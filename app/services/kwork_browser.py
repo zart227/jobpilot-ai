@@ -311,6 +311,9 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
     await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2000)
 
+    propose_button = page.get_by_role("button", name="Предложить услугу")
+    has_propose_button = await propose_button.count() > 0
+
     resume_error = page.locator(".js-link-resume-error:has-text('Предложить услугу')")
     if await resume_error.count() > 0:
         await resume_error.first.click(force=True)
@@ -327,6 +330,8 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
     body = (await page.inner_text("body")).lower()
     if "архив" in body or "закрыт" in body:
         return "Заказ закрыт или в архиве на Kwork"
+    if not has_propose_button:
+        return "Кнопка «Предложить услугу» отсутствует — форма отклика недоступна на Kwork"
     return None
 
 
