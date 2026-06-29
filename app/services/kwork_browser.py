@@ -295,14 +295,35 @@ async def _exchange_lesson_required(page: Page) -> bool:
 
 
 async def _verify_offer_in_my_offers(page: Page, project_id: str) -> bool:
-    await page.goto(
+    offers_urls = (
+        "https://kwork.ru/projects?tab=offers",
         "https://kwork.ru/manage_orders?tab=offers",
-        wait_until="domcontentloaded",
-        timeout=60000,
     )
-    await page.wait_for_timeout(2500)
-    content = await page.content()
-    return f"/projects/{project_id}" in content or f"project={project_id}" in content
+    link_selector = f'a[href*="/projects/{project_id}"], a[href*="project={project_id}"]'
+
+    for offers_url in offers_urls:
+        await page.goto(offers_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+        for _ in range(6):
+            if await page.locator(link_selector).count() > 0:
+                logger.info(
+                    "Kwork offer found in offers list",
+                    project_id=project_id,
+                    offers_url=offers_url,
+                )
+                return True
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1200)
+        content = await page.content()
+        if f"/projects/{project_id}" in content or f"project={project_id}" in content:
+            logger.info(
+                "Kwork offer found in offers page HTML",
+                project_id=project_id,
+                offers_url=offers_url,
+            )
+            return True
+
+    return False
 
 
 async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
@@ -336,6 +357,11 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
 
 
 async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
+    form_ready = await _offer_form_ready(page)
+    if form_ready:
+        logger.info("Kwork offer form available, skipping seller onboarding check")
+        return True, None
+
     info = await _load_seller_profile_if_needed(page, await _get_seller_state(page))
     form_ready = await _offer_form_ready(page)
     logger.info(
@@ -494,6 +520,11 @@ async def submit_offer(
 
     await page.goto(offer_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2500)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=60000)
+    except Exception:
+        # Some Kwork pages keep long-polling; best-effort only.
+        pass
 
     if await _is_access_blocked(page):
         return await _fail_offer(page, "access_blocked", "Kwork заблокировал доступ с этого IP", url=offer_url)
@@ -540,14 +571,20 @@ async def submit_offer(
 
     textarea = page.locator('textarea[name="description"]')
     try:
-        await textarea.wait_for(state="attached", timeout=20000)
+        await textarea.wait_for(state="visible", timeout=60000)
     except Exception:
+        debug = {
+            "title": await page.title(),
+            "description_count": await textarea.count(),
+            "submit_count": await page.get_by_role("button", name="Предложить").count(),
+        }
         return await _fail_offer(
             page,
             "form_not_loaded",
             "Форма отклика не загрузилась",
             url=offer_url,
             current_url=page.url,
+            **debug,
         )
 
     await _fill_offer_form(page, content, budget_min, budget_max)
