@@ -1,0 +1,139 @@
+services:
+    postgres:
+        image: postgres:16-alpine
+        container_name: jobpilot-postgres
+        environment:
+            POSTGRES_USER: jobpilot
+            POSTGRES_PASSWORD: jobpilot_secret
+            POSTGRES_DB: jobpilot_ai
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        ports:
+            - "5433:5432"
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U jobpilot -d jobpilot_ai"]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    redis:
+        image: redis:7-alpine
+        container_name: jobpilot-redis
+        ports:
+            - "6379:6379"
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+
+    qdrant:
+        image: qdrant/qdrant:v1.13.6
+        container_name: jobpilot-qdrant
+        ports:
+            - "6333:6333"
+            - "6334:6334"
+        volumes:
+            - qdrant_data:/qdrant/storage
+        healthcheck:
+            test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+            interval: 10s
+            timeout: 5s
+            retries: 10
+            start_period: 10s
+
+    api:
+        build: .
+        container_name: jobpilot-api
+        command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+        env_file: .env
+        environment:
+            PYTHONPATH: /app
+            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
+            REDIS_URL: redis://redis:6379/0
+            CELERY_BROKER_URL: redis://redis:6379/0
+            CELERY_RESULT_BACKEND: redis://redis:6379/1
+            QDRANT_URL: http://qdrant:6333
+            CURSOR_WORKSPACE: /app
+        ports:
+            - "8000:8000"
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+            qdrant:
+                condition: service_healthy
+        volumes:
+            - ./app:/app/app
+            - ./scripts:/app/scripts
+
+    celery-worker:
+        build: .
+        container_name: jobpilot-celery-worker
+        command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+        env_file: .env
+        environment:
+            PYTHONPATH: /app
+            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
+            REDIS_URL: redis://redis:6379/0
+            CELERY_BROKER_URL: redis://redis:6379/0
+            CELERY_RESULT_BACKEND: redis://redis:6379/1
+            QDRANT_URL: http://qdrant:6333
+            CURSOR_WORKSPACE: /app
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+            qdrant:
+                condition: service_healthy
+        volumes:
+            - ./app:/app/app
+
+    celery-beat:
+        build: .
+        container_name: jobpilot-celery-beat
+        command: celery -A app.celery_app beat --loglevel=info
+        env_file: .env
+        environment:
+            PYTHONPATH: /app
+            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
+            REDIS_URL: redis://redis:6379/0
+            CELERY_BROKER_URL: redis://redis:6379/0
+            CELERY_RESULT_BACKEND: redis://redis:6379/1
+            QDRANT_URL: http://qdrant:6333
+            CURSOR_WORKSPACE: /app
+        depends_on:
+            redis:
+                condition: service_healthy
+        volumes:
+            - ./app:/app/app
+
+    telegram-bot:
+        build: .
+        container_name: jobpilot-telegram
+        command: python -m app.telegram.bot
+        env_file: .env
+        environment:
+            PYTHONPATH: /app
+            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
+            REDIS_URL: redis://redis:6379/0
+            CELERY_BROKER_URL: redis://redis:6379/0
+            CELERY_RESULT_BACKEND: redis://redis:6379/1
+            QDRANT_URL: http://qdrant:6333
+            CURSOR_WORKSPACE: /app
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+            api:
+                condition: service_started
+        volumes:
+            - ./app:/app/app
+            - ./data:/app/data
+
+volumes:
+    postgres_data:
+    qdrant_data:

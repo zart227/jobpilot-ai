@@ -1,0 +1,1 @@
+"""JobPilot AI Playwright scrapers."""
