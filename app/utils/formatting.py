@@ -3,6 +3,28 @@ import re
 import structlog
 
 
+def extract_site_order_id(
+    *,
+    external_id: str | None = None,
+    url: str | None = None,
+    platform: str | None = None,
+) -> str | None:
+    """Return the marketplace order/project id shown on the source site."""
+    if url and (platform == "kwork" or "kwork.ru" in url):
+        match = re.search(r"/projects/(\d+)", url)
+        if match:
+            return match.group(1)
+
+    if external_id:
+        if platform == "kwork" or external_id.startswith("kwork-"):
+            match = re.search(r"(\d+)", external_id)
+            if match:
+                return match.group(1)
+        return external_id
+
+    return None
+
+
 def normalize_ru_number(text: str) -> str:
     """Join spaced thousands: '10 000' -> '10000'."""
     cleaned = text.replace("\xa0", " ")

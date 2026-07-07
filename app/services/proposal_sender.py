@@ -38,15 +38,31 @@ class ProposalSender:
             return result.scalar_one_or_none() is not None
 
     async def send(
-        self, job_id: str, proposal_id: str, content: str
+        self,
+        job_id: str,
+        proposal_id: str,
+        content: str,
+        *,
+        allow_resubmit: bool = False,
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
-        if await self.is_already_sent(job_id, proposal_id):
+        async with AsyncSessionLocal() as session:
+            proposal = await session.get(Proposal, uuid.UUID(proposal_id))
+            if proposal and proposal.status == "sent" and not allow_resubmit:
+                if proposal.content.strip() == content.strip():
+                    logger.info(
+                        "JobPilot AI skip duplicate send",
+                        job_id=job_id,
+                        proposal_id=proposal_id,
+                    )
+                    return True, None, {"offer_action": "unchanged"}
+
+        if not allow_resubmit and await self.is_already_sent(job_id, proposal_id):
             logger.info(
                 "JobPilot AI skip duplicate send",
                 job_id=job_id,
                 proposal_id=proposal_id,
             )
-            return True, None, None
+            return True, None, {"offer_action": "unchanged"}
 
         async with AsyncSessionLocal() as session:
             job = await session.get(Job, uuid.UUID(job_id))
@@ -56,13 +72,14 @@ class ProposalSender:
                 logger.error("JobPilot AI send failed: job or proposal not found")
                 return False, "Заказ или отклик не найден в базе", None
 
-            if proposal.status == "sent":
-                logger.info(
-                    "JobPilot AI skip duplicate send",
-                    job_id=job_id,
-                    proposal_id=proposal_id,
-                )
-                return True, None, None
+            if proposal.status == "sent" and not allow_resubmit:
+                if proposal.content.strip() == content.strip():
+                    logger.info(
+                        "JobPilot AI skip duplicate send",
+                        job_id=job_id,
+                        proposal_id=proposal_id,
+                    )
+                    return True, None, {"offer_action": "unchanged"}
 
             success, error, debug = await self._send_to_platform(job, proposal, content)
 
@@ -93,6 +110,11 @@ class ProposalSender:
                 debug["job_title"] = job.title
                 debug["job_id"] = job_id
                 debug["proposal_id"] = proposal_id
+                debug["order_id"] = extract_site_order_id(
+                    external_id=job.external_id,
+                    url=job.url,
+                    platform=job.platform,
+                )
             return success, error, debug
 
     async def _send_to_platform(

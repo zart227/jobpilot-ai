@@ -441,8 +441,9 @@ async def _exchange_lesson_required(page: Page) -> bool:
 async def _verify_offer_on_project_page(page: Page, project_id: str) -> bool:
     """Check project view page for signs that our offer was submitted."""
     view_url = f"https://kwork.ru/projects/{project_id}/view"
-    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
+    if project_id not in page.url:
+        await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
 
     body = (await page.inner_text("body")).lower()
     success_markers = (
@@ -458,66 +459,251 @@ async def _verify_offer_on_project_page(page: Page, project_id: str) -> bool:
         logger.info("Kwork offer verified on project page", project_id=project_id)
         return True
 
-    propose_button = page.get_by_role("button", name="Предложить услугу")
-    if await propose_button.count() == 0 and "предложени" in body:
-        logger.info(
-            "Kwork offer likely submitted: propose button hidden on project page",
-            project_id=project_id,
-        )
-        return True
-
     return False
 
 
 async def _verify_offer_in_my_offers(page: Page, project_id: str) -> bool:
+    """Strict check: offer must be editable/visible, not just project link in HTML."""
+    view_url = f"https://kwork.ru/projects/{project_id}/view"
+    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+    if await _verify_offer_on_project_page(page, project_id):
+        return True
+
     offers_urls = (
         "https://kwork.ru/projects?tab=offers",
         "https://kwork.ru/manage_orders?tab=offers",
-        "https://kwork.ru/manage_orders",
-        f"https://kwork.ru/projects/{project_id}/view",
     )
-    link_selector = f'a[href*="/projects/{project_id}"], a[href*="project={project_id}"]'
+    link_selector = (
+        f'a[href*="/projects/{project_id}/view"], '
+        f'a[href*="/projects/{project_id}"], '
+        f'a[href*="project={project_id}"]'
+    )
 
     for offers_url in offers_urls:
         await page.goto(offers_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(2500)
-        if offers_url.endswith("/view"):
-            body = (await page.inner_text("body")).lower()
-            if any(
-                marker in body
-                for marker in (
-                    "ваше предложение",
-                    "вы предложили",
-                    "редактировать предложение",
-                    "отозвать предложение",
-                )
-            ):
-                logger.info(
-                    "Kwork offer found on project view",
-                    project_id=project_id,
-                    offers_url=offers_url,
-                )
-                return True
         for _ in range(6):
-            if await page.locator(link_selector).count() > 0:
-                logger.info(
-                    "Kwork offer found in offers list",
-                    project_id=project_id,
-                    offers_url=offers_url,
-                )
-                return True
+            links = page.locator(link_selector)
+            count = await links.count()
+            for index in range(count):
+                link = links.nth(index)
+                text = ((await link.inner_text()) or "").lower()
+                href = (await link.get_attribute("href")) or ""
+                if project_id not in href:
+                    continue
+                if any(
+                    marker in text
+                    for marker in ("отклик", "предложени", "редактир", "отозв")
+                ):
+                    logger.info(
+                        "Kwork offer found in offers list",
+                        project_id=project_id,
+                        offers_url=offers_url,
+                        link_text=text[:80],
+                    )
+                    return True
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1200)
-        content = await page.content()
-        if f"/projects/{project_id}" in content or f"project={project_id}" in content:
-            logger.info(
-                "Kwork offer found in offers page HTML",
-                project_id=project_id,
-                offers_url=offers_url,
-            )
+
+    return False
+
+
+async def _open_new_offer_from_project_page(
+    page: Page,
+    job_url: str,
+    steps: list[str],
+) -> bool:
+    view_url = _normalize_project_url(job_url)
+    steps.append(f"открытие страницы заказа: {view_url}")
+    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+
+    propose_locators = (
+        page.get_by_role("button", name="Предложить услугу"),
+        page.get_by_role("link", name="Предложить услугу"),
+        page.locator('button:has-text("Предложить услугу")'),
+        page.locator('a:has-text("Предложить услугу")'),
+    )
+    clicked = False
+    for locator in propose_locators:
+        if await locator.count() == 0:
+            continue
+        steps.append("нажатие «Предложить услугу» на странице заказа")
+        await locator.first.click(force=True)
+        await page.wait_for_timeout(2500)
+        clicked = True
+        break
+
+    if not clicked:
+        return False
+
+    if await _offer_form_visible(page):
+        return True
+
+    blocker = await _diagnose_offer_blocker(page, job_url)
+    if blocker:
+        steps.append(f"блокировка Kwork: {blocker}")
+    return False
+
+
+async def _offer_form_visible(page: Page) -> bool:
+    textarea = page.locator('textarea[name="description"]')
+    if await textarea.count() > 0:
+        try:
+            await textarea.first.wait_for(state="visible", timeout=5000)
+            return True
+        except Exception:
+            pass
+    return await _offer_form_ready(page)
+
+
+async def _open_edit_offer_form(
+    page: Page,
+    project_id: str,
+    job_url: str,
+    steps: list[str],
+) -> bool:
+    edit_urls = (
+        f"https://kwork.ru/edit_offer?project={project_id}",
+        f"https://kwork.ru/new_offer?project={project_id}&edit=1",
+    )
+    for edit_url in edit_urls:
+        steps.append(f"попытка открыть редактирование: {edit_url}")
+        await page.goto(edit_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+        if await _offer_form_visible(page):
+            steps.append(f"форма редактирования открыта: {page.url}")
+            return True
+
+    view_url = _normalize_project_url(job_url)
+    steps.append(f"переход на страницу заказа: {view_url}")
+    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+
+    edit_locators = (
+        page.get_by_role("link", name=re.compile(r"редактировать\s+предложение", re.I)),
+        page.get_by_role("button", name=re.compile(r"редактировать\s+предложение", re.I)),
+        page.locator('a[href*="edit_offer"]'),
+        page.locator('a[href*="new_offer"][href*="edit"]'),
+    )
+    for locator in edit_locators:
+        if await locator.count() == 0:
+            continue
+        await locator.first.click(force=True)
+        await page.wait_for_timeout(2500)
+        if await _offer_form_visible(page):
+            steps.append(f"форма редактирования открыта через UI: {page.url}")
             return True
 
     return False
+
+
+async def _click_submit_offer_button(page: Page) -> str | None:
+    for label in ("Предложить", "Сохранить", "Сохранить изменения", "Отправить"):
+        button = page.get_by_role("button", name=label)
+        if await button.count() > 0:
+            await button.first.scroll_into_view_if_needed()
+            await button.first.click(force=True)
+            return label
+    return None
+
+
+async def _edit_existing_offer(
+    page: Page,
+    job_url: str,
+    content: str,
+    budget_min: float | None,
+    budget_max: float | None,
+    steps: list[str],
+    project_id: str,
+    *,
+    content_file: str | None,
+    offer_price: int | None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    if not await _open_edit_offer_form(page, project_id, job_url, steps):
+        return False, (
+            "Отклик на Kwork уже существует, но форма редактирования недоступна. "
+            "Обновите текст вручную на странице заказа."
+        ), {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps + ["форма редактирования не найдена"],
+            "error_label": "edit_form_unavailable",
+            "offer_price": offer_price,
+        }
+
+    steps.append("заполнение формы редактирования")
+    try:
+        await _fill_offer_form(page, content, budget_min, budget_max)
+    except Exception as exc:
+        return await _fail_offer(
+            page,
+            "edit_form_fill_error",
+            f"Не удалось заполнить форму редактирования: {exc}",
+            url=page.url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
+            offer_price=offer_price,
+        )
+
+    await _save_debug_screenshot(page, f"before_edit_submit_{project_id}")
+    steps.append("форма редактирования заполнена")
+
+    clicked = await _click_submit_offer_button(page)
+    if not clicked:
+        return await _fail_offer(
+            page,
+            "edit_submit_missing",
+            "Кнопка сохранения отклика не найдена на форме редактирования",
+            url=page.url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
+            offer_price=offer_price,
+        )
+
+    steps.append(f"нажата кнопка «{clicked}»")
+    await page.wait_for_timeout(5000)
+    steps.append(f"ожидание ответа после редактирования, URL: {page.url}")
+
+    if await _verify_offer_on_project_page(page, project_id):
+        logger.info("Kwork offer updated on project page", project_id=project_id)
+        return True, None, {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "offer_action": "updated",
+            "offer_price": offer_price,
+        }
+
+    errors = await _collect_visible_form_errors(page)
+    if errors:
+        return await _fail_offer(
+            page,
+            "edit_validation_error",
+            errors[0],
+            url=page.url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
+            errors=errors,
+            offer_price=offer_price,
+        )
+
+    return await _fail_offer(
+        page,
+        "edit_unverified",
+        "Не удалось подтвердить обновление отклика на Kwork",
+        url=page.url,
+        job_url=job_url,
+        content=content,
+        steps=steps,
+        offer_price=offer_price,
+    )
 
 
 async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
@@ -805,13 +991,15 @@ async def submit_offer(
         )
 
     if "new_offer" not in page.url:
-        steps.append("форма new_offer недоступна, проверка существующих откликов")
-        if await _verify_offer_in_my_offers(page, project_id):
-            logger.info("Kwork offer already exists in my offers", project_id=project_id)
-            return True, None, None
-        steps.append("диагностика блокировки на странице проекта")
-        blocker = await _diagnose_offer_blocker(page, job_url)
-        if blocker:
+        steps.append("форма new_offer недоступна, открытие отклика со страницы заказа")
+        if await _open_new_offer_from_project_page(page, job_url, steps):
+            steps.append("форма отклика открыта через «Предложить услугу»")
+        elif any("блокировка Kwork:" in step for step in steps):
+            blocker = next(
+                step.removeprefix("блокировка Kwork: ")
+                for step in reversed(steps)
+                if step.startswith("блокировка Kwork:")
+            )
             return await _fail_offer(
                 page,
                 "offer_blocked",
@@ -822,16 +1010,68 @@ async def submit_offer(
                 steps=steps,
                 reason=blocker,
             )
-        return await _fail_offer(
-            page,
-            "form_unavailable",
-            "Форма отклика недоступна на Kwork",
-            url=offer_url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-            redirect=page.url,
-        )
+        elif await _verify_offer_on_project_page(page, project_id):
+            logger.info(
+                "Kwork offer already exists, attempting update",
+                project_id=project_id,
+            )
+            updated, update_error, update_debug = await _edit_existing_offer(
+                page,
+                job_url,
+                content,
+                budget_min,
+                budget_max,
+                steps,
+                project_id,
+                content_file=content_file,
+                offer_price=offer_price,
+            )
+            if updated:
+                return True, None, update_debug
+            return updated, update_error, update_debug
+        elif await _verify_offer_in_my_offers(page, project_id):
+            logger.info(
+                "Kwork offer found in offers list, attempting update",
+                project_id=project_id,
+            )
+            updated, update_error, update_debug = await _edit_existing_offer(
+                page,
+                job_url,
+                content,
+                budget_min,
+                budget_max,
+                steps,
+                project_id,
+                content_file=content_file,
+                offer_price=offer_price,
+            )
+            if updated:
+                return True, None, update_debug
+            return updated, update_error, update_debug
+        else:
+            steps.append("диагностика блокировки на странице проекта")
+            blocker = await _diagnose_offer_blocker(page, job_url)
+            if blocker:
+                return await _fail_offer(
+                    page,
+                    "offer_blocked",
+                    blocker,
+                    url=offer_url,
+                    job_url=job_url,
+                    content=content,
+                    steps=steps,
+                    reason=blocker,
+                )
+            return await _fail_offer(
+                page,
+                "form_unavailable",
+                "Форма отклика недоступна на Kwork",
+                url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
+                redirect=page.url,
+            )
 
     steps.append("форма отклика открыта")
     ready, ready_error = await _check_seller_ready(page)
@@ -897,8 +1137,8 @@ async def submit_offer(
     await _save_debug_screenshot(page, f"before_submit_{project_id}")
     steps.append("форма заполнена, скриншот before_submit сохранён")
 
-    submit_button = page.get_by_role("button", name="Предложить")
-    if await submit_button.count() == 0:
+    clicked = await _click_submit_offer_button(page)
+    if not clicked:
         return await _fail_offer(
             page,
             "submit_button_missing",
@@ -909,9 +1149,7 @@ async def submit_offer(
             steps=steps,
         )
 
-    steps.append("нажатие «Предложить»")
-    await submit_button.scroll_into_view_if_needed()
-    await submit_button.click(force=True)
+    steps.append(f"нажатие «{clicked}»")
     await page.wait_for_timeout(5000)
     steps.append(f"ожидание ответа, текущий URL: {page.url}")
 
@@ -965,11 +1203,25 @@ async def submit_offer(
 
     if await _verify_offer_on_project_page(page, project_id):
         logger.info("Kwork offer verified on project page after submit", project_id=project_id)
-        return True, None, None
+        return True, None, {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "offer_action": "created",
+            "offer_price": offer_price,
+        }
 
     if await _verify_offer_in_my_offers(page, project_id):
         logger.info("Kwork offer verified in my offers", project_id=project_id)
-        return True, None, None
+        return True, None, {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "offer_action": "created",
+            "offer_price": offer_price,
+        }
 
     body = (await page.inner_text("body")).lower()
     if any(

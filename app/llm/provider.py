@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, PermissionDeniedError
 
 from app.config import Settings, get_settings
+from app.llm.errors import LLMErrorKind, LLMServiceError, classify_llm_error
 from app.utils.proxy import (
     build_httpx_async_client,
     get_proxy_candidates,
@@ -154,44 +155,105 @@ class OllamaProvider(LLMProvider):
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    def _client(self) -> "AsyncClient":
+    def _client(self, proxy: str | None) -> "AsyncClient":
         from ollama import AsyncClient
 
         headers: dict[str, str] = {}
         if self._settings.ollama_api_key:
             headers["Authorization"] = f"Bearer {self._settings.ollama_api_key}"
+
+        client_kwargs: dict[str, Any] = {
+            "timeout": self._settings.ollama_timeout_seconds,
+        }
+        if proxy:
+            client_kwargs["proxy"] = proxy
+
         return AsyncClient(
             host=self._settings.ollama_base_url.rstrip("/"),
             headers=headers,
-            timeout=self._settings.ollama_timeout_seconds,
+            **client_kwargs,
         )
 
-    async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+    async def _chat_once(
+        self,
+        proxy: str | None,
+        messages: list[dict[str, str]],
+        temperature: float,
+    ) -> str:
         from ollama import ResponseError
 
-        temperature = kwargs.get("temperature", 0.3)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        client = self._client(proxy)
         try:
-            response = await self._client().chat(
-                model=self._settings.ollama_model,
-                messages=messages,
-                options={"temperature": temperature},
+            response = await asyncio.wait_for(
+                client.chat(
+                    model=self._settings.ollama_model,
+                    messages=messages,
+                    options={"temperature": temperature},
+                ),
+                timeout=self._settings.ollama_timeout_seconds,
             )
+        except asyncio.TimeoutError as exc:
+            raise classify_llm_error(exc) from exc
         except ResponseError as exc:
             logger.error(
                 "Ollama request failed",
                 model=self._settings.ollama_model,
                 status_code=exc.status_code,
                 error=exc.error,
+                proxy=mask_proxy(proxy) if proxy else None,
             )
-            raise RuntimeError(f"Ollama error: {exc.error}") from exc
+            raise classify_llm_error(exc) from exc
+        except Exception as exc:
+            raise classify_llm_error(exc) from exc
+        finally:
+            await client.close()
 
         content = response.message.content
-        logger.info("Ollama response", model=self._settings.ollama_model)
+        logger.info(
+            "Ollama response",
+            model=self._settings.ollama_model,
+            proxy=mask_proxy(proxy) if proxy else None,
+        )
         return content if isinstance(content, str) else str(content)
+
+    async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        temperature = kwargs.get("temperature", 0.3)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        proxies = get_proxy_candidates(self._settings, "ollama")
+        last_error: LLMServiceError | None = None
+
+        for proxy in proxies:
+            if proxy:
+                logger.info("Ollama request via proxy", proxy=mask_proxy(proxy))
+            try:
+                return await self._chat_once(proxy, messages, temperature)
+            except LLMServiceError as exc:
+                last_error = exc
+                if proxy and exc.retryable and exc.kind in {
+                    LLMErrorKind.NETWORK,
+                    LLMErrorKind.SERVER,
+                    LLMErrorKind.RATE_LIMIT,
+                }:
+                    logger.warning(
+                        "Ollama proxy failed, rotating",
+                        proxy=mask_proxy(proxy),
+                        kind=exc.kind.value,
+                        error=exc.message,
+                    )
+                    mark_proxy_failed(self._settings, "ollama", proxy)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise LLMServiceError(
+            kind=LLMErrorKind.NETWORK,
+            message="No working proxy available for Ollama",
+            retryable=False,
+        )
 
     def get_chat_model(self) -> BaseChatModel:
         raise NotImplementedError("Ollama provider does not expose a LangChain chat model")

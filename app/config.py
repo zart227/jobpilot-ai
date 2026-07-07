@@ -62,6 +62,11 @@ class Settings(BaseSettings):
         alias="OPENAI_PROXY_LIST",
         description="Path to proxy list for OpenAI (e.g. Poland residential)",
     )
+    ollama_proxy_list: str = Field(
+        default="",
+        alias="OLLAMA_PROXY_LIST",
+        description="Path to proxy list for Ollama Cloud; falls back to OPENAI_PROXY_LIST",
+    )
     telegram_proxy_list: str = Field(
         default="",
         alias="TELEGRAM_PROXY_LIST",
