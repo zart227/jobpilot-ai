@@ -10,6 +10,7 @@ venv/
 data/kwork_session.json
 data/kwork_debug/
 data/*_proxy_rotation.json
+proxy-lists/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
