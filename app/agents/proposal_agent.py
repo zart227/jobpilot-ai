@@ -125,6 +125,22 @@ class ProposalAgent:
         if phrases:
             phrase_hint = f"\nHigh-conversion phrases to naturally incorporate: {', '.join(phrases[:3])}"
 
+        edit_pref_hint = ""
+        edit_prefs = await self._memory.search_edit_preferences(job_context, limit=5)
+        if edit_prefs:
+            seen: set[str] = set()
+            lines: list[str] = []
+            for item in edit_prefs:
+                instruction = str(item.get("instruction", "")).strip()
+                if instruction and instruction not in seen:
+                    seen.add(instruction)
+                    lines.append(f"- {instruction}")
+            if lines:
+                edit_pref_hint = (
+                    "\n\nUser edit preferences from past approvals (apply proactively):\n"
+                    + "\n".join(lines[:5])
+                )
+
         budget_label = format_budget(
             job.get("budget_min"),
             job.get("budget_max"),
@@ -169,7 +185,7 @@ Description: {job.get('description', '')}
 Budget: {budget_label}{offer_price_hint}
 Skills: {', '.join(job.get('skills', []))}
 Deadline: {job.get('deadline', 'Not specified')}
-{examples}{phrase_hint}
+{examples}{phrase_hint}{edit_pref_hint}
 
 Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this specific job."""
 

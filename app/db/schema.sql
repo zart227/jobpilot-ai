@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS proposals (
 CREATE INDEX IF NOT EXISTS idx_proposals_job_id ON proposals(job_id);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 
+CREATE TABLE IF NOT EXISTS proposal_edits (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    proposal_id UUID NOT NULL REFERENCES proposals(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    instruction TEXT NOT NULL,
+    original_content TEXT NOT NULL,
+    edited_content TEXT NOT NULL,
+    platform VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposal_edits_proposal_id ON proposal_edits(proposal_id);
+CREATE INDEX IF NOT EXISTS idx_proposal_edits_job_id ON proposal_edits(job_id);
+
 CREATE TABLE IF NOT EXISTS interactions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,

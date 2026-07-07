@@ -91,6 +91,23 @@ class Proposal(Base):
     job: Mapped[Job] = relationship(back_populates="proposals")
     interactions: Mapped[list["Interaction"]] = relationship(back_populates="proposal")
     outcomes: Mapped[list["Outcome"]] = relationship(back_populates="proposal")
+    edits: Mapped[list["ProposalEdit"]] = relationship(back_populates="proposal")
+
+
+class ProposalEdit(Base):
+    __tablename__ = "proposal_edits"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("proposals.id", ondelete="CASCADE"))
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    original_content: Mapped[str] = mapped_column(Text, nullable=False)
+    edited_content: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    proposal: Mapped[Proposal] = relationship(back_populates="edits")
+    job: Mapped[Job] = relationship()
 
 
 class Interaction(Base):

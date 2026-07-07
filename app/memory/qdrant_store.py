@@ -20,6 +20,7 @@ COLLECTIONS = {
     "successful_proposals": 1536,
     "high_conversion_phrases": 1536,
     "job_embeddings": 1536,
+    "edit_preferences": 1536,
 }
 
 
@@ -153,6 +154,40 @@ class QdrantMemoryStore:
             limit,
         )
         return [str(hit.payload.get("phrase", "")) for hit in results if hit.payload]
+
+    async def store_edit_preference(
+        self,
+        instruction: str,
+        original_content: str,
+        edited_content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        key = f"{instruction}:{original_content[:120]}:{edited_content[:120]}"
+        vector = await self._embed(f"{instruction}\n{original_content[:300]}")
+        point = PointStruct(
+            id=self._point_id(key),
+            vector=vector,
+            payload={
+                "instruction": instruction,
+                "original_snippet": original_content[:500],
+                "edited_snippet": edited_content[:500],
+                "type": "edit_preference",
+                **(metadata or {}),
+            },
+        )
+        self._client.upsert(
+            collection_name=self._collection_name("edit_preferences"),
+            points=[point],
+        )
+
+    async def search_edit_preferences(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        vector = await self._embed(query)
+        results = self._vector_search(
+            self._collection_name("edit_preferences"),
+            vector,
+            limit,
+        )
+        return [{"score": hit.score, **hit.payload} for hit in results if hit.payload]
 
     async def find_similar_jobs(self, job_text: str, platform: str | None = None, limit: int = 5) -> list[dict[str, Any]]:
         vector = await self._embed(job_text)
