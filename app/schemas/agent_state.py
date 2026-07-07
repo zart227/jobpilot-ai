@@ -40,6 +40,7 @@ class JobPilotState(TypedDict, total=False):
     chat_reply: str
     outcome_status: str
     send_error: str
+    send_debug: dict
     reward: int
     learning_notes: str
     error: str

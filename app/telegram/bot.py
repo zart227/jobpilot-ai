@@ -1,6 +1,7 @@
 import html
 import asyncio
 import uuid
+from typing import Any
 
 import structlog
 from aiogram import Bot, Dispatcher, F
@@ -22,7 +23,13 @@ from app.services.job_pipeline import JobPipelineService
 from app.services.proposal_sender import ProposalSender
 from app.services.reward_system import RewardSystem
 from app.telegram.keyboards import approval_keyboard
-from app.utils.formatting import format_budget, sanitize_proposal_text
+from app.utils.formatting import (
+    KWORK_MAX_OFFER_CHARS,
+    format_budget,
+    format_offer_price,
+    sanitize_proposal_text,
+)
+from app.utils.proxy import create_telegram_bot
 
 logger = structlog.get_logger(__name__)
 
@@ -68,12 +75,24 @@ def format_job_description_messages(job: Job) -> list[str]:
 
 
 def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
+    settings = get_settings()
     budget = format_budget(
         float(job.budget_min) if job.budget_min else None,
         float(job.budget_max) if job.budget_max else None,
         job.budget_currency or "RUB",
         job.platform,
     )
+
+    offer_line = ""
+    if job.platform == "kwork":
+        offer = format_offer_price(
+            float(job.budget_min) if job.budget_min else None,
+            float(job.budget_max) if job.budget_max else None,
+            job.budget_currency or "RUB",
+            settings.kwork_offer_discount_percent,
+        )
+        if offer:
+            offer_line = f"<b>Предлагаем:</b> {html.escape(offer)}\n"
 
     preview = sanitize_proposal_text(proposal.content[:800])
     if len(proposal.content) > 800:
@@ -85,10 +104,74 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
         f"<b>Title:</b> {html.escape(job.title)}\n"
         f"<b>Platform:</b> {html.escape(job.platform)}\n"
         f"<b>Budget:</b> {html.escape(budget)}\n"
+        f"{offer_line}"
         f"<b>Score:</b> {score or 0}/100\n\n"
         f"<b>Proposal preview:</b>\n\n"
         f"{html.escape(preview)}"
     )
+
+
+def format_kwork_failure_message(
+    job: Job | None,
+    send_error: str | None,
+    debug: dict[str, Any] | None,
+) -> str:
+    parts = ["❌ JobPilot AI: не удалось отправить отклик на Kwork."]
+
+    title = (job.title if job else None) or (debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+
+    job_url = (job.url if job else None) or (debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Kwork</a>')
+
+    if send_error:
+        parts.append(f"\n\n<b>Причина:</b> {html.escape(send_error)}")
+
+    if debug:
+        content_length = debug.get("content_length")
+        if content_length is not None:
+            parts.append(
+                f"\n\n<b>Длина текста:</b> {content_length} симв. "
+                f"(рекомендуется ≤1200, лимит Kwork: {KWORK_MAX_OFFER_CHARS})"
+            )
+        offer_price = debug.get("offer_price")
+        if offer_price:
+            parts.append(f"\n<b>Цена в отклике:</b> {offer_price} ₽")
+        content_file = debug.get("content_file")
+        if content_file:
+            parts.append(
+                f"\n\n<b>Текст отклика:</b> <code>{html.escape(str(content_file))}</code>"
+            )
+        steps = debug.get("steps")
+        if steps:
+            step_lines = "\n".join(
+                f"{index}. {html.escape(str(step))}" for index, step in enumerate(steps, 1)
+            )
+            parts.append(f"\n\n<b>Шаги до ошибки:</b>\n{step_lines}")
+        debug_file = debug.get("debug_file")
+        screenshot = debug.get("screenshot")
+        if debug_file or screenshot:
+            parts.append("\n\n<b>Дебаг:</b>")
+            if debug_file:
+                parts.append(f"\nJSON: <code>{html.escape(str(debug_file))}</code>")
+            if screenshot:
+                parts.append(f"\nСкрин: <code>{html.escape(str(screenshot))}</code>")
+
+    parts.append(
+        "\n\nЧастые причины:\n"
+        "1. Нет кворка с портфолио в нужной рубрике (SaaS/сайты)\n"
+        "2. Не пройден урок по работе на Бирже\n"
+        "3. Профиль продавца не подтверждён — kwork.ru/seller\n"
+        "4. Сессия устарела — пересохраните data/kwork_session.json\n"
+        "5. Заказ закрыт или форма отклика недоступна\n\n"
+        "Логи: docker compose logs telegram-bot --tail=50"
+    )
+    text = "".join(parts)
+    if len(text) > 4096:
+        return text[:4093] + "..."
+    return text
 
 
 async def notify_new_proposal(
@@ -136,7 +219,7 @@ def create_dispatcher() -> Dispatcher:
     redis = Redis.from_url(settings.redis_url)
     storage = RedisStorage(redis=redis)
     dp = Dispatcher(storage=storage)
-    bot = Bot(token=settings.telegram_bot_token)
+    bot = create_telegram_bot(settings.telegram_bot_token, settings)
 
     @dp.message(Command("start"))
     async def cmd_start(message: Message) -> None:
@@ -230,13 +313,16 @@ def create_dispatcher() -> Dispatcher:
             )
             return
 
-        success = await _resume_pipeline(job_id, proposal_id, "edited", new_content)
+        success, send_error, send_debug = await _resume_pipeline(job_id, proposal_id, "edited", new_content)
         if success:
             await message.answer("✅ JobPilot AI: отредактированный отклик отправлен на Kwork.")
         else:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(Job, uuid.UUID(job_id))
             await message.answer(
-                "❌ JobPilot AI: не удалось отправить отклик на Kwork. "
-                "Проверьте учётные данные Kwork в .env."
+                format_kwork_failure_message(job, send_error, send_debug),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
             )
 
     async def _process_approval(
@@ -298,25 +384,18 @@ def create_dispatcher() -> Dispatcher:
         except Exception:
             pass
 
-        success, send_error = await _resume_pipeline(job_id, proposal_id, action)
+        success, send_error, send_debug = await _resume_pipeline(job_id, proposal_id, action)
         if success:
             await callback.message.answer(
                 "✅ JobPilot AI: отклик отправлен на Kwork."
             )
         else:
-            reason = f"\n\n<b>Причина:</b> {html.escape(send_error)}" if send_error else ""
+            async with AsyncSessionLocal() as session:
+                job = await session.get(Job, uuid.UUID(job_id))
             await callback.message.answer(
-                "❌ JobPilot AI: не удалось отправить отклик на Kwork."
-                f"{reason}\n\n"
-                "Частые причины:\n"
-                "1. Нет кворка с портфолио в нужной рубрике (SaaS/сайты)\n"
-                "2. Не пройден урок по работе на Бирже\n"
-                "3. Профиль продавца не подтверждён — kwork.ru/seller\n"
-                "4. Сессия устарела — пересохраните data/kwork_session.json\n"
-                "5. Заказ закрыт или форма отклика недоступна\n\n"
-                "Логи: docker compose logs telegram-bot --tail=50\n"
-                "Скриншоты: data/kwork_debug/ (в контейнере /app/data/kwork_debug/)",
+                format_kwork_failure_message(job, send_error, send_debug),
                 parse_mode="HTML",
+                disable_web_page_preview=True,
             )
 
     async def _resume_pipeline(
@@ -324,7 +403,7 @@ def create_dispatcher() -> Dispatcher:
         proposal_id: str,
         approval_status: str,
         edited_content: str | None = None,
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[bool, str | None, dict[str, Any] | None]:
         pipeline = JobPipelineService()
         base_state = await pipeline.job_to_state(uuid.UUID(job_id))
 
@@ -343,10 +422,11 @@ def create_dispatcher() -> Dispatcher:
         graph = compile_jobpilot_graph()
         send_success = False
         send_error: str | None = None
+        send_debug: dict[str, Any] | None = None
         if approval_status in ("approved", "edited"):
             sender = ProposalSender()
             if await sender.is_already_sent(job_id, proposal_id):
-                return True, None
+                return True, None, None
 
             from app.agents.graph import send_node
 
@@ -354,6 +434,7 @@ def create_dispatcher() -> Dispatcher:
             state.update(send_result)
             send_success = send_result.get("outcome_status") == "sent"
             send_error = send_result.get("send_error") or None
+            send_debug = send_result.get("send_debug") or None
             learning = LearningAgent()
             learn_result = await learning.run(state)
             state.update(learn_result)
@@ -362,6 +443,7 @@ def create_dispatcher() -> Dispatcher:
             state.update(result)
             send_success = state.get("outcome_status") == "sent"
             send_error = state.get("send_error") or None
+            send_debug = state.get("send_debug") or None
 
         reward_system = RewardSystem()
         await reward_system.record_outcome(
@@ -369,7 +451,7 @@ def create_dispatcher() -> Dispatcher:
             uuid.UUID(proposal_id),
             state.get("outcome_status", "sent" if send_success else "draft"),
         )
-        return send_success, send_error
+        return send_success, send_error, send_debug
 
     dp["bot_instance"] = bot
     return dp
@@ -380,7 +462,7 @@ async def run_bot() -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required for JobPilot AI Telegram bot")
 
-    bot = Bot(token=settings.telegram_bot_token)
+    bot = create_telegram_bot(settings.telegram_bot_token, settings)
     dp = create_dispatcher()
 
     logger.info("JobPilot AI Telegram bot starting")

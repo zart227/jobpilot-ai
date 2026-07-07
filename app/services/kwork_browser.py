@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,7 +10,7 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from app.config import get_settings
-from app.utils.formatting import competitive_offer_price
+from app.utils.formatting import KWORK_MAX_OFFER_CHARS, competitive_offer_price
 
 logger = structlog.get_logger(__name__)
 
@@ -174,8 +175,9 @@ def _normalize_project_url(job_url: str) -> str:
 
 async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str) -> None:
     editor = page.locator(f'.trumbowyg-editor[placeholder*="{placeholder_part}"]')
-    await editor.click(force=True)
-    await editor.fill(value)
+    await editor.first.wait_for(state="visible", timeout=30000)
+    await editor.first.click(force=True)
+    await editor.first.fill(value)
     field_name = await page.evaluate(
         """(part) => {
             const editor = [...document.querySelectorAll(".trumbowyg-editor")]
@@ -187,6 +189,87 @@ async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str) -> None
     )
     if field_name:
         await page.locator(f'textarea[name="{field_name}"]').fill(value, force=True)
+
+
+async def _fill_price_input(page: Page, price: int) -> tuple[bool, str | None]:
+    """Fill Kwork offer price field; form markup varies by project category."""
+    await page.wait_for_timeout(800)
+    method = await page.evaluate(
+        """(price) => {
+            const setValue = (input) => {
+                input.focus();
+                input.value = String(price);
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+            };
+
+            const byName = document.querySelector('input[name="price"], input[name="kwork_price"]');
+            if (byName) {
+                setValue(byName);
+                return "name";
+            }
+
+            for (const input of document.querySelectorAll("input")) {
+                const placeholder = input.placeholder || "";
+                if (/0{2,}/.test(placeholder) || /стоимость|цена/i.test(placeholder)) {
+                    setValue(input);
+                    return "placeholder";
+                }
+            }
+
+            for (const block of document.querySelectorAll(
+                ".form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label"
+            )) {
+                const text = (block.textContent || "").toLowerCase();
+                if (!text.includes("стоимость") && !text.includes("цена")) {
+                    continue;
+                }
+                const input = block.querySelector("input:not([type='hidden'])");
+                if (input) {
+                    setValue(input);
+                    return "label";
+                }
+            }
+
+            const visibleInputs = [...document.querySelectorAll(
+                ".offer-form input[type='tel'], .offer-form input[type='number'], .new-offer input[type='tel']"
+            )].filter((el) => el.offsetParent !== null);
+            if (visibleInputs.length === 1) {
+                setValue(visibleInputs[0]);
+                return "single_tel";
+            }
+
+            return null;
+        }""",
+        price,
+    )
+    if method:
+        logger.info("Kwork price input filled", method=method, offer_price=price)
+        await page.wait_for_timeout(400)
+        return True, method
+
+    playwright_selectors = (
+        'input[name="price"]',
+        'input[name="kwork_price"]',
+        'input[placeholder*="000"]',
+        '.form-item:has-text("Стоимость") input',
+        '.form-item:has-text("Цена") input',
+    )
+    for selector in playwright_selectors:
+        locator = page.locator(selector).first
+        try:
+            if await locator.count() == 0:
+                continue
+            await locator.wait_for(state="visible", timeout=3000)
+            await locator.click(force=True)
+            await locator.fill(str(price))
+            logger.info("Kwork price input filled", method=selector, offer_price=price)
+            await page.wait_for_timeout(400)
+            return True, selector
+        except Exception:
+            continue
+
+    return False, None
 
 
 async def _offer_form_ready(page: Page) -> bool:
@@ -217,13 +300,74 @@ async def _get_seller_state(page: Page) -> dict[str, Any]:
     )
 
 
+def _debug_base_name(label: str) -> tuple[str, str]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label)[:80]
+    return timestamp, f"{timestamp}_{safe_label}"
+
+
+def _save_submission_content(content: str, label: str) -> str | None:
+    """Save full offer text to a separate file; logs reference this path only."""
+    try:
+        DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        _, base = _debug_base_name(label)
+        path = DEBUG_SCREENSHOT_DIR / f"{base}_content.txt"
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except Exception as exc:
+        logger.warning("Kwork submission content save failed", label=label, error=str(exc))
+        return None
+
+
+async def _save_debug_context(
+    label: str,
+    *,
+    job_url: str,
+    content: str,
+    steps: list[str],
+    error: str,
+    screenshot: str | None = None,
+    content_file: str | None = None,
+    **extra: Any,
+) -> str | None:
+    """Persist JSON debug dump for failed Kwork offer submissions."""
+    try:
+        DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        _, base = _debug_base_name(label)
+        path = DEBUG_SCREENSHOT_DIR / f"{base}.json"
+        if not content_file and content:
+            content_file = _save_submission_content(content, label)
+        payload = {
+            "timestamp": base.split("_", 1)[0],
+            "label": label,
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "error": error,
+            "screenshot": screenshot,
+            **extra,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(
+            "Kwork debug context saved",
+            path=str(path),
+            label=label,
+            content_file=content_file,
+            content_length=len(content),
+        )
+        return str(path)
+    except Exception as exc:
+        logger.warning("Kwork debug context save failed", label=label, error=str(exc))
+        return None
+
+
 async def _save_debug_screenshot(page: Page, label: str) -> str | None:
     """Save a Playwright screenshot for Kwork automation debugging."""
     try:
         DEBUG_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label)[:80]
-        path = DEBUG_SCREENSHOT_DIR / f"{timestamp}_{safe_label}.png"
+        _, base = _debug_base_name(label)
+        path = DEBUG_SCREENSHOT_DIR / f"{base}.png"
         await page.screenshot(path=str(path), full_page=True)
         logger.info("Kwork debug screenshot saved", path=str(path), label=label, url=page.url)
         return str(path)
@@ -294,16 +438,66 @@ async def _exchange_lesson_required(page: Page) -> bool:
     )
 
 
+async def _verify_offer_on_project_page(page: Page, project_id: str) -> bool:
+    """Check project view page for signs that our offer was submitted."""
+    view_url = f"https://kwork.ru/projects/{project_id}/view"
+    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+
+    body = (await page.inner_text("body")).lower()
+    success_markers = (
+        "ваше предложение",
+        "вы предложили",
+        "редактировать предложение",
+        "отозвать предложение",
+        "ваш отклик",
+        "отклик отправлен",
+        "предложение отправлено",
+    )
+    if any(marker in body for marker in success_markers):
+        logger.info("Kwork offer verified on project page", project_id=project_id)
+        return True
+
+    propose_button = page.get_by_role("button", name="Предложить услугу")
+    if await propose_button.count() == 0 and "предложени" in body:
+        logger.info(
+            "Kwork offer likely submitted: propose button hidden on project page",
+            project_id=project_id,
+        )
+        return True
+
+    return False
+
+
 async def _verify_offer_in_my_offers(page: Page, project_id: str) -> bool:
     offers_urls = (
         "https://kwork.ru/projects?tab=offers",
         "https://kwork.ru/manage_orders?tab=offers",
+        "https://kwork.ru/manage_orders",
+        f"https://kwork.ru/projects/{project_id}/view",
     )
     link_selector = f'a[href*="/projects/{project_id}"], a[href*="project={project_id}"]'
 
     for offers_url in offers_urls:
         await page.goto(offers_url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(2500)
+        if offers_url.endswith("/view"):
+            body = (await page.inner_text("body")).lower()
+            if any(
+                marker in body
+                for marker in (
+                    "ваше предложение",
+                    "вы предложили",
+                    "редактировать предложение",
+                    "отозвать предложение",
+                )
+            ):
+                logger.info(
+                    "Kwork offer found on project view",
+                    project_id=project_id,
+                    offers_url=offers_url,
+                )
+                return True
         for _ in range(6):
             if await page.locator(link_selector).count() > 0:
                 logger.info(
@@ -426,6 +620,7 @@ async def _fill_offer_form(
     if len(content.strip()) < 150:
         content = f"{content.strip()}\n\nГотов приступить к задаче в ближайшее время."
 
+    await dismiss_overlays(page)
     await _fill_trumbowyg(page, "решать задачу", content)
 
     settings = get_settings()
@@ -442,10 +637,9 @@ async def _fill_offer_form(
         discount_percent=settings.kwork_offer_discount_percent,
     )
 
-    price_input = page.locator('input[placeholder*="000"]').first
-    await price_input.click()
-    await price_input.fill(str(price))
-    await page.wait_for_timeout(500)
+    filled, method = await _fill_price_input(page, price)
+    if not filled:
+        raise RuntimeError("Поле стоимости не найдено на форме Kwork")
 
     await _select_duration(page)
 
@@ -457,7 +651,11 @@ async def _fill_offer_form(
     want_title = await page.evaluate(
         """() => window.bus?.state?.want?.title || "Выполнение проекта" """
     )
-    await _fill_trumbowyg(page, "Введите название заказа", want_title[:200])
+    title_editor = page.locator('.trumbowyg-editor[placeholder*="название"]')
+    if await title_editor.count() > 0:
+        await _fill_trumbowyg(page, "Введите название заказа", want_title[:200])
+    elif await page.locator('.trumbowyg-editor[placeholder*="название заказа"]').count() > 0:
+        await _fill_trumbowyg(page, "название заказа", want_title[:200])
 
 
 async def _select_duration(page: Page) -> None:
@@ -484,17 +682,48 @@ async def _fail_offer(
     error: str,
     *,
     url: str | None = None,
+    job_url: str | None = None,
+    content: str = "",
+    steps: list[str] | None = None,
     **log_kwargs: Any,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, dict[str, Any]]:
+    step_list = list(steps or [])
+    step_list.append(f"ошибка: {error}")
+    content_file = _save_submission_content(content, label) if content else None
     screenshot = await _save_debug_screenshot(page, label)
+    debug_file = await _save_debug_context(
+        label,
+        job_url=job_url or url or page.url,
+        content=content,
+        steps=step_list,
+        error=error,
+        screenshot=screenshot,
+        content_file=content_file,
+        url=url or page.url,
+        **log_kwargs,
+    )
     logger.error(
         "Kwork offer step failed",
         error=error,
         screenshot=screenshot,
+        debug_file=debug_file,
+        content_file=content_file,
         url=url or page.url,
+        content_length=len(content),
+        steps=step_list,
         **log_kwargs,
     )
-    return False, error
+    debug = {
+        "job_url": job_url or url or page.url,
+        "content_length": len(content),
+        "content_file": content_file,
+        "steps": step_list,
+        "error_label": label,
+        "screenshot": screenshot,
+        "debug_file": debug_file,
+        **log_kwargs,
+    }
+    return False, error, debug
 
 
 async def submit_offer(
@@ -503,31 +732,66 @@ async def submit_offer(
     content: str,
     budget_min: float | None = None,
     budget_max: float | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    steps: list[str] = []
     project_id = _extract_project_id(job_url)
     offer_url = _offer_form_url(job_url)
     if not offer_url or not project_id:
-        logger.error("Kwork project id not found in url", url=job_url)
-        return False, "Не удалось определить ID проекта Kwork"
+        content_file = _save_submission_content(content, "no_project_id")
+        logger.error(
+            "Kwork project id not found in url",
+            url=job_url,
+            content_file=content_file,
+            content_length=len(content),
+        )
+        return False, "Не удалось определить ID проекта Kwork", {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": ["не удалось извлечь ID проекта из URL"],
+        }
 
+    settings = get_settings()
+    offer_price = competitive_offer_price(
+        budget_min,
+        budget_max,
+        discount_percent=settings.kwork_offer_discount_percent,
+    )
+
+    steps.append(f"подготовка: текст {len(content)} симв. (рекомендуется ≤1200, лимит Kwork {KWORK_MAX_OFFER_CHARS})")
+    if offer_price:
+        steps.append(f"подготовка: цена отклика {offer_price} ₽")
+
+    content_file = _save_submission_content(content, f"submit_{project_id}")
     logger.info(
         "Kwork opening offer form",
         job_url=job_url,
         offer_url=offer_url,
         project_id=project_id,
         content_length=len(content),
+        content_file=content_file,
+        offer_price=offer_price,
     )
 
+    steps.append(f"открытие формы: {offer_url}")
     await page.goto(offer_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2500)
     try:
         await page.wait_for_load_state("networkidle", timeout=60000)
     except Exception:
-        # Some Kwork pages keep long-polling; best-effort only.
         pass
+    steps.append(f"страница загружена: {page.url}")
 
     if await _is_access_blocked(page):
-        return await _fail_offer(page, "access_blocked", "Kwork заблокировал доступ с этого IP", url=offer_url)
+        return await _fail_offer(
+            page,
+            "access_blocked",
+            "Kwork заблокировал доступ с этого IP",
+            url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
+        )
 
     if "/login" in page.url:
         return await _fail_offer(
@@ -535,23 +799,41 @@ async def submit_offer(
             "session_expired",
             "Сессия Kwork устарела — пересохраните data/kwork_session.json",
             url=page.url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
         )
 
     if "new_offer" not in page.url:
+        steps.append("форма new_offer недоступна, проверка существующих откликов")
         if await _verify_offer_in_my_offers(page, project_id):
             logger.info("Kwork offer already exists in my offers", project_id=project_id)
-            return True, None
+            return True, None, None
+        steps.append("диагностика блокировки на странице проекта")
         blocker = await _diagnose_offer_blocker(page, job_url)
         if blocker:
-            return await _fail_offer(page, "offer_blocked", blocker, url=offer_url, reason=blocker)
+            return await _fail_offer(
+                page,
+                "offer_blocked",
+                blocker,
+                url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
+                reason=blocker,
+            )
         return await _fail_offer(
             page,
             "form_unavailable",
             "Форма отклика недоступна на Kwork",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
             redirect=page.url,
         )
 
+    steps.append("форма отклика открыта")
     ready, ready_error = await _check_seller_ready(page)
     if not ready:
         return await _fail_offer(
@@ -559,7 +841,11 @@ async def submit_offer(
             "seller_not_ready",
             ready_error or "Профиль продавца не готов к откликам",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
         )
+    steps.append("профиль продавца готов")
 
     if await _exchange_lesson_required(page):
         return await _fail_offer(
@@ -567,13 +853,17 @@ async def submit_offer(
             "exchange_lesson_required",
             "Пройдите урок по работе на Бирже на Kwork",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
         )
+    steps.append("урок по Бирже не требуется")
 
     textarea = page.locator('textarea[name="description"]')
     try:
         await textarea.wait_for(state="visible", timeout=60000)
     except Exception:
-        debug = {
+        form_debug = {
             "title": await page.title(),
             "description_count": await textarea.count(),
             "submit_count": await page.get_by_role("button", name="Предложить").count(),
@@ -583,12 +873,29 @@ async def submit_offer(
             "form_not_loaded",
             "Форма отклика не загрузилась",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
             current_url=page.url,
-            **debug,
+            **form_debug,
         )
 
-    await _fill_offer_form(page, content, budget_min, budget_max)
+    steps.append("заполнение полей формы")
+    try:
+        await _fill_offer_form(page, content, budget_min, budget_max)
+    except Exception as exc:
+        return await _fail_offer(
+            page,
+            "form_fill_error",
+            f"Не удалось заполнить форму: {exc}",
+            url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
+            offer_price=offer_price,
+        )
     await _save_debug_screenshot(page, f"before_submit_{project_id}")
+    steps.append("форма заполнена, скриншот before_submit сохранён")
 
     submit_button = page.get_by_role("button", name="Предложить")
     if await submit_button.count() == 0:
@@ -597,22 +904,32 @@ async def submit_offer(
             "submit_button_missing",
             "Кнопка «Предложить» не найдена на форме",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
         )
 
+    steps.append("нажатие «Предложить»")
     await submit_button.scroll_into_view_if_needed()
     await submit_button.click(force=True)
     await page.wait_for_timeout(5000)
+    steps.append(f"ожидание ответа, текущий URL: {page.url}")
 
     if "new_offer" in page.url:
         errors = await _collect_visible_form_errors(page)
         body = (await page.inner_text("body")).lower()
         if errors:
+            steps.append(f"ошибки формы: {', '.join(errors)}")
             return await _fail_offer(
                 page,
                 "form_validation_error",
                 errors[0],
                 url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
                 errors=errors,
+                offer_price=offer_price,
             )
         if await _exchange_lesson_required(page):
             return await _fail_offer(
@@ -620,6 +937,9 @@ async def submit_offer(
                 "exchange_lesson_after_submit",
                 "Пройдите урок по работе на Бирже на Kwork",
                 url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
             )
         if "не подтвержден" in body or "онбординг" in body:
             return await _fail_offer(
@@ -627,18 +947,29 @@ async def submit_offer(
                 "onboarding_required_after_submit",
                 "Профиль продавца не подтверждён на Kwork",
                 url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
             )
         return await _fail_offer(
             page,
             "stayed_on_form",
             "Kwork не принял отклик — форма осталась открытой",
             url=offer_url,
+            job_url=job_url,
+            content=content,
+            steps=steps,
             current_url=page.url,
+            offer_price=offer_price,
         )
+
+    if await _verify_offer_on_project_page(page, project_id):
+        logger.info("Kwork offer verified on project page after submit", project_id=project_id)
+        return True, None, None
 
     if await _verify_offer_in_my_offers(page, project_id):
         logger.info("Kwork offer verified in my offers", project_id=project_id)
-        return True, None
+        return True, None, None
 
     body = (await page.inner_text("body")).lower()
     if any(
@@ -650,16 +981,37 @@ async def submit_offer(
         )
     ):
         logger.info("Kwork offer submitted", url=offer_url)
-        return True, None
+        return True, None, None
 
     screenshot = await _save_debug_screenshot(page, f"unverified_submit_{project_id}")
+    debug_file = await _save_debug_context(
+        "unverified_submit",
+        job_url=job_url,
+        content=content,
+        steps=steps + ["отклик не найден в «Мои отклики»"],
+        error="Отклик не появился в «Мои отклики» — отправка не подтверждена",
+        screenshot=screenshot,
+        content_file=content_file,
+        offer_price=offer_price,
+    )
     logger.warning(
         "Kwork offer not found in my offers after submit",
         url=offer_url,
         current_url=page.url,
         screenshot=screenshot,
+        debug_file=debug_file,
+        content_file=content_file,
     )
-    return False, "Отклик не появился в «Мои отклики» — отправка не подтверждена"
+    return False, "Отклик не появился в «Мои отклики» — отправка не подтверждена", {
+        "job_url": job_url,
+        "content_length": len(content),
+        "content_file": content_file,
+        "steps": steps + ["отклик не найден в «Мои отклики»"],
+        "error_label": "unverified_submit",
+        "screenshot": screenshot,
+        "debug_file": debug_file,
+        "offer_price": offer_price,
+    }
 
 
 async def send_kwork_offer(
@@ -667,26 +1019,82 @@ async def send_kwork_offer(
     content: str,
     budget_min: float | None = None,
     budget_max: float | None = None,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, dict[str, Any] | None]:
     settings = get_settings()
     playwright: Playwright | None = None
     browser: Browser | None = None
+    steps = ["запуск браузера"]
 
     try:
         playwright, browser, page = await launch_browser()
+        steps.append("браузер запущен")
         logged_in = await login(page, settings.kwork_email, settings.kwork_password)
         if not logged_in:
-            await _save_debug_screenshot(page, "login_failed")
-            return False, "Не удалось войти в Kwork — проверьте сессию"
+            content_file = _save_submission_content(content, "login_failed")
+            screenshot = await _save_debug_screenshot(page, "login_failed")
+            debug_file = await _save_debug_context(
+                "login_failed",
+                job_url=job_url,
+                content=content,
+                steps=steps + ["вход в Kwork не удался"],
+                error="Не удалось войти в Kwork — проверьте сессию",
+                screenshot=screenshot,
+                content_file=content_file,
+            )
+            return False, "Не удалось войти в Kwork — проверьте сессию", {
+                "job_url": job_url,
+                "content_length": len(content),
+                "content_file": content_file,
+                "steps": steps + ["вход в Kwork не удался"],
+                "error_label": "login_failed",
+                "screenshot": screenshot,
+                "debug_file": debug_file,
+            }
+        steps.append("вход в Kwork успешен")
         logger.info(
             "Kwork login ok, submitting offer",
             job_url=job_url,
             storage_state=settings.kwork_storage_state or None,
         )
-        return await submit_offer(page, job_url, content, budget_min, budget_max)
+        success, error, debug = await submit_offer(page, job_url, content, budget_min, budget_max)
+        if debug and "steps" in debug:
+            debug["steps"] = steps + debug["steps"]
+        elif not success:
+            content_file = _save_submission_content(content, "submit_failed")
+            debug = {
+                "job_url": job_url,
+                "content_length": len(content),
+                "content_file": content_file,
+                "steps": steps,
+                "error_label": "submit_failed",
+            }
+        return success, error, debug
     except Exception as exc:
-        logger.error("Kwork offer send failed", error=str(exc), url=job_url, exc_type=type(exc).__name__)
-        return False, f"Ошибка отправки: {exc}"
+        content_file = _save_submission_content(content, "exception")
+        logger.error(
+            "Kwork offer send failed",
+            error=str(exc),
+            url=job_url,
+            exc_type=type(exc).__name__,
+            content_file=content_file,
+            content_length=len(content),
+        )
+        debug_file = await _save_debug_context(
+            "exception",
+            job_url=job_url,
+            content=content,
+            steps=steps + [f"исключение: {type(exc).__name__}"],
+            error=str(exc),
+            content_file=content_file,
+        )
+        return False, f"Ошибка отправки: {exc}", {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps + [f"исключение: {type(exc).__name__}: {exc}"],
+            "error_label": "exception",
+            "debug_file": debug_file,
+        }
     finally:
         if playwright and browser:
             await close_browser(playwright, browser)

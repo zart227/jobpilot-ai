@@ -14,8 +14,7 @@ from app.utils.formatting import (
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are ProposalAgent for JobPilot AI.
-Write a short, concrete freelance proposal in plain text. NOT a template.
+SYSTEM_PROMPT = """Write a short, concrete freelance proposal in plain text. NOT a template.
 
 Style (critical):
 - ALWAYS start with a greeting: "Здравствуйте." for Russian jobs, "Hello." for English.
@@ -46,8 +45,7 @@ EXECUTION_PLAN:
 TIMELINE:
 <brief milestones with durations>"""
 
-KWORK_SYSTEM_PROMPT = """You are ProposalAgent for JobPilot AI, specialized in Kwork Exchange offers.
-Write a selling Kwork offer (отклик) in Russian. Each offer must be unique for THIS project.
+KWORK_SYSTEM_PROMPT = """Write a selling Kwork offer (отклик) in Russian for Kwork Exchange. Each offer must be unique for THIS project.
 This text is sent directly to the buyer on Kwork. One connect is spent per offer.
 
 Kwork selling rules (from Kwork training, critical):
@@ -65,14 +63,19 @@ Kwork selling rules (from Kwork training, critical):
 9. Do NOT use em dash (—). Use commas, periods, or hyphen (-) instead.
 10. Do NOT suggest calls or meetings.
 
-PROPOSAL structure (follow this order in one cohesive text, 200-350 words):
+PROPOSAL structure (follow this order in one cohesive text):
 - Greeting with buyer name if CLIENT NAME is provided ("Добрый день, Иван!").
 - One sentence why this task is interesting + link to a relevant portfolio project.
 - Concrete overlap between that project and the buyer's task (technologies, features).
 - How you will solve it: stack, architecture, deliverables.
-- 1-2 short guarantees (speed, code quality, bug-fix window) only if believable from bio.
 - YOUR OFFER PRICE quoted exactly once (if provided).
 - 2-3 numbered questions specific to this posting.
+
+Length (critical):
+- PROPOSAL is sent to the buyer on Kwork. Keep it SHORT: 100-150 words, max 1200 characters.
+- Kwork hard limit is 2000 characters. Buyers skim offers; long text hurts conversion.
+- Do NOT pad with guarantees, filler, or repeated points.
+- EXECUTION_PLAN and TIMELINE below are for internal Telegram review ONLY. They are NOT sent to Kwork.
 
 Pricing (critical):
 - If YOUR OFFER PRICE is provided, quote EXACTLY that amount once in PROPOSAL.
@@ -182,10 +185,19 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
             )
             parsed["execution_plan"] = sanitize_proposal_text(parsed["execution_plan"])
             parsed["timeline"] = sanitize_proposal_text(parsed["timeline"])
+            proposal_len = len(parsed["proposal"])
+            if is_kwork and proposal_len > 1200:
+                logger.warning(
+                    "Kwork proposal exceeds recommended length",
+                    title=job.get("title"),
+                    length=proposal_len,
+                    recommended_max=1200,
+                )
             logger.info(
                 "ProposalAgent generated proposal",
                 title=job.get("title"),
                 platform=job.get("platform"),
+                proposal_length=proposal_len if is_kwork else None,
             )
             return {
                 "proposal_content": parsed["proposal"],

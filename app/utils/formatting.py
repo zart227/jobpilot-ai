@@ -131,6 +131,7 @@ def sanitize_proposal_text(text: str) -> str:
 
 
 KWORK_MIN_OFFER_CHARS = 150
+KWORK_MAX_OFFER_CHARS = 2000
 
 KWORK_GENERIC_PHRASES = (
     "имею большой опыт",
@@ -177,20 +178,16 @@ def compose_kwork_submission(
     execution_plan: str | None = None,
     timeline: str | None = None,
 ) -> str:
-    """Merge proposal sections into one Kwork offer text (min 150 chars)."""
-    parts = [sanitize_proposal_text(proposal)]
-    plan = sanitize_proposal_text(execution_plan or "")
-    schedule = sanitize_proposal_text(timeline or "")
-
-    body = parts[0]
-    if plan and plan[:40].lower() not in body.lower():
-        parts.append(f"Как буду работать:\n{plan}")
-    if schedule and schedule[:40].lower() not in body.lower():
-        parts.append(f"Сроки:\n{schedule}")
-
-    text = "\n\n".join(p for p in parts if p)
+    """Prepare proposal text for Kwork (only PROPOSAL is sent; plan/timeline are internal)."""
+    text = sanitize_proposal_text(proposal)
     if len(text) < KWORK_MIN_OFFER_CHARS:
         text = f"{text}\n\nГотов приступить к задаче в ближайшее время."
+    if len(text) > KWORK_MAX_OFFER_CHARS:
+        structlog.get_logger(__name__).warning(
+            "Kwork submission exceeds platform limit",
+            length=len(text),
+            max_chars=KWORK_MAX_OFFER_CHARS,
+        )
     return text
 
 
