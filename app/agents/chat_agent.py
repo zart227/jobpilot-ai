@@ -3,13 +3,12 @@ import re
 
 import structlog
 
-from app.llm.provider import get_llm_provider
+from app.llm.provider import get_simple_llm_provider
 from app.schemas.agent_state import JobPilotState
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are ChatAgent for JobPilot AI.
-Handle client replies to freelance proposals.
+SYSTEM_PROMPT = """Handle client replies to freelance proposals.
 
 Classify intent and respond concisely.
 
@@ -26,7 +25,7 @@ Be helpful, professional, and move toward closing the deal when appropriate."""
 
 class ChatAgent:
     def __init__(self) -> None:
-        self._llm = get_llm_provider()
+        self._llm = get_simple_llm_provider()
 
     async def run(self, state: JobPilotState) -> dict:
         job = state.get("job_data", {})

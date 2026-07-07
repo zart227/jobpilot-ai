@@ -2,7 +2,6 @@ import asyncio
 import uuid
 
 import structlog
-from aiogram import Bot
 
 from app.agents.graph import compile_jobpilot_graph
 from app.celery_app import celery_app
@@ -10,6 +9,7 @@ from app.config import get_settings
 from app.scrapers.registry import get_scrapers
 from app.services.job_pipeline import JobPipelineService
 from app.telegram.bot import notify_new_proposal
+from app.utils.proxy import create_telegram_bot
 
 logger = structlog.get_logger(__name__)
 
@@ -99,7 +99,7 @@ async def _scrape_and_process() -> dict:
             processed += 1
             settings = get_settings()
             if settings.telegram_bot_token and settings.telegram_admin_chat_id:
-                bot = Bot(token=settings.telegram_bot_token)
+                bot = create_telegram_bot(settings.telegram_bot_token, settings)
                 try:
                     await notify_new_proposal(bot, job_id, proposal_id)
                     notified += 1
@@ -149,7 +149,7 @@ async def _process_job(job_id: uuid.UUID) -> dict:
     if proposal_id:
         settings = get_settings()
         if settings.telegram_bot_token:
-            bot = Bot(token=settings.telegram_bot_token)
+            bot = create_telegram_bot(settings.telegram_bot_token, settings)
             try:
                 await notify_new_proposal(bot, job_id, proposal_id)
             finally:

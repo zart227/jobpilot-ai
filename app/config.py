@@ -36,8 +36,41 @@ class Settings(BaseSettings):
     llm_provider: Literal["openai", "anthropic", "cursor"] = Field(
         default="openai", alias="LLM_PROVIDER"
     )
+    llm_simple_provider: Literal["ollama", "openai", "anthropic", "cursor", "same"] = Field(
+        default="ollama",
+        alias="LLM_SIMPLE_PROVIDER",
+        description="Provider for filter/score/chat/learning; proposal uses LLM_PROVIDER",
+    )
+    ollama_base_url: str = Field(
+        default="https://ollama.com",
+        alias="OLLAMA_BASE_URL",
+    )
+    ollama_api_key: str = Field(
+        default="",
+        alias="OLLAMA_API_KEY",
+        description="Ollama Cloud API key (ollama.com/settings/keys); optional for local ollama signin",
+    )
+    ollama_model: str = Field(default="minimax-m2.5", alias="OLLAMA_MODEL")
+    ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    openai_timeout_seconds: float = Field(default=30.0, alias="OPENAI_TIMEOUT_SECONDS")
+    openai_max_retries: int = Field(default=3, alias="OPENAI_MAX_RETRIES")
+    proxy: str = Field(default="", alias="PROXY")
+    openai_proxy_list: str = Field(
+        default="",
+        alias="OPENAI_PROXY_LIST",
+        description="Path to proxy list for OpenAI (e.g. Poland residential)",
+    )
+    telegram_proxy_list: str = Field(
+        default="",
+        alias="TELEGRAM_PROXY_LIST",
+        description="Path to proxy list for Telegram bot",
+    )
+    proxy_rotate: bool = Field(default=True, alias="PROXY_ROTATE")
+    proxy_rotate_mode: str = Field(default="sequential", alias="PROXY_ROTATE_MODE")
+    proxy_max_attempts: int = Field(default=5, alias="PROXY_MAX_ATTEMPTS")
+    proxy_state_dir: str = Field(default="./data", alias="PROXY_STATE_DIR")
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-3-5-haiku-latest", alias="ANTHROPIC_MODEL")
     cursor_api_key: str = Field(default="", alias="CURSOR_API_KEY")

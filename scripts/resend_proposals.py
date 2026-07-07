@@ -3,13 +3,13 @@
 import asyncio
 import uuid
 
-from aiogram import Bot
 from sqlalchemy import select
 
 from app.config import get_settings
 from app.db.models import Job, Proposal
 from app.db.session import AsyncSessionLocal
 from app.telegram.bot import notify_new_proposal
+from app.utils.proxy import create_telegram_bot
 
 
 async def reset_false_sent() -> int:
@@ -44,7 +44,7 @@ async def resend_pending_alerts() -> int:
         proposals = result.scalars().all()
 
     seen_jobs: set[uuid.UUID] = set()
-    bot = Bot(token=settings.telegram_bot_token)
+    bot = create_telegram_bot(settings.telegram_bot_token, settings)
     sent = 0
     try:
         for proposal in proposals:

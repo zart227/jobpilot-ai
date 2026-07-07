@@ -7,13 +7,12 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.models import ScoringWeight
 from app.db.session import AsyncSessionLocal
-from app.llm.provider import get_llm_provider
+from app.llm.provider import get_simple_llm_provider
 from app.schemas.agent_state import JobPilotState
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are ScoringAgent for JobPilot AI.
-Score the job opportunity from 0 to 100 based on weighted criteria.
+SYSTEM_PROMPT = """Score the job opportunity from 0 to 100 based on weighted criteria.
 
 Respond ONLY with valid JSON:
 {
@@ -35,7 +34,7 @@ If job requires excluded skills as primary stack, score below 20."""
 class ScoringAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._llm = get_llm_provider()
+        self._llm = get_simple_llm_provider()
 
     async def run(self, state: JobPilotState) -> dict:
         job = state.get("job_data", {})

@@ -7,15 +7,14 @@ from sqlalchemy import func, select, update
 from app.config import get_settings
 from app.db.models import Outcome, Proposal, Reward, ScoringWeight
 from app.db.session import AsyncSessionLocal
-from app.llm.provider import get_llm_provider
+from app.llm.provider import get_simple_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.agent_state import JobPilotState
 from app.services.reward_system import REWARD_MAP
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are LearningAgent for JobPilot AI.
-Analyze proposal outcomes and suggest improvements.
+SYSTEM_PROMPT = """Analyze proposal outcomes and suggest improvements.
 
 Based on historical data, provide:
 1. Adjusted scoring weights (must sum to 1.0)
@@ -33,7 +32,7 @@ Respond ONLY with valid JSON:
 class LearningAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._llm = get_llm_provider()
+        self._llm = get_simple_llm_provider()
         self._memory = get_memory_store()
 
     async def run(self, state: JobPilotState) -> dict:

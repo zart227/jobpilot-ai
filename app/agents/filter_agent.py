@@ -4,14 +4,13 @@ import re
 import structlog
 
 from app.config import get_settings
-from app.llm.provider import get_llm_provider
+from app.llm.provider import get_simple_llm_provider
 from app.schemas.agent_state import JobPilotState
 from app.utils.formatting import format_budget
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """You are FilterAgent for JobPilot AI.
-Determine if a freelance job posting is relevant for the developer profile.
+SYSTEM_PROMPT = """Determine if a freelance job posting is relevant for the developer profile.
 
 Respond ONLY with valid JSON:
 {"relevant": true/false, "reason": "brief explanation"}
@@ -28,7 +27,7 @@ Rules:
 class FilterAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._llm = get_llm_provider()
+        self._llm = get_simple_llm_provider()
         self._excluded = [
             s.strip().lower()
             for s in self._settings.developer_excluded_skills.split(",")
