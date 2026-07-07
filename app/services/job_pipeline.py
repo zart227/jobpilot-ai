@@ -153,6 +153,88 @@ class JobPipelineService:
             await session.commit()
             return proposal_id
 
+    async def regenerate_proposal(self, job_id: uuid.UUID) -> uuid.UUID | None:
+        """Re-run ProposalAgent for a job that has not been sent yet."""
+        if await self.is_job_sent(job_id):
+            return None
+
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job or not job.is_relevant:
+                return None
+
+        state = await self.job_to_state(job_id)
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return None
+            state["score"] = job.score or 0
+            state["is_relevant"] = bool(job.is_relevant)
+
+        from app.agents.proposal_agent import ProposalAgent
+
+        result = await ProposalAgent().run(state)
+        content = result.get("proposal_content")
+        if not content:
+            logger.warning("JobPilot AI proposal regeneration empty", job_id=str(job_id))
+            return None
+
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, job_id)
+            if not job:
+                return None
+
+            proposal_result = await session.execute(
+                select(Proposal)
+                .where(Proposal.job_id == job_id)
+                .order_by(Proposal.created_at.desc())
+                .limit(1)
+            )
+            proposal = proposal_result.scalar_one_or_none()
+            if proposal:
+                proposal.content = content
+                proposal.execution_plan = result.get("execution_plan")
+                proposal.timeline = result.get("timeline")
+                proposal.version += 1
+                proposal.status = "pending_approval"
+                proposal.sent_at = None
+            else:
+                proposal = Proposal(
+                    job_id=job_id,
+                    content=content,
+                    execution_plan=result.get("execution_plan"),
+                    timeline=result.get("timeline"),
+                    status="pending_approval",
+                )
+                session.add(proposal)
+
+            job.status = "pending_approval"
+            await session.flush()
+            proposal_id = proposal.id
+            await session.commit()
+            logger.info(
+                "JobPilot AI proposal regenerated",
+                job_id=str(job_id),
+                proposal_id=str(proposal_id),
+                version=proposal.version,
+            )
+            return proposal_id
+
+    async def supersede_telegram_pending(self, job_id: uuid.UUID) -> int:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(TelegramPending).where(
+                    TelegramPending.job_id == job_id,
+                    TelegramPending.status == "pending",
+                )
+            )
+            rows = result.scalars().all()
+            for row in rows:
+                row.status = "superseded"
+            if rows:
+                await session.commit()
+            return len(rows)
+
     async def create_telegram_pending(
         self,
         job_id: uuid.UUID,
