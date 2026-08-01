@@ -136,7 +136,7 @@ def get_service_proxy_list(settings: Settings, service: ServiceName) -> Path | N
 
 
 def get_proxy_rotator(settings: Settings, service: ServiceName) -> ProxyRotator | None:
-    if settings.proxy or not settings.proxy_rotate:
+    if not settings.proxy_enabled or settings.proxy or not settings.proxy_rotate:
         return None
 
     list_path = get_service_proxy_list(settings, service)
@@ -155,11 +155,14 @@ def get_proxy_rotator(settings: Settings, service: ServiceName) -> ProxyRotator 
 
 
 def get_proxy_candidates(settings: Settings, service: ServiceName) -> list[str | None]:
+    if not settings.proxy_enabled:
+        return [None]
+
     if settings.proxy:
         return [settings.proxy]
 
     rotator = get_proxy_rotator(settings, service)
-    if rotator:
+    if rotator and settings.proxy_max_attempts > 0:
         candidates: list[str | None] = []
         attempts = min(settings.proxy_max_attempts, rotator.total)
         for _ in range(attempts):
@@ -196,6 +199,54 @@ def create_telegram_bot(token: str, settings: Settings | None = None) -> Bot:
         session = AiohttpSession(proxy=proxy)
         return Bot(token=token, session=session)
     return Bot(token=token)
+
+
+async def send_telegram_message(
+    token: str,
+    chat_id: int,
+    text: str,
+    *,
+    settings: Settings | None = None,
+    parse_mode: str | None = None,
+    disable_web_page_preview: bool | None = None,
+) -> None:
+    """Send Telegram message with proxy rotation and direct fallback."""
+    cfg = settings or get_settings()
+    candidates = list(get_proxy_candidates(cfg, "telegram"))
+    if None not in candidates:
+        candidates.append(None)
+
+    last_error: Exception | None = None
+    for proxy in candidates:
+        bot: Bot | None = None
+        try:
+            if proxy:
+                bot = Bot(token=token, session=AiohttpSession(proxy=proxy))
+            else:
+                logger.info("Telegram sending without proxy")
+                bot = Bot(token=token)
+            kwargs: dict = {"chat_id": chat_id, "text": text}
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            if disable_web_page_preview is not None:
+                kwargs["disable_web_page_preview"] = disable_web_page_preview
+            await bot.send_message(**kwargs)
+            return
+        except Exception as exc:
+            last_error = exc
+            if proxy:
+                mark_proxy_failed(cfg, "telegram", proxy)
+                logger.warning(
+                    "Telegram proxy failed, retrying",
+                    proxy=mask_proxy(proxy),
+                    error=str(exc),
+                )
+        finally:
+            if bot and bot.session:
+                await bot.session.close()
+
+    if last_error:
+        raise last_error
 
 
 def mark_proxy_failed(settings: Settings, service: ServiceName, proxy: str | None) -> None:

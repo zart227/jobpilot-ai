@@ -52,11 +52,47 @@ class Settings(BaseSettings):
     )
     ollama_model: str = Field(default="minimax-m2.5", alias="OLLAMA_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
+    ollama_session_cookie: str = Field(
+        default="",
+        alias="OLLAMA_SESSION_COOKIE",
+        description="Browser __Secure-session cookie for ollama.com/settings usage scrape",
+    )
+    ollama_aid: str = Field(
+        default="",
+        alias="OLLAMA_AID",
+        description="Browser aid cookie for ollama.com/settings usage scrape",
+    )
+    ollama_cf_clearance: str = Field(
+        default="",
+        alias="OLLAMA_CF_CLEARANCE",
+        description="Optional Cloudflare cf_clearance cookie for settings scrape",
+    )
+    ollama_usage_warn_percent: float = Field(default=85.0, alias="OLLAMA_USAGE_WARN_PERCENT")
+    ollama_usage_critical_percent: float = Field(default=95.0, alias="OLLAMA_USAGE_CRITICAL_PERCENT")
+    ollama_usage_cache_seconds: int = Field(default=60, alias="OLLAMA_USAGE_CACHE_SECONDS")
+    ollama_usage_alert_cooldown_seconds: int = Field(
+        default=3600,
+        alias="OLLAMA_USAGE_ALERT_COOLDOWN_SECONDS",
+    )
+    ollama_auto_fallback: bool = Field(
+        default=True,
+        alias="OLLAMA_AUTO_FALLBACK",
+        description="Fall back to OpenAI for simple LLM when Ollama limits are critical",
+    )
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_timeout_seconds: float = Field(default=30.0, alias="OPENAI_TIMEOUT_SECONDS")
     openai_max_retries: int = Field(default=3, alias="OPENAI_MAX_RETRIES")
-    proxy: str = Field(default="", alias="PROXY")
+    proxy: str = Field(
+        default="",
+        alias="PROXY",
+        description="Single proxy for all services (HTTP/SOCKS5), e.g. v2raytun local port",
+    )
+    proxy_enabled: bool = Field(
+        default=True,
+        alias="PROXY_ENABLED",
+        description="Master switch: false = direct connection, no proxy lists",
+    )
     openai_proxy_list: str = Field(
         default="",
         alias="OPENAI_PROXY_LIST",
@@ -81,6 +117,33 @@ class Settings(BaseSettings):
     cursor_api_key: str = Field(default="", alias="CURSOR_API_KEY")
     cursor_model: str = Field(default="composer-2.5", alias="CURSOR_MODEL")
     cursor_workspace: str = Field(default=".", alias="CURSOR_WORKSPACE")
+    cursor_workspace_host: str = Field(
+        default="",
+        alias="CURSOR_WORKSPACE_HOST",
+        description="Host path to project for Cursor agent (required in Docker)",
+    )
+    cursor_bridge_port: int = Field(default=9247, alias="CURSOR_BRIDGE_PORT")
+    jobpilot_in_docker: bool = Field(default=False, alias="JOBPILOT_IN_DOCKER")
+    cursor_agent_timeout_seconds: float = Field(
+        default=600.0,
+        alias="CURSOR_AGENT_TIMEOUT_SECONDS",
+        description="Timeout for dev-agent runs via Cursor SDK bridge",
+    )
+    cursor_bridge_base_url: str = Field(
+        default="",
+        alias="CURSOR_BRIDGE_BASE_URL",
+        description="External bridge URL when bot runs in Docker (from run_cursor_bridge.py)",
+    )
+    cursor_bridge_auth_token: str = Field(
+        default="",
+        alias="CURSOR_BRIDGE_AUTH_TOKEN",
+        description="Auth token printed by run_cursor_bridge.py",
+    )
+    telegram_dev_agent_enabled: bool = Field(
+        default=True,
+        alias="TELEGRAM_DEV_AGENT_ENABLED",
+        description="Allow /dev commands to talk to local Cursor agent",
+    )
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_admin_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_CHAT_ID")
@@ -125,6 +188,33 @@ class Settings(BaseSettings):
         default=15.0,
         alias="KWORK_OFFER_DISCOUNT_PERCENT",
         description="Bid this % below buyer desired budget (competitive pricing)",
+    )
+    kwork_pause_enabled: bool = Field(
+        default=True,
+        alias="KWORK_PAUSE_ENABLED",
+        description="Pause Kwork scrape, LLM pipeline and proposal delivery when connects exhausted",
+    )
+    kwork_pause_auto: bool = Field(
+        default=True,
+        alias="KWORK_PAUSE_AUTO",
+        description="Auto-detect connects limit and resume date from Kwork UI",
+    )
+    kwork_pause_until: str = Field(
+        default="",
+        alias="KWORK_PAUSE_UNTIL",
+        description="Manual resume date override (YYYY-MM-DD); used when KWORK_PAUSE_AUTO=false",
+    )
+    kwork_pause_timezone: str = Field(
+        default="Europe/Moscow",
+        alias="KWORK_PAUSE_TIMEZONE",
+    )
+    kwork_pause_check_interval_hours: int = Field(
+        default=6,
+        alias="KWORK_PAUSE_CHECK_INTERVAL_HOURS",
+    )
+    kwork_pause_state_file: str = Field(
+        default="data/kwork_connects_pause.json",
+        alias="KWORK_PAUSE_STATE_FILE",
     )
 
     min_score_threshold: int = Field(default=35, alias="MIN_SCORE_THRESHOLD")

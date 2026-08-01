@@ -8,8 +8,14 @@ build/
 .venv/
 venv/
 data/kwork_session.json
+data/kwork_connects_pause.json
 data/kwork_debug/
 data/*_proxy_rotation.json
+data/ollama_usage_alert.json
+data/cursor_bridge.env
+data/cursor_bridge.pid
+data/cursor_bridge_socat.pid
+data/cursor_bridge.log
 proxy-lists/
 .pytest_cache/
 .ruff_cache/
