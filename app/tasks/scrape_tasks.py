@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from typing import Any
 
 import structlog
 
@@ -8,7 +9,10 @@ from app.celery_app import celery_app
 from app.config import get_settings
 from app.scrapers.registry import get_scrapers
 from app.services.job_pipeline import JobPipelineService
+from app.services.kwork_browser import refresh_kwork_pause_from_kwork
+from app.services.kwork_pause import KWORK_PLATFORM, get_kwork_pause_reason, is_kwork_paused
 from app.telegram.bot import notify_new_proposal
+from app.llm.ollama_usage import maybe_notify_ollama_usage_warning
 from app.utils.proxy import create_telegram_bot
 
 logger = structlog.get_logger(__name__)
@@ -48,20 +52,23 @@ async def _queue_unprocessed_jobs(exclude: set[str] | None = None) -> int:
         Integer,
     )
     async with AsyncSessionLocal() as session:
+        filters = [
+            Job.status != "sent",
+            or_(
+                Job.is_relevant.is_(None),
+                Job.status == "new",
+                and_(
+                    Job.is_relevant.is_(True),
+                    Job.status == "scored",
+                    ~Job.id.in_(select(Proposal.job_id)),
+                ),
+            ),
+        ]
+        if is_kwork_paused():
+            filters.append(Job.platform != KWORK_PLATFORM)
         result = await session.execute(
             select(Job.id)
-            .where(
-                Job.status != "sent",
-                or_(
-                    Job.is_relevant.is_(None),
-                    Job.status == "new",
-                    and_(
-                        Job.is_relevant.is_(True),
-                        Job.status == "scored",
-                        ~Job.id.in_(select(Proposal.job_id)),
-                    ),
-                ),
-            )
+            .where(*filters)
             .order_by(desc(kwork_project_id).nullslast(), Job.created_at.desc())
         )
         job_ids = [str(row[0]) for row in result.all() if str(row[0]) not in exclude]
@@ -75,7 +82,45 @@ async def _queue_unprocessed_jobs(exclude: set[str] | None = None) -> int:
 
 
 async def _scrape_and_process() -> dict:
+    settings = get_settings()
+    pause_refresh: dict[str, Any] = {}
+    if settings.kwork_pause_enabled and settings.kwork_pause_auto:
+        try:
+            pause_refresh = await refresh_kwork_pause_from_kwork()
+        except Exception as exc:
+            logger.warning("Kwork pause refresh failed", error=str(exc))
+
+    pause_reason = get_kwork_pause_reason()
+    if pause_reason:
+        logger.info("JobPilot AI Kwork pipeline paused", reason=pause_reason)
+
+    if settings.telegram_bot_token and settings.telegram_admin_chat_id:
+        bot = create_telegram_bot(settings.telegram_bot_token, settings)
+        try:
+            await maybe_notify_ollama_usage_warning(settings, bot)
+        except Exception as exc:
+            logger.warning("Ollama usage alert failed", error=str(exc))
+        finally:
+            await bot.session.close()
+
     scrapers = get_scrapers()
+    if is_kwork_paused():
+        scrapers = [scraper for scraper in scrapers if scraper.platform != KWORK_PLATFORM]
+        if not scrapers:
+            queued = await _queue_unprocessed_jobs(exclude=set())
+            logger.info(
+                "JobPilot AI scrape skipped: only Kwork enabled and paused",
+                queued_reprocess=queued,
+                pause_reason=pause_reason,
+            )
+            return {
+                "processed": 0,
+                "notified": 0,
+                "scraped": 0,
+                "queued_reprocess": queued,
+                "kwork_paused": True,
+                "pause_reason": pause_reason,
+            }
     pipeline = JobPipelineService()
     graph = compile_jobpilot_graph()
     processed = 0
@@ -85,6 +130,8 @@ async def _scrape_and_process() -> dict:
     for scraper in scrapers:
         jobs = await scraper.scrape()
         for normalized in jobs:
+            if is_kwork_paused() and normalized.platform == KWORK_PLATFORM:
+                continue
             job_id = await pipeline.save_normalized_job(normalized)
             scraped_ids.add(str(job_id))
             if await pipeline.is_job_sent(job_id):
@@ -119,7 +166,13 @@ async def _scrape_and_process() -> dict:
         "notified": notified,
         "scraped": len(scraped_ids),
         "queued_reprocess": queued,
+        "pause_refresh": pause_refresh,
     }
+
+
+@celery_app.task(name="app.tasks.scrape_tasks.refresh_kwork_pause")
+def refresh_kwork_pause_task() -> dict:
+    return _run_async(refresh_kwork_pause_from_kwork(force=True))
 
 
 @celery_app.task(name="app.tasks.scrape_tasks.process_single_job")
@@ -138,9 +191,20 @@ async def _reprocess_pending() -> dict:
 
 
 async def _process_job(job_id: uuid.UUID) -> dict:
+    from app.db.models import Job
+    from app.db.session import AsyncSessionLocal
+
     pipeline = JobPipelineService()
     if await pipeline.is_job_sent(job_id):
         return {"job_id": str(job_id), "skipped": "already_sent"}
+
+    async with AsyncSessionLocal() as session:
+        job = await session.get(Job, job_id)
+    if job and job.platform == KWORK_PLATFORM and is_kwork_paused():
+        reason = get_kwork_pause_reason()
+        logger.info("JobPilot AI skip Kwork job while paused", job_id=str(job_id), reason=reason)
+        return {"job_id": str(job_id), "skipped": "kwork_paused", "reason": reason}
+
     graph = compile_jobpilot_graph()
     state_data = await pipeline.job_to_state(job_id)
     result = await graph.ainvoke(state_data)

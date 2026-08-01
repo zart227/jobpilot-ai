@@ -4,7 +4,7 @@ import uuid
 from typing import Any
 
 import structlog
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -23,9 +23,19 @@ from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
 from app.services.edit_preference_service import EditPreferenceService
 from app.services.job_pipeline import JobPipelineService
+from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
+from app.services.kwork_pause import format_kwork_pause_reason, get_kwork_pause_reason, is_kwork_paused
 from app.services.proposal_sender import ProposalSender
 from app.services.reward_system import RewardSystem
+from app.telegram.dev_agent_handlers import register_dev_agent_handlers
 from app.telegram.keyboards import approval_keyboard, edit_preview_keyboard
+from app.services.dev_agent_service import (
+    DevAgentConfigurationError,
+    DevAgentService,
+    create_cursor_client,
+    docker_bridge_hint,
+    resolve_agent_workspace,
+)
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
     extract_site_order_id,
@@ -185,6 +195,102 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
     )
 
 
+def format_kwork_skipped_message(
+    job: Job | None,
+    reason: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+) -> str:
+    parts = ["⏭ JobPilot AI: заказ пропущен на Kwork."]
+
+    title = (job.title if job else None) or (send_debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+
+    order_id = _resolve_order_id(job=job, send_debug=send_debug)
+    if order_id:
+        parts.append(f"\n<b>№ заказа:</b> {html.escape(order_id)}")
+
+    job_url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Kwork</a>')
+
+    if reason:
+        parts.append(f"\n\n<b>Причина:</b> {html.escape(reason)}")
+    return "".join(parts)
+
+
+def format_kwork_paused_message(job: Job | None = None) -> str:
+    parts = ["⏸ JobPilot AI: Kwork на паузе."]
+    title = job.title if job else None
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+    parts.append(f"\n\n{html.escape(get_kwork_pause_reason() or format_kwork_pause_reason())}")
+    parts.append(
+        "\n\nОдобренные отклики сохранены — отправка возобновится автоматически после даты в настройке."
+    )
+    return "".join(parts)
+
+
+def format_kwork_connects_limit_message(
+    job: Job | None,
+    reason: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+) -> str:
+    parts = ["🛑 JobPilot AI: лимит коннектов на Kwork исчерпан."]
+
+    title = (job.title if job else None) or (send_debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+
+    order_id = _resolve_order_id(job=job, send_debug=send_debug)
+    if order_id:
+        parts.append(f"\n<b>№ заказа:</b> {html.escape(order_id)}")
+
+    job_url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Kwork</a>')
+
+    if reason:
+        parts.append(f"\n\n<b>Причина:</b> {html.escape(reason)}")
+
+    parts.append(
+        "\n\n<b>Что это значит:</b> на Бирже Kwork 1 отклик = 1 коннект. "
+        "Когда месячный лимит закончился, новые отклики не отправляются."
+    )
+    parts.append(
+        "\n<b>Когда снова можно:</b> коннекты пополняются автоматически каждые 30 дней."
+    )
+    if reason and "до " in reason.lower():
+        parts.append(f" {html.escape(reason.split('до ', 1)[1])}.")
+    else:
+        parts.append(
+            " Точную дату смотрите в личном кабинете Kwork → раздел «Коннекты»."
+        )
+    parts.append(
+        "\n\nОтклик остаётся в статусе «одобрен» — его можно отправить после пополнения."
+    )
+    return "".join(parts)
+
+
+def format_send_outcome_message(
+    job: Job | None,
+    *,
+    success: bool,
+    send_error: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+    edited: bool = False,
+) -> str:
+    if success:
+        return format_kwork_success_message(send_debug, edited=edited, job=job)
+    if is_kwork_order_closed_error(send_error):
+        return format_kwork_skipped_message(job, send_error, send_debug)
+    if is_kwork_connects_limit_error(send_error):
+        return format_kwork_connects_limit_message(job, send_error, send_debug)
+    if is_kwork_paused() and job and job.platform == "kwork":
+        return format_kwork_paused_message(job)
+    return format_kwork_failure_message(job, send_error, send_debug)
+
+
 def format_kwork_failure_message(
     job: Job | None,
     send_error: str | None,
@@ -296,20 +402,28 @@ async def notify_new_proposal(
         return message.message_id
 
 
-def create_dispatcher() -> Dispatcher:
+def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
     settings = get_settings()
     redis = Redis.from_url(settings.redis_url)
     storage = RedisStorage(redis=redis)
     dp = Dispatcher(storage=storage)
     bot = create_telegram_bot(settings.telegram_bot_token, settings)
 
+    dev_router = Router()
+    register_dev_agent_handlers(dev_router, dev_agent)
+    dp.include_router(dev_router)
+
     @dp.message(Command("start"))
     async def cmd_start(message: Message) -> None:
+        dev_hint = ""
+        if dev_agent and dev_agent.enabled:
+            dev_hint = "\n\n/dev — удалённый dev-агент (Cursor) для отладки и доработок."
         await message.answer(
             "👋 <b>JobPilot AI</b> is running.\n\n"
             "I will send you freelance job alerts with proposals.\n"
             "Use buttons: APPROVE | EDIT | SKIP | Задание\n\n"
-            "EDIT: напишите инструкцию для LLM (например: «сделай короче»).",
+            "EDIT: напишите инструкцию для LLM (например: «сделай короче»)."
+            f"{dev_hint}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -552,26 +666,27 @@ def create_dispatcher() -> Dispatcher:
         success, send_error, send_debug = await _resume_pipeline(
             job_id, proposal_id, "edited", new_content
         )
-        if success:
-            if edit_steps:
-                await EditPreferenceService().record_edit_steps(
-                    proposal_id=uuid.UUID(proposal_id),
-                    job_id=uuid.UUID(job_id),
-                    platform=platform,
-                    job_context=job_context,
-                    edit_steps=edit_steps,
-                )
-            await callback.message.answer(
-                format_kwork_success_message(send_debug, edited=True, job=job)
+        if success and edit_steps:
+            await EditPreferenceService().record_edit_steps(
+                proposal_id=uuid.UUID(proposal_id),
+                job_id=uuid.UUID(job_id),
+                platform=platform,
+                job_context=job_context,
+                edit_steps=edit_steps,
             )
-        else:
-            async with AsyncSessionLocal() as session:
-                job = await session.get(Job, uuid.UUID(job_id))
-            await callback.message.answer(
-                format_kwork_failure_message(job, send_error, send_debug),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, uuid.UUID(job_id))
+        await callback.message.answer(
+            format_send_outcome_message(
+                job,
+                success=success,
+                send_error=send_error,
+                send_debug=send_debug,
+                edited=True,
+            ),
+            parse_mode="HTML" if not success else None,
+            disable_web_page_preview=not success,
+        )
 
     async def _process_approval(
         callback: CallbackQuery,
@@ -586,6 +701,14 @@ def create_dispatcher() -> Dispatcher:
             job_id = str(pending.job_id)
             proposal_id = str(pending.proposal_id)
             job = await session.get(Job, pending.job_id)
+
+            if action in ("approved", "edited") and job and job.platform == "kwork" and is_kwork_paused():
+                try:
+                    await callback.answer("Kwork на паузе", show_alert=True)
+                except Exception:
+                    pass
+                await callback.message.answer(format_kwork_paused_message(job))
+                return
 
             if action in ("approved", "edited") and await JobPipelineService().is_job_sent(
                 pending.job_id
@@ -636,18 +759,18 @@ def create_dispatcher() -> Dispatcher:
             pass
 
         success, send_error, send_debug = await _resume_pipeline(job_id, proposal_id, action)
-        if success:
-            await callback.message.answer(
-                format_kwork_success_message(send_debug, job=job),
-            )
-        else:
-            async with AsyncSessionLocal() as session:
-                job = await session.get(Job, uuid.UUID(job_id))
-            await callback.message.answer(
-                format_kwork_failure_message(job, send_error, send_debug),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, uuid.UUID(job_id))
+        await callback.message.answer(
+            format_send_outcome_message(
+                job,
+                success=success,
+                send_error=send_error,
+                send_debug=send_debug,
+            ),
+            parse_mode="HTML" if not success else None,
+            disable_web_page_preview=not success,
+        )
 
     async def _resume_pipeline(
         job_id: str,
@@ -714,10 +837,32 @@ async def run_bot() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required for JobPilot AI Telegram bot")
 
     bot = create_telegram_bot(settings.telegram_bot_token, settings)
-    dp = create_dispatcher()
+    redis = Redis.from_url(settings.redis_url)
+    cursor_client = None
+    dev_agent: DevAgentService | None = None
+
+    if settings.telegram_dev_agent_enabled and settings.cursor_api_key:
+        try:
+            cursor_client = await create_cursor_client(settings)
+            dev_agent = DevAgentService(cursor_client, redis, settings)
+            logger.info(
+                "Dev agent enabled",
+                workspace=resolve_agent_workspace(settings),
+                bridge=bool(settings.cursor_bridge_base_url),
+            )
+        except DevAgentConfigurationError as exc:
+            logger.error("Dev agent configuration error", error=str(exc))
+        except Exception as exc:
+            logger.error("Failed to start Cursor bridge, dev agent disabled", error=str(exc))
+
+    dp = create_dispatcher(dev_agent=dev_agent)
 
     logger.info("JobPilot AI Telegram bot starting")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if cursor_client is not None:
+            await cursor_client.close()
 
 
 def main() -> None:

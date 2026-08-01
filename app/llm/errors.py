@@ -4,7 +4,7 @@ import asyncio
 import html
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 
 class LLMErrorKind(str, Enum):
@@ -23,9 +23,29 @@ class LLMServiceError(Exception):
     message: str
     retryable: bool = False
     details: str | None = None
+    quota_period: Literal["session", "weekly"] | None = None
 
     def __str__(self) -> str:
         return self.message
+
+    def _quota_message(self) -> str:
+        if self.quota_period == "session":
+            return (
+                "📉 <b>Лимит Ollama Cloud (session) исчерпан</b>\n\n"
+                "Сессионный лимит (~5 ч) закончился. Подождите сброса или проверьте "
+                "<a href=\"https://ollama.com/settings\">ollama.com/settings</a>."
+            )
+        if self.quota_period == "weekly":
+            return (
+                "📉 <b>Лимит Ollama Cloud (weekly) исчерпан</b>\n\n"
+                "Недельный лимит закончился. Подождите сброса или проверьте "
+                "<a href=\"https://ollama.com/settings\">ollama.com/settings</a>."
+            )
+        return (
+            "📉 <b>Лимит Ollama Cloud исчерпан</b>\n\n"
+            "Закончилась квота. Проверьте аккаунт на "
+            "<a href=\"https://ollama.com/settings\">ollama.com/settings</a>."
+        )
 
     def user_message_ru(self) -> str:
         messages = {
@@ -42,10 +62,7 @@ class LLMServiceError(Exception):
                 "Проверьте <code>OLLAMA_API_KEY</code> в .env "
                 "(ключ: ollama.com/settings/keys)."
             ),
-            LLMErrorKind.QUOTA: (
-                "📉 <b>Лимит Ollama Cloud исчерпан</b>\n\n"
-                "Закончилась квота или баланс API. Проверьте аккаунт на ollama.com."
-            ),
+            LLMErrorKind.QUOTA: self._quota_message(),
             LLMErrorKind.RATE_LIMIT: (
                 "🚦 <b>Слишком много запросов</b>\n\n"
                 "Ollama Cloud временно ограничил частоту. Подождите 30–60 сек и повторите."
@@ -75,23 +92,34 @@ def _error_text(exc: Exception) -> str:
     return " ".join(parts).lower()
 
 
-def _kind_from_status(status_code: int, text: str) -> tuple[LLMErrorKind, bool]:
+def _quota_period_from_text(text: str) -> Literal["session", "weekly"] | None:
+    if "session usage limit" in text or "session limit" in text:
+        return "session"
+    if "weekly usage limit" in text or "weekly limit" in text:
+        return "weekly"
+    return None
+
+
+def _kind_from_status(status_code: int, text: str) -> tuple[LLMErrorKind, bool, Literal["session", "weekly"] | None]:
+    quota_period = _quota_period_from_text(text)
+    if status_code == 429 and quota_period:
+        return LLMErrorKind.QUOTA, False, quota_period
     if status_code == 429 or "rate limit" in text or "too many requests" in text:
-        return LLMErrorKind.RATE_LIMIT, True
+        return LLMErrorKind.RATE_LIMIT, True, None
     if status_code in {401, 403} and any(
         token in text for token in ("api key", "unauthorized", "forbidden", "invalid key", "authentication")
     ):
-        return LLMErrorKind.AUTH, False
+        return LLMErrorKind.AUTH, False, None
     if status_code == 402 or any(
         token in text
         for token in ("quota", "insufficient", "billing", "credit", "balance", "payment", "quota exceeded")
     ):
-        return LLMErrorKind.QUOTA, False
+        return LLMErrorKind.QUOTA, False, quota_period
     if status_code in {500, 502, 503, 504}:
-        return LLMErrorKind.SERVER, True
+        return LLMErrorKind.SERVER, True, None
     if status_code in {407, 408}:
-        return LLMErrorKind.NETWORK, True
-    return LLMErrorKind.UNKNOWN, False
+        return LLMErrorKind.NETWORK, True, None
+    return LLMErrorKind.UNKNOWN, False, None
 
 
 def classify_llm_error(exc: Exception) -> LLMServiceError:
@@ -118,12 +146,13 @@ def classify_llm_error(exc: Exception) -> LLMServiceError:
 
     status_code = getattr(exc, "status_code", None)
     if status_code is not None:
-        kind, retryable = _kind_from_status(int(status_code), text)
+        kind, retryable, quota_period = _kind_from_status(int(status_code), text)
         return LLMServiceError(
             kind=kind,
             message=text or f"HTTP {status_code}",
             retryable=retryable,
             details=str(exc),
+            quota_period=quota_period,
         )
 
     if isinstance(exc, ConnectionError) or exc_name in {
@@ -148,12 +177,16 @@ def classify_llm_error(exc: Exception) -> LLMServiceError:
             details=str(exc),
         )
 
-    if any(token in text for token in ("quota", "insufficient", "billing", "credit", "balance exceeded")):
+    quota_period = _quota_period_from_text(text)
+    if quota_period or any(
+        token in text for token in ("quota", "insufficient", "billing", "credit", "balance exceeded")
+    ):
         return LLMServiceError(
             kind=LLMErrorKind.QUOTA,
             message="Quota exceeded",
             retryable=False,
             details=str(exc),
+            quota_period=quota_period,
         )
 
     if "rate limit" in text or "too many requests" in text:

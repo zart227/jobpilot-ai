@@ -25,6 +25,10 @@ celery_app.conf.update(
             "task": "app.tasks.scrape_tasks.run_all_scrapers",
             "schedule": timedelta(minutes=max(1, settings.scrape_interval_minutes)),
         },
+        "refresh-kwork-pause": {
+            "task": "app.tasks.scrape_tasks.refresh_kwork_pause",
+            "schedule": timedelta(hours=max(1, settings.kwork_pause_check_interval_hours)),
+        },
     },
 )
 

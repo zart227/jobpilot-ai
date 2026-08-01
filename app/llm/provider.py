@@ -10,6 +10,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, PermissionDe
 
 from app.config import Settings, get_settings
 from app.llm.errors import LLMErrorKind, LLMServiceError, classify_llm_error
+from app.llm.ollama_usage import get_ollama_usage
 from app.utils.proxy import (
     build_httpx_async_client,
     get_proxy_candidates,
@@ -217,6 +218,20 @@ class OllamaProvider(LLMProvider):
         return content if isinstance(content, str) else str(content)
 
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        snapshot = await get_ollama_usage(self._settings)
+        critical = self._settings.ollama_usage_critical_percent
+        if snapshot.has_usage() and snapshot.is_critical(critical):
+            if snapshot.session_critical(critical):
+                period: Literal["session", "weekly"] = "session"
+            else:
+                period = "weekly"
+            raise LLMServiceError(
+                kind=LLMErrorKind.QUOTA,
+                message=f"Ollama {period} usage limit reached (proactive check)",
+                retryable=False,
+                quota_period=period,
+            )
+
         temperature = kwargs.get("temperature", 0.3)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -313,4 +328,15 @@ def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
     simple = cfg.llm_simple_provider
     if simple == "same":
         return get_llm_provider(cfg)
+    if simple == "ollama" and cfg.ollama_auto_fallback and cfg.openai_api_key:
+        from app.llm.ollama_usage import get_ollama_usage_sync
+
+        snapshot = get_ollama_usage_sync(cfg)
+        if snapshot.has_usage() and snapshot.is_critical(cfg.ollama_usage_critical_percent):
+            logger.warning(
+                "Ollama limits critical, falling back to OpenAI",
+                session=snapshot.session.percent if snapshot.session else None,
+                weekly=snapshot.weekly.percent if snapshot.weekly else None,
+            )
+            return OpenAIProvider(cfg)
     return _build_provider(cfg, simple)

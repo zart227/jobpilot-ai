@@ -9,6 +9,7 @@ from app.config import get_settings
 from app.db.models import Job, Proposal
 from app.db.session import AsyncSessionLocal
 from app.services.job_pipeline import JobPipelineService
+from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
 from app.telegram.bot import notify_new_proposal
 from app.utils.proxy import create_telegram_bot
 
@@ -30,6 +31,10 @@ async def list_unsent_kwork_jobs() -> list[uuid.UUID]:
 
 async def regenerate_and_notify() -> dict:
     settings = get_settings()
+    pause_reason = get_kwork_pause_reason()
+    if pause_reason:
+        return {"regenerated": 0, "notified": 0, "failed": 0, "kwork_paused": True, "reason": pause_reason}
+
     if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
         raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_CHAT_ID are required")
 

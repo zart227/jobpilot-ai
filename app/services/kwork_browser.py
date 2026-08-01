@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from app.config import get_settings
+from app.services.kwork_pause import extract_connects_replenish_text
 from app.utils.formatting import KWORK_MAX_OFFER_CHARS, competitive_offer_price
 
 logger = structlog.get_logger(__name__)
@@ -18,15 +20,130 @@ LOGIN_URL = "https://kwork.ru/login"
 DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
 BLOCKED_TITLE = "Доступ заблокирован"
 DEBUG_SCREENSHOT_DIR = Path("data/kwork_debug")
+_kwork_send_lock = asyncio.Lock()
+
+KWORK_ORDER_CLOSED_ERROR = (
+    "Заказ закрыт на Kwork — исполнитель уже выбран, отклики не принимаются"
+)
+KWORK_CONNECTS_LIMIT_ERROR = (
+    "Исчерпан лимит коннектов на Kwork — новые отклики на Бирже недоступны "
+    "до ежемесячного пополнения"
+)
 
 
-async def launch_browser() -> tuple[Playwright, Browser, Page]:
+def is_kwork_order_closed_error(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "исполнитель уже выбран",
+            "закрыт на kwork",
+            "закрыт или в архиве",
+        )
+    )
+
+
+def is_kwork_connects_limit_error(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "лимит коннектов",
+            "исчерпали лимит коннект",
+            "connects_limit",
+        )
+    )
+
+
+def _connects_limit_exhausted(body: str) -> bool:
+    lowered = body.lower()
+    return "лимит коннект" in lowered or "исчерпали лимит коннект" in lowered
+
+
+def _order_closed_in_body(body: str) -> bool:
+    lowered = body.lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "исполнитель уже выбран",
+            "заказ закрыт",
+            "проект закрыт",
+            "находится в архиве",
+            "заказ в архиве",
+            "проект в архиве",
+        )
+    )
+
+
+def _propose_offer_locators(page: Page):
+    return (
+        page.locator('.js-link-resume-error:has-text("Предложить услугу")'),
+        page.get_by_role("button", name="Предложить услугу"),
+        page.get_by_role("link", name="Предложить услугу"),
+        page.locator('button:has-text("Предложить услугу")'),
+        page.locator('a:has-text("Предложить услугу")'),
+    )
+
+
+async def _visible_page_texts(page: Page) -> str:
+    parts = [await page.inner_text("body")]
+    for text in await page.locator(
+        ".tooltip:visible, .popover:visible, [role='tooltip']:visible, "
+        ".v-tooltip:visible, .modal:visible, .popup:visible"
+    ).all_inner_texts():
+        if text.strip():
+            parts.append(text)
+    return "\n".join(parts)
+
+
+async def _detect_connects_limit_on_page(page: Page) -> bool:
+    if _connects_limit_exhausted(await _visible_page_texts(page)):
+        return True
+
+    for locator in _propose_offer_locators(page):
+        if await locator.count() == 0:
+            continue
+        button = locator.first
+        if not await button.is_visible():
+            continue
+        try:
+            await button.hover(timeout=3000)
+            await page.wait_for_timeout(600)
+        except Exception:
+            pass
+        if _connects_limit_exhausted(await _visible_page_texts(page)):
+            return True
+        break
+    return False
+
+
+def format_connects_limit_error(replenish_date: str | None = None) -> str:
+    message = KWORK_CONNECTS_LIMIT_ERROR
+    if replenish_date:
+        message = (
+            f"Исчерпан лимит коннектов на Kwork — новые отклики на Бирже недоступны "
+            f"до {replenish_date}"
+        )
+    return message
+
+
+async def _connects_limit_error_from_page(page: Page) -> str:
+    texts = await _visible_page_texts(page)
+    return format_connects_limit_error(extract_connects_replenish_text(texts))
+
+
+async def launch_browser(*, proxy: str | None = None) -> tuple[Playwright, Browser, Page]:
     settings = get_settings()
     playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+    launch_kwargs: dict[str, Any] = {
+        "headless": True,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    browser = await playwright.chromium.launch(**launch_kwargs)
     context_kwargs: dict[str, Any] = {
         "viewport": DESKTOP_VIEWPORT,
         "locale": "ru-RU",
@@ -35,6 +152,17 @@ async def launch_browser() -> tuple[Playwright, Browser, Page]:
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         ),
     }
+    if proxy:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(proxy)
+        proxy_config: dict[str, str] = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            proxy_config["username"] = parsed.username
+        if parsed.password:
+            proxy_config["password"] = parsed.password
+        context_kwargs["proxy"] = proxy_config
+        logger.info("Kwork browser using proxy", proxy_host=parsed.hostname)
     storage_state = settings.kwork_storage_state.strip()
     if storage_state and Path(storage_state).is_file():
         context_kwargs["storage_state"] = storage_state
@@ -79,8 +207,20 @@ async def _is_access_blocked(page: Page) -> bool:
 
 
 async def _has_active_session(page: Page) -> bool:
-    await page.goto("https://kwork.ru/seller", wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
+    settings = get_settings()
+    storage_state = settings.kwork_storage_state.strip()
+    has_saved_session = bool(storage_state and Path(storage_state).is_file())
+    url, timeout_ms = (
+        ("https://kwork.ru/", 30000)
+        if has_saved_session
+        else ("https://kwork.ru/seller", 60000)
+    )
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_timeout(1500)
+    except Exception as exc:
+        logger.warning("Kwork session check failed", url=url, error=str(exc))
+        return False
     if _is_on_login_page(page.url):
         return False
     if await _is_access_blocked(page):
@@ -93,6 +233,12 @@ def _is_on_login_page(url: str) -> bool:
 
 
 async def login(page: Page, email: str, password: str) -> bool:
+    settings = get_settings()
+    storage_state = settings.kwork_storage_state.strip()
+    if storage_state and Path(storage_state).is_file():
+        logger.info("Kwork using saved storage state, skipping network session check")
+        return True
+
     if await _has_active_session(page):
         logger.info("Kwork session already active")
         return True
@@ -401,14 +547,21 @@ async def _load_seller_profile_if_needed(page: Page, info: dict[str, Any]) -> di
 
 
 async def _collect_visible_form_errors(page: Page) -> list[str]:
-    return [
+    errors = [
         text.strip()
         for text in await page.locator(
             ".form-item__error:visible, .k-input__error:visible, "
-            ".error-message:visible, .form-error:visible"
+            ".error-message:visible, .form-error:visible, "
+            ".offer-form__error:visible, .new-offer__error:visible"
         ).all_inner_texts()
         if text.strip() and len(text.strip()) < 200
     ]
+    body = (await page.inner_text("body")).lower()
+    if _connects_limit_exhausted(body) and not any(
+        is_kwork_connects_limit_error(error) for error in errors
+    ):
+        errors.append(KWORK_CONNECTS_LIMIT_ERROR)
+    return errors
 
 
 async def _exchange_lesson_required(page: Page) -> bool:
@@ -462,8 +615,59 @@ async def _verify_offer_on_project_page(page: Page, project_id: str) -> bool:
     return False
 
 
+async def _verify_offer_after_submit_redirect(page: Page, project_id: str) -> bool:
+    """Lenient check right after submit when Kwork left the offer form."""
+    if "new_offer" in page.url:
+        return False
+    if "not_access.php" in page.url or await _is_access_blocked(page):
+        return False
+    if "/login" in page.url:
+        return False
+
+    await page.wait_for_timeout(2000)
+    current_url = page.url.lower()
+    body = (await page.inner_text("body")).lower()
+    if any(
+        marker in body
+        for marker in (
+            "отклик отправлен",
+            "предложение отправлено",
+            "ваше предложение отправлено",
+        )
+    ):
+        logger.info("Kwork offer verified via success message", project_id=project_id)
+        return True
+
+    if any(part in current_url for part in ("tab=offers", "manage_orders")):
+        logger.info(
+            "Kwork offer verified via offers redirect",
+            project_id=project_id,
+            url=page.url,
+        )
+        return True
+
+    if current_url.rstrip("/").endswith("/projects"):
+        logger.info(
+            "Kwork offer verified via projects hub redirect",
+            project_id=project_id,
+            url=page.url,
+        )
+        return True
+
+    html = await page.content()
+    project_markers = (
+        f"/projects/{project_id}/view",
+        f"/projects/{project_id}",
+        f"project={project_id}",
+    )
+    if any(marker in html for marker in project_markers):
+        return await _verify_offer_on_project_page(page, project_id)
+
+    return False
+
+
 async def _verify_offer_in_my_offers(page: Page, project_id: str) -> bool:
-    """Strict check: offer must be editable/visible, not just project link in HTML."""
+    """Check project page and offers lists for a submitted offer."""
     view_url = f"https://kwork.ru/projects/{project_id}/view"
     await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2500)
@@ -486,23 +690,14 @@ async def _verify_offer_in_my_offers(page: Page, project_id: str) -> bool:
         for _ in range(6):
             links = page.locator(link_selector)
             count = await links.count()
-            for index in range(count):
-                link = links.nth(index)
-                text = ((await link.inner_text()) or "").lower()
-                href = (await link.get_attribute("href")) or ""
-                if project_id not in href:
-                    continue
-                if any(
-                    marker in text
-                    for marker in ("отклик", "предложени", "редактир", "отозв")
-                ):
-                    logger.info(
-                        "Kwork offer found in offers list",
-                        project_id=project_id,
-                        offers_url=offers_url,
-                        link_text=text[:80],
-                    )
-                    return True
+            if count > 0:
+                logger.info(
+                    "Kwork offer found in offers list by project link",
+                    project_id=project_id,
+                    offers_url=offers_url,
+                    link_count=count,
+                )
+                return True
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
             await page.wait_for_timeout(1200)
 
@@ -519,27 +714,35 @@ async def _open_new_offer_from_project_page(
     await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2500)
 
-    propose_locators = (
-        page.get_by_role("button", name="Предложить услугу"),
-        page.get_by_role("link", name="Предложить услугу"),
-        page.locator('button:has-text("Предложить услугу")'),
-        page.locator('a:has-text("Предложить услугу")'),
-    )
+    propose_locators = _propose_offer_locators(page)
     clicked = False
     for locator in propose_locators:
         if await locator.count() == 0:
             continue
+        button = locator.first
+        try:
+            await button.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        if not await button.is_visible():
+            continue
         steps.append("нажатие «Предложить услугу» на странице заказа")
-        await locator.first.click(force=True)
+        await button.click(force=True)
         await page.wait_for_timeout(2500)
         clicked = True
         break
 
     if not clicked:
+        if await _detect_connects_limit_on_page(page):
+            steps.append(f"блокировка Kwork: {await _connects_limit_error_from_page(page)}")
         return False
 
     if await _offer_form_visible(page):
         return True
+
+    if await _detect_connects_limit_on_page(page):
+        steps.append(f"блокировка Kwork: {await _connects_limit_error_from_page(page)}")
+        return False
 
     blocker = await _diagnose_offer_blocker(page, job_url)
     if blocker:
@@ -712,26 +915,61 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
     await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(2000)
 
-    propose_button = page.get_by_role("button", name="Предложить услугу")
-    has_propose_button = await propose_button.count() > 0
+    if await _detect_connects_limit_on_page(page):
+        return await _connects_limit_error_from_page(page)
+
+    propose_locators = _propose_offer_locators(page)
+    has_propose_button = False
+    propose_button_disabled = False
+    for locator in propose_locators:
+        if await locator.count() == 0:
+            continue
+        has_propose_button = True
+        button = locator.first
+        if await button.is_visible() and await button.is_disabled():
+            propose_button_disabled = True
+        break
+
+    review_locators = (
+        page.get_by_role("button", name="Оставить отзыв"),
+        page.get_by_role("link", name="Оставить отзыв"),
+        page.locator('button:has-text("Оставить отзыв")'),
+        page.locator('a:has-text("Оставить отзыв")'),
+    )
+    has_review_action = False
+    for locator in review_locators:
+        if await locator.count() > 0:
+            has_review_action = True
+            break
+
+    if has_review_action and not has_propose_button:
+        return KWORK_ORDER_CLOSED_ERROR
 
     resume_error = page.locator(".js-link-resume-error:has-text('Предложить услугу')")
     if await resume_error.count() > 0:
-        await resume_error.first.click(force=True)
-        await page.wait_for_timeout(2000)
-        body = (await page.inner_text("body")).lower()
-        if "портфолио" in body and "кворк" in body:
-            return (
-                "Для этой рубрики Kwork требует кворк с портфолио. "
-                "Создайте кворк и загрузите работы: kwork.ru/seller"
-            )
-        if "портфолио" in body:
-            return "Для откликов в этой рубрике нужно портфолио на Kwork"
+        btn = resume_error.first
+        if await btn.is_visible():
+            await btn.click(force=True)
+            await page.wait_for_timeout(2000)
+            body = (await page.inner_text("body")).lower()
+            if "портфолио" in body and "кворк" in body:
+                return (
+                    "Для этой рубрики Kwork требует кворк с портфолио. "
+                    "Создайте кворк и загрузите работы: kwork.ru/seller"
+                )
+            if "портфолио" in body:
+                return "Для откликов в этой рубрике нужно портфолио на Kwork"
 
     body = (await page.inner_text("body")).lower()
-    if "архив" in body or "закрыт" in body:
+    if propose_button_disabled and await _detect_connects_limit_on_page(page):
+        return await _connects_limit_error_from_page(page)
+    if _order_closed_in_body(body):
+        if "исполнитель уже выбран" in body or "оставить отзыв" in body:
+            return KWORK_ORDER_CLOSED_ERROR
         return "Заказ закрыт или в архиве на Kwork"
     if not has_propose_button:
+        if "оставить отзыв" in body:
+            return KWORK_ORDER_CLOSED_ERROR
         return "Кнопка «Предложить услугу» отсутствует — форма отклика недоступна на Kwork"
     return None
 
@@ -992,6 +1230,16 @@ async def submit_offer(
 
     if "new_offer" not in page.url:
         steps.append("форма new_offer недоступна, открытие отклика со страницы заказа")
+        if await _detect_connects_limit_on_page(page):
+            return await _fail_offer(
+                page,
+                "connects_limit_exhausted",
+                await _connects_limit_error_from_page(page),
+                url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps + ["лимит коннектов обнаружен до открытия формы"],
+            )
         if await _open_new_offer_from_project_page(page, job_url, steps):
             steps.append("форма отклика открыта через «Предложить услугу»")
         elif any("блокировка Kwork:" in step for step in steps):
@@ -1189,6 +1437,18 @@ async def submit_offer(
                 content=content,
                 steps=steps,
             )
+        if _connects_limit_exhausted(body):
+            return await _fail_offer(
+                page,
+                "connects_limit_exhausted",
+                await _connects_limit_error_from_page(page),
+                url=offer_url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
+                current_url=page.url,
+                offer_price=offer_price,
+            )
         return await _fail_offer(
             page,
             "stayed_on_form",
@@ -1200,6 +1460,17 @@ async def submit_offer(
             current_url=page.url,
             offer_price=offer_price,
         )
+
+    if await _verify_offer_after_submit_redirect(page, project_id):
+        logger.info("Kwork offer verified after submit redirect", project_id=project_id)
+        return True, None, {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "offer_action": "created",
+            "offer_price": offer_price,
+        }
 
     if await _verify_offer_on_project_page(page, project_id):
         logger.info("Kwork offer verified on project page after submit", project_id=project_id)
@@ -1272,81 +1543,253 @@ async def send_kwork_offer(
     budget_min: float | None = None,
     budget_max: float | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
-    settings = get_settings()
-    playwright: Playwright | None = None
-    browser: Browser | None = None
-    steps = ["запуск браузера"]
+    async with _kwork_send_lock:
+        return await _send_kwork_offer_locked(job_url, content, budget_min, budget_max)
 
-    try:
-        playwright, browser, page = await launch_browser()
-        steps.append("браузер запущен")
-        logged_in = await login(page, settings.kwork_email, settings.kwork_password)
-        if not logged_in:
-            content_file = _save_submission_content(content, "login_failed")
-            screenshot = await _save_debug_screenshot(page, "login_failed")
+
+async def _send_kwork_offer_locked(
+    job_url: str,
+    content: str,
+    budget_min: float | None = None,
+    budget_max: float | None = None,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    from app.utils.proxy import get_proxy_candidates, mark_proxy_failed, mask_proxy
+
+    settings = get_settings()
+    last_result: tuple[bool, str | None, dict[str, Any] | None] = (
+        False,
+        "Не удалось войти в Kwork — проверьте сессию",
+        None,
+    )
+
+    candidates = list(get_proxy_candidates(settings, "openai"))
+    if None not in candidates:
+        candidates.insert(0, None)
+
+    for proxy in candidates:
+        playwright: Playwright | None = None
+        browser: Browser | None = None
+        steps = ["запуск браузера"]
+        label = mask_proxy(proxy) if proxy else "direct"
+        steps.append(f"прокси: {label}")
+
+        try:
+            playwright, browser, page = await launch_browser(proxy=proxy)
+            steps.append("браузер запущен")
+            logged_in = await login(page, settings.kwork_email, settings.kwork_password)
+            if not logged_in:
+                content_file = _save_submission_content(content, "login_failed")
+                screenshot = await _save_debug_screenshot(page, "login_failed")
+                debug_file = await _save_debug_context(
+                    "login_failed",
+                    job_url=job_url,
+                    content=content,
+                    steps=steps + ["вход в Kwork не удался"],
+                    error="Не удалось войти в Kwork — проверьте сессию",
+                    screenshot=screenshot,
+                    content_file=content_file,
+                )
+                last_result = (
+                    False,
+                    "Не удалось войти в Kwork — проверьте сессию",
+                    {
+                        "job_url": job_url,
+                        "content_length": len(content),
+                        "content_file": content_file,
+                        "steps": steps + ["вход в Kwork не удался"],
+                        "error_label": "login_failed",
+                        "screenshot": screenshot,
+                        "debug_file": debug_file,
+                    },
+                )
+                if proxy:
+                    mark_proxy_failed(settings, "openai", proxy)
+                continue
+
+            steps.append("вход в Kwork успешен")
+            logger.info(
+                "Kwork login ok, submitting offer",
+                job_url=job_url,
+                proxy=label,
+                storage_state=settings.kwork_storage_state or None,
+            )
+            success, error, debug = await submit_offer(
+                page, job_url, content, budget_min, budget_max
+            )
+            if debug and "steps" in debug:
+                debug["steps"] = steps + debug["steps"]
+            elif not success:
+                content_file = _save_submission_content(content, "submit_failed")
+                debug = {
+                    "job_url": job_url,
+                    "content_length": len(content),
+                    "content_file": content_file,
+                    "steps": steps,
+                    "error_label": "submit_failed",
+                }
+            if success and settings.kwork_storage_state.strip():
+                output = Path(settings.kwork_storage_state)
+                try:
+                    await page.context.storage_state(path=str(output))
+                except Exception as exc:
+                    logger.warning("Kwork session refresh failed", error=str(exc))
+            return success, error, debug
+        except Exception as exc:
+            content_file = _save_submission_content(content, "exception")
+            logger.error(
+                "Kwork offer send failed",
+                error=str(exc),
+                url=job_url,
+                proxy=label,
+                exc_type=type(exc).__name__,
+                content_file=content_file,
+                content_length=len(content),
+            )
             debug_file = await _save_debug_context(
-                "login_failed",
+                "exception",
                 job_url=job_url,
                 content=content,
-                steps=steps + ["вход в Kwork не удался"],
-                error="Не удалось войти в Kwork — проверьте сессию",
-                screenshot=screenshot,
+                steps=steps + [f"исключение: {type(exc).__name__}"],
+                error=str(exc),
                 content_file=content_file,
             )
-            return False, "Не удалось войти в Kwork — проверьте сессию", {
-                "job_url": job_url,
-                "content_length": len(content),
-                "content_file": content_file,
-                "steps": steps + ["вход в Kwork не удался"],
-                "error_label": "login_failed",
-                "screenshot": screenshot,
-                "debug_file": debug_file,
+            last_result = (
+                False,
+                f"Ошибка отправки: {exc}",
+                {
+                    "job_url": job_url,
+                    "content_length": len(content),
+                    "content_file": content_file,
+                    "steps": steps + [f"исключение: {type(exc).__name__}: {exc}"],
+                    "error_label": "exception",
+                    "debug_file": debug_file,
+                },
+            )
+            if proxy:
+                mark_proxy_failed(settings, "openai", proxy)
+        finally:
+            if playwright and browser:
+                await close_browser(playwright, browser)
+
+    return last_result
+
+
+async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
+    settings = get_settings()
+
+    for connects_url in (
+        "https://kwork.ru/connects",
+        "https://kwork.ru/balance/connects",
+    ):
+        await page.goto(connects_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+        if "/login" in page.url or await _is_access_blocked(page):
+            break
+        page_text = await _visible_page_texts(page)
+        if _connects_limit_exhausted(page_text) or extract_connects_replenish_text(page_text):
+            return {
+                "limit_exhausted": True,
+                "confident": True,
+                "page_text": page_text,
+                "project_url": connects_url,
             }
-        steps.append("вход в Kwork успешен")
-        logger.info(
-            "Kwork login ok, submitting offer",
-            job_url=job_url,
-            storage_state=settings.kwork_storage_state or None,
-        )
-        success, error, debug = await submit_offer(page, job_url, content, budget_min, budget_max)
-        if debug and "steps" in debug:
-            debug["steps"] = steps + debug["steps"]
-        elif not success:
-            content_file = _save_submission_content(content, "submit_failed")
-            debug = {
-                "job_url": job_url,
-                "content_length": len(content),
-                "content_file": content_file,
-                "steps": steps,
-                "error_label": "submit_failed",
+
+    listing_url = settings.kwork_category_url or "https://kwork.ru/projects?a=1"
+    await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+
+    if await _is_access_blocked(page) or "/login" in page.url:
+        return {"error": "session_or_access", "limit_exhausted": False}
+
+    project_urls: list[str] = []
+    links = page.locator('a[href*="/projects/"]')
+    link_count = await links.count()
+    for index in range(min(link_count, 20)):
+        href = await links.nth(index).get_attribute("href")
+        if not href or not re.search(r"/projects/\d+", href):
+            continue
+        project_url = href if href.startswith("http") else f"https://kwork.ru{href}"
+        project_url = re.sub(r"(/projects/\d+)(?:/.*)?$", r"\1/view", project_url.split("?")[0])
+        if project_url not in project_urls:
+            project_urls.append(project_url)
+        if len(project_urls) >= 3:
+            break
+
+    if not project_urls:
+        return {"error": "no_project_link", "limit_exhausted": False, "confident": False}
+
+    last_text = ""
+    for project_url in project_urls:
+        await page.goto(project_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3500)
+        page_text = await _visible_page_texts(page)
+        last_text = page_text
+        if await _detect_connects_limit_on_page(page):
+            return {
+                "limit_exhausted": True,
+                "confident": True,
+                "page_text": page_text,
+                "project_url": project_url,
             }
-        return success, error, debug
-    except Exception as exc:
-        content_file = _save_submission_content(content, "exception")
-        logger.error(
-            "Kwork offer send failed",
-            error=str(exc),
-            url=job_url,
-            exc_type=type(exc).__name__,
-            content_file=content_file,
-            content_length=len(content),
-        )
-        debug_file = await _save_debug_context(
-            "exception",
-            job_url=job_url,
-            content=content,
-            steps=steps + [f"исключение: {type(exc).__name__}"],
-            error=str(exc),
-            content_file=content_file,
-        )
-        return False, f"Ошибка отправки: {exc}", {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps + [f"исключение: {type(exc).__name__}: {exc}"],
-            "error_label": "exception",
-            "debug_file": debug_file,
-        }
-    finally:
-        if playwright and browser:
-            await close_browser(playwright, browser)
+
+        for locator in _propose_offer_locators(page):
+            if await locator.count() == 0:
+                continue
+            button = locator.first
+            if not await button.is_visible():
+                continue
+            if not await button.is_disabled():
+                return {
+                    "limit_exhausted": False,
+                    "confident": True,
+                    "page_text": page_text,
+                    "project_url": project_url,
+                }
+            break
+
+    return {
+        "limit_exhausted": False,
+        "confident": False,
+        "page_text": last_text,
+        "project_url": project_urls[-1],
+    }
+
+
+async def refresh_kwork_pause_from_kwork(*, force: bool = False) -> dict[str, Any]:
+    from app.services.kwork_pause import apply_connects_probe_result, should_refresh_pause_state
+    from app.utils.proxy import get_proxy_candidates, mask_proxy
+
+    settings = get_settings()
+    if not settings.kwork_pause_enabled or not settings.kwork_pause_auto:
+        return {"skipped": True, "reason": "auto_pause_disabled"}
+    if not force and not should_refresh_pause_state():
+        return {"skipped": True, "reason": "throttled"}
+
+    proxies = get_proxy_candidates(settings, "openai")
+    last_error: str | None = None
+    for proxy in proxies:
+        playwright = browser = None
+        try:
+            label = mask_proxy(proxy) if proxy else "direct"
+            logger.info("JobPilot AI checking Kwork connects pause", proxy=label, force=force)
+            playwright, browser, page = await launch_browser(proxy=proxy)
+            probe = await probe_kwork_connects_status(page)
+            if probe.get("error"):
+                last_error = str(probe["error"])
+                logger.warning("Kwork connects probe failed", error=last_error, proxy=label)
+                continue
+            return apply_connects_probe_result(
+                limit_exhausted=bool(probe.get("limit_exhausted")),
+                page_text=str(probe.get("page_text", "")),
+                source="browser_probe",
+                confident=bool(probe.get("confident", True)),
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            logger.warning("Kwork connects probe exception", error=last_error, proxy=label)
+        finally:
+            if playwright and browser:
+                await close_browser(playwright, browser)
+
+    return {"skipped": True, "error": last_error}
+

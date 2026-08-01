@@ -162,6 +162,12 @@ class JobPipelineService:
             job = await session.get(Job, job_id)
             if not job or not job.is_relevant:
                 return None
+            if job.platform == "kwork":
+                from app.services.kwork_pause import is_kwork_paused
+
+                if is_kwork_paused():
+                    logger.info("JobPilot AI skip proposal regeneration while Kwork paused", job_id=str(job_id))
+                    return None
 
         state = await self.job_to_state(job_id)
         async with AsyncSessionLocal() as session:

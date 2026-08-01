@@ -5,10 +5,15 @@ from typing import Any
 import structlog
 from sqlalchemy import select
 
-from app.db.models import Job, Proposal
+from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
-from app.services.kwork_browser import send_kwork_offer
-from app.utils.formatting import compose_kwork_submission
+from app.services.kwork_browser import (
+    is_kwork_connects_limit_error,
+    is_kwork_order_closed_error,
+    send_kwork_offer,
+)
+from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused, record_connects_limit_detected
+from app.utils.formatting import compose_kwork_submission, extract_site_order_id
 
 logger = structlog.get_logger(__name__)
 
@@ -94,18 +99,43 @@ class ProposalSender:
                     job_id=job_id,
                 )
             else:
-                proposal.status = "approved"
-                job.status = "approved"
+                if is_kwork_order_closed_error(error):
+                    proposal.status = "skipped"
+                    job.status = "skipped"
+                    pending_rows = await session.execute(
+                        select(TelegramPending).where(
+                            TelegramPending.job_id == job.id,
+                            TelegramPending.proposal_id == proposal.id,
+                            TelegramPending.status.in_(("approved", "edited")),
+                        )
+                    )
+                    for pending in pending_rows.scalars():
+                        pending.status = "skipped"
+                    logger.info(
+                        "JobPilot AI skip closed Kwork order",
+                        platform=job.platform,
+                        job_id=job_id,
+                        job_title=job.title,
+                        error=error,
+                    )
+                else:
+                    proposal.status = "approved"
+                    job.status = "approved"
+                    logger.error(
+                        "JobPilot AI proposal delivery failed",
+                        platform=job.platform,
+                        job_id=job_id,
+                        job_title=job.title,
+                        error=error,
+                        content_file=(debug or {}).get("content_file"),
+                        content_length=(debug or {}).get("content_length"),
+                    )
+                if debug is not None and is_kwork_order_closed_error(error):
+                    debug["error_label"] = "order_closed"
+                if debug is not None and is_kwork_connects_limit_error(error):
+                    debug["error_label"] = "connects_limit"
+                    record_connects_limit_detected(error or "")
                 await session.commit()
-                logger.error(
-                    "JobPilot AI proposal delivery failed",
-                    platform=job.platform,
-                    job_id=job_id,
-                    job_title=job.title,
-                    error=error,
-                    content_file=(debug or {}).get("content_file"),
-                    content_length=(debug or {}).get("content_length"),
-                )
             if debug is not None:
                 debug["job_title"] = job.title
                 debug["job_id"] = job_id
@@ -133,6 +163,10 @@ class ProposalSender:
             url=job.url,
             content_length=len(content),
         )
+
+        if job.platform == "kwork" and is_kwork_paused():
+            reason = get_kwork_pause_reason() or "Kwork приостановлен"
+            return False, reason, {"error_label": "kwork_paused"}
 
         if job.platform == "kwork" and job.url:
             success, error, debug = await send_kwork_offer(
