@@ -1,3 +1,12 @@
+x-app-env: &app-env
+    PYTHONPATH: /app
+    DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    QDRANT_URL: http://qdrant:6333
+    JOBPILOT_IN_DOCKER: "1"
+
 services:
     postgres:
         image: postgres:16-alpine
@@ -50,13 +59,9 @@ services:
         extra_hosts:
             - "host.docker.internal:host-gateway"
         environment:
-            PYTHONPATH: /app
-            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
-            REDIS_URL: redis://redis:6379/0
-            CELERY_BROKER_URL: redis://redis:6379/0
-            CELERY_RESULT_BACKEND: redis://redis:6379/1
-            QDRANT_URL: http://qdrant:6333
-            CURSOR_WORKSPACE: /app
+            <<: *app-env
+            API_HOST: 0.0.0.0
+            API_PORT: 8000
         ports:
             - "8000:8000"
         depends_on:
@@ -80,13 +85,7 @@ services:
         extra_hosts:
             - "host.docker.internal:host-gateway"
         environment:
-            PYTHONPATH: /app
-            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
-            REDIS_URL: redis://redis:6379/0
-            CELERY_BROKER_URL: redis://redis:6379/0
-            CELERY_RESULT_BACKEND: redis://redis:6379/1
-            QDRANT_URL: http://qdrant:6333
-            CURSOR_WORKSPACE: /app
+            <<: *app-env
         depends_on:
             postgres:
                 condition: service_healthy
@@ -107,13 +106,7 @@ services:
         extra_hosts:
             - "host.docker.internal:host-gateway"
         environment:
-            PYTHONPATH: /app
-            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
-            REDIS_URL: redis://redis:6379/0
-            CELERY_BROKER_URL: redis://redis:6379/0
-            CELERY_RESULT_BACKEND: redis://redis:6379/1
-            QDRANT_URL: http://qdrant:6333
-            CURSOR_WORKSPACE: /app
+            <<: *app-env
         depends_on:
             redis:
                 condition: service_healthy
@@ -126,17 +119,19 @@ services:
         build: .
         container_name: jobpilot-telegram
         command: python -m app.telegram.bot
-        env_file: .env
+        env_file:
+            - .env
+            - path: data/cursor_bridge.env
+              required: false
         extra_hosts:
             - "host.docker.internal:host-gateway"
         environment:
-            PYTHONPATH: /app
-            DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_secret@postgres:5432/jobpilot_ai
-            REDIS_URL: redis://redis:6379/0
-            CELERY_BROKER_URL: redis://redis:6379/0
-            CELERY_RESULT_BACKEND: redis://redis:6379/1
-            QDRANT_URL: http://qdrant:6333
-            CURSOR_WORKSPACE: /app
+            <<: *app-env
+            API_HOST: api
+            API_PORT: 8000
+            CURSOR_WORKSPACE_HOST: ${JOBPILOT_HOST_WORKSPACE:-/home/arthur/jobpilot-ai}
+            CURSOR_BRIDGE_BASE_URL: ${CURSOR_BRIDGE_BASE_URL:-http://host.docker.internal:9247}
+            TELEGRAM_DEV_AGENT_ENABLED: ${TELEGRAM_DEV_AGENT_ENABLED:-true}
         depends_on:
             postgres:
                 condition: service_healthy
@@ -144,10 +139,21 @@ services:
                 condition: service_healthy
             api:
                 condition: service_started
+            cursor-bridge-proxy:
+                condition: service_started
         volumes:
             - ./app:/app/app
-            - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
+            - ./scripts:/app/scripts
             - ./data:/app/data
+            - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
+
+    # Forwards host bridge (127.0.0.1:19247) to 0.0.0.0:9247 for containers on Linux
+    cursor-bridge-proxy:
+        image: alpine/socat:1.0.5
+        container_name: jobpilot-cursor-proxy
+        network_mode: host
+        command: TCP-LISTEN:9247,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:19247
+        restart: unless-stopped
 
 volumes:
     postgres_data:

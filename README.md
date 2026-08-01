@@ -49,7 +49,15 @@ Edit `.env` and set:
 - `DEVELOPER_*` — your profile for proposal generation
 - Scraper URLs and credentials (Kwork optional)
 
-### 2. Start all services
+### 2. Start all services (Docker)
+
+```bash
+./scripts/docker-up.sh
+```
+
+This starts the Cursor bridge on the host (for `/dev` Telegram agent) and then `docker compose up`.
+
+Manual start without bridge helper:
 
 ```bash
 docker compose up --build
@@ -83,6 +91,30 @@ curl -X POST http://localhost:8000/scrape/trigger
     - **APPROVE** — send proposal to platform
     - **EDIT** — send revised text, then auto-send
     - **SKIP** — ignore job, record reward = 0
+
+### 5. Remote dev agent (Telegram → Cursor)
+
+Talk to a local Cursor agent from Telegram to debug, check status, or change the project remotely.
+
+**Commands (admin chat only):**
+
+| Command       | Description                       |
+| ------------- | --------------------------------- |
+| `/dev`        | Enable dev-agent mode             |
+| `/dev_status` | Project health without full agent |
+| `/dev_reset`  | Start a fresh agent session       |
+| `/dev_stop`   | Exit dev-agent mode               |
+
+After `/dev`, send plain-text tasks, e.g. «проверь логи celery», «исправь ошибку в proposal_sender».
+
+**Setup for Docker (recommended):**
+
+1. Set `CURSOR_API_KEY` and `TELEGRAM_DEV_AGENT_ENABLED=true` in `.env`.
+2. Set `CURSOR_WORKSPACE=/home/you/jobpilot-ai` (absolute host path).
+3. Start everything: `./scripts/docker-up.sh` — bridge credentials go to `data/cursor_bridge.env` automatically.
+4. In Telegram: `/dev` → send tasks.
+
+If bridge stops, restart: `python scripts/run_cursor_bridge.py` then `docker compose restart telegram-bot`.
 
 ## API Endpoints
 
