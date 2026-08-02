@@ -77,8 +77,9 @@ class CursorProvider(LLMProvider):
 
 
 class OpenAIProvider(LLMProvider):
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, model: str | None = None) -> None:
         self._settings = settings
+        self._model = model or settings.openai_model
 
     def _build_client(self, proxy: str | None) -> AsyncOpenAI:
         http_client = build_httpx_async_client(
@@ -103,7 +104,7 @@ class OpenAIProvider(LLMProvider):
             client = self._build_client(proxy)
             try:
                 response = await client.responses.create(
-                    model=self._settings.openai_model,
+                    model=self._model,
                     instructions=system_prompt,
                     input=[
                         {
@@ -217,10 +218,41 @@ class OllamaProvider(LLMProvider):
         )
         return content if isinstance(content, str) else str(content)
 
+    def _can_fallback_to_openai(self) -> bool:
+        return bool(self._settings.ollama_auto_fallback and self._settings.openai_api_key)
+
+    async def _fallback_to_openai(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        reason: str,
+        **kwargs: Any,
+    ) -> str:
+        model = self._settings.openai_simple_model
+        logger.warning(
+            "Ollama limits exceeded, falling back to OpenAI",
+            model=model,
+            reason=reason,
+        )
+        return await OpenAIProvider(self._settings, model=model).complete(
+            system_prompt,
+            user_prompt,
+            **kwargs,
+        )
+
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         snapshot = await get_ollama_usage(self._settings)
         critical = self._settings.ollama_usage_critical_percent
         if snapshot.has_usage() and snapshot.is_critical(critical):
+            if self._can_fallback_to_openai():
+                period = "session" if snapshot.session_critical(critical) else "weekly"
+                return await self._fallback_to_openai(
+                    system_prompt,
+                    user_prompt,
+                    reason=f"proactive check ({period} >= {critical}%)",
+                    **kwargs,
+                )
             if snapshot.session_critical(critical):
                 period: Literal["session", "weekly"] = "session"
             else:
@@ -247,6 +279,13 @@ class OllamaProvider(LLMProvider):
                 return await self._chat_once(proxy, messages, temperature)
             except LLMServiceError as exc:
                 last_error = exc
+                if exc.kind == LLMErrorKind.QUOTA and self._can_fallback_to_openai():
+                    return await self._fallback_to_openai(
+                        system_prompt,
+                        user_prompt,
+                        reason=exc.message,
+                        **kwargs,
+                    )
                 if proxy and exc.retryable and exc.kind in {
                     LLMErrorKind.NETWORK,
                     LLMErrorKind.SERVER,
@@ -263,6 +302,13 @@ class OllamaProvider(LLMProvider):
                 raise
 
         if last_error:
+            if last_error.kind == LLMErrorKind.QUOTA and self._can_fallback_to_openai():
+                return await self._fallback_to_openai(
+                    system_prompt,
+                    user_prompt,
+                    reason=last_error.message,
+                    **kwargs,
+                )
             raise last_error
         raise LLMServiceError(
             kind=LLMErrorKind.NETWORK,
@@ -335,8 +381,11 @@ def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
         if snapshot.has_usage() and snapshot.is_critical(cfg.ollama_usage_critical_percent):
             logger.warning(
                 "Ollama limits critical, falling back to OpenAI",
+                model=cfg.openai_simple_model,
                 session=snapshot.session.percent if snapshot.session else None,
                 weekly=snapshot.weekly.percent if snapshot.weekly else None,
             )
-            return OpenAIProvider(cfg)
+            return OpenAIProvider(cfg, model=cfg.openai_simple_model)
+    if simple == "openai":
+        return OpenAIProvider(cfg, model=cfg.openai_simple_model)
     return _build_provider(cfg, simple)

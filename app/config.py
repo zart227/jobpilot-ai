@@ -77,12 +77,45 @@ class Settings(BaseSettings):
     ollama_auto_fallback: bool = Field(
         default=True,
         alias="OLLAMA_AUTO_FALLBACK",
-        description="Fall back to OpenAI for simple LLM when Ollama limits are critical",
+        description="Fall back to OPENAI_SIMPLE_MODEL for simple LLM when Ollama limits are critical",
     )
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
+    openai_simple_model: str = Field(
+        default="gpt-4.1-nano",
+        alias="OPENAI_SIMPLE_MODEL",
+        description="Cheap OpenAI model for filter/score/chat and Ollama auto-fallback",
+    )
     openai_timeout_seconds: float = Field(default=30.0, alias="OPENAI_TIMEOUT_SECONDS")
     openai_max_retries: int = Field(default=3, alias="OPENAI_MAX_RETRIES")
+    openai_admin_api_key: str = Field(
+        default="",
+        alias="OPENAI_ADMIN_API_KEY",
+        description="Admin API key for organization/costs spend tracking",
+    )
+    openai_session_token: str = Field(
+        default="",
+        alias="OPENAI_SESSION_TOKEN",
+        description="Browser session Bearer token for billing/credit_grants (platform.openai.com)",
+    )
+    openai_session_cookie: str = Field(
+        default="",
+        alias="OPENAI_SESSION_COOKIE",
+        description="Optional browser Cookie header (used together with OPENAI_SESSION_TOKEN)",
+    )
+    openai_budget_usd: float = Field(
+        default=0.0,
+        alias="OPENAI_BUDGET_USD",
+        description="Manual prepaid balance for estimated remaining when credits API unavailable",
+    )
+    openai_balance_warn_usd: float = Field(default=5.0, alias="OPENAI_BALANCE_WARN_USD")
+    openai_balance_critical_usd: float = Field(default=2.0, alias="OPENAI_BALANCE_CRITICAL_USD")
+    openai_usage_cache_seconds: int = Field(default=300, alias="OPENAI_USAGE_CACHE_SECONDS")
+    openai_usage_alert_cooldown_seconds: int = Field(
+        default=3600,
+        alias="OPENAI_USAGE_ALERT_COOLDOWN_SECONDS",
+    )
+    openai_cost_lookback_days: int = Field(default=30, alias="OPENAI_COST_LOOKBACK_DAYS")
     proxy: str = Field(
         default="",
         alias="PROXY",
@@ -143,6 +176,15 @@ class Settings(BaseSettings):
         default=True,
         alias="TELEGRAM_DEV_AGENT_ENABLED",
         description="Allow /dev commands to talk to local Cursor agent",
+    )
+    dev_agent_log_enabled: bool = Field(
+        default=True,
+        alias="DEV_AGENT_LOG_ENABLED",
+        description="Write dev-agent request/response audit logs to data/dev_agent_logs",
+    )
+    dev_agent_log_dir: str = Field(
+        default="data/dev_agent_logs",
+        alias="DEV_AGENT_LOG_DIR",
     )
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
@@ -215,6 +257,19 @@ class Settings(BaseSettings):
     kwork_pause_state_file: str = Field(
         default="data/kwork_connects_pause.json",
         alias="KWORK_PAUSE_STATE_FILE",
+    )
+    kwork_inbox_check_enabled: bool = Field(
+        default=True,
+        alias="KWORK_INBOX_CHECK_ENABLED",
+        description="Poll Kwork inbox for new client messages and notify via Telegram",
+    )
+    kwork_inbox_check_interval_minutes: int = Field(
+        default=15,
+        alias="KWORK_INBOX_CHECK_INTERVAL_MINUTES",
+    )
+    kwork_inbox_state_file: str = Field(
+        default="data/kwork_inbox_state.json",
+        alias="KWORK_INBOX_STATE_FILE",
     )
 
     min_score_threshold: int = Field(default=35, alias="MIN_SCORE_THRESHOLD")

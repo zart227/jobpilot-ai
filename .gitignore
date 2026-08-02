@@ -8,13 +8,17 @@ build/
 .venv/
 venv/
 data/kwork_session.json
+data/kwork_api_token.json
+data/kwork_inbox_state.json
 data/kwork_connects_pause.json
 data/kwork_debug/
 data/*_proxy_rotation.json
 data/ollama_usage_alert.json
+data/openai_usage_alert.json
 data/cursor_bridge.env
 data/cursor_bridge.pid
 data/cursor_bridge_socat.pid
+data/dev_agent_logs/
 data/cursor_bridge.log
 proxy-lists/
 .pytest_cache/
@@ -25,3 +29,4 @@ playwright-report/
 test-results/
 postgres_data/
 qdrant_data/
+temp/
