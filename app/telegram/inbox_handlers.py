@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 
 from app.agents.edit_reply_agent import EditReplyAgent
-from app.db.models import Job, TelegramInboxPending
+from app.db.models import Job, Proposal, TelegramInboxPending
 from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
 from app.services.kwork_inbox import send_kwork_inbox_reply
@@ -91,6 +91,9 @@ def register_inbox_handlers(router: Router) -> None:
                 await callback.answer("Already processed", show_alert=True)
                 return
             job = await session.get(Job, pending.job_id) if pending.job_id else None
+            proposal = (
+                await session.get(Proposal, pending.proposal_id) if pending.proposal_id else None
+            )
             order_id = ""
             if job:
                 order_id = extract_site_order_id(
@@ -106,6 +109,8 @@ def register_inbox_handlers(router: Router) -> None:
             client_message=pending.client_message,
             username=pending.kwork_username,
             job_title=job.title if job else "",
+            job_description=job.description if job else "",
+            proposal_content=proposal.content if proposal else "",
             order_id=order_id,
             edit_steps=[],
         )
@@ -131,6 +136,8 @@ def register_inbox_handlers(router: Router) -> None:
         client_message = data.get("client_message") or ""
         username = data.get("username") or ""
         job_title = data.get("job_title") or ""
+        job_description = data.get("job_description") or ""
+        proposal_content = data.get("proposal_content") or ""
         order_id = data.get("order_id") or None
 
         await message.answer("⏳ Применяю правки через LLM...")
@@ -141,6 +148,8 @@ def register_inbox_handlers(router: Router) -> None:
                 instruction=instruction,
                 client_message=client_message,
                 job_title=job_title,
+                job_description=job_description,
+                proposal_content=proposal_content,
             )
         except LLMServiceError as exc:
             await message.answer(format_llm_error_message(exc, order_id), parse_mode=ParseMode.HTML)

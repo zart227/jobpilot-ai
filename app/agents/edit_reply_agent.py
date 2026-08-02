@@ -8,12 +8,15 @@ logger = structlog.get_logger(__name__)
 
 SYSTEM_PROMPT = """You edit a freelance chat reply based on the user's instruction.
 
+Context: job posting, our proposal to the client, the client's message, and the current draft.
+
 Rules:
 - Apply ONLY what the user asked.
 - Keep the same language as the original (Russian for Kwork).
+- Stay consistent with the job and our proposal.
 - Plain text ONLY: no markdown, no asterisks.
 - Do NOT use em dash (—). Use commas or periods instead.
-- Be professional and concise (max 150 words unless user asks otherwise).
+- Be professional and concise (max 200 words unless user asks otherwise).
 - Return ONLY the revised reply text, no labels or commentary."""
 
 
@@ -28,8 +31,16 @@ class EditReplyAgent:
         instruction: str,
         client_message: str,
         job_title: str = "",
+        job_description: str = "",
+        proposal_content: str = "",
     ) -> str:
         user_prompt = f"""Job title: {job_title}
+
+Job description:
+{job_description[:2000]}
+
+Our proposal to this job:
+{proposal_content[:2000] if proposal_content.strip() else "(not available)"}
 
 Client message:
 {client_message[:1500]}

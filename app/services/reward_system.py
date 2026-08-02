@@ -3,7 +3,7 @@ import uuid
 import structlog
 from sqlalchemy import select
 
-from app.db.models import Job, Outcome, Proposal, Reward
+from app.db.models import Outcome, Reward
 from app.db.session import AsyncSessionLocal
 
 logger = structlog.get_logger(__name__)
@@ -45,14 +45,8 @@ class RewardSystem:
             )
             session.add(reward_record)
 
-            job = await session.get(Job, job_id)
-            if job:
-                job.status = status
-
-            if proposal_id:
-                proposal = await session.get(Proposal, proposal_id)
-                if proposal:
-                    proposal.status = status
+            # Job/proposal statuses are managed by ProposalSender and approval flow.
+            # Outcome statuses like "draft" must not overwrite "approved"/"sent".
 
             await session.commit()
 

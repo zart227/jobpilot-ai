@@ -41,6 +41,7 @@ def is_kwork_order_closed_error(error: str | None) -> bool:
             "исполнитель уже выбран",
             "закрыт на kwork",
             "закрыт или в архиве",
+            "проект уже закрыт",
         )
     )
 
@@ -72,6 +73,7 @@ def _order_closed_in_body(body: str) -> bool:
             "исполнитель уже выбран",
             "заказ закрыт",
             "проект закрыт",
+            "проект уже закрыт",
             "находится в архиве",
             "заказ в архиве",
             "проект в архиве",
@@ -964,9 +966,7 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
     if propose_button_disabled and await _detect_connects_limit_on_page(page):
         return await _connects_limit_error_from_page(page)
     if _order_closed_in_body(body):
-        if "исполнитель уже выбран" in body or "оставить отзыв" in body:
-            return KWORK_ORDER_CLOSED_ERROR
-        return "Заказ закрыт или в архиве на Kwork"
+        return KWORK_ORDER_CLOSED_ERROR
     if not has_propose_button:
         if "оставить отзыв" in body:
             return KWORK_ORDER_CLOSED_ERROR

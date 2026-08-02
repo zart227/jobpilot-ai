@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -133,7 +134,21 @@ def _extract_project_id(message: dict[str, Any], dialog: dict[str, Any]) -> str 
             value = source.get(key)
             if value:
                 return str(value)
+
+    raw_text = str(message.get("message", message.get("text", "")))
+    match = re.search(r"/projects/(\d+)", raw_text)
+    if match:
+        return match.group(1)
+
+    cleaned = clean_kwork_message_text(raw_text)
+    match = re.search(r"/projects/(\d+)", cleaned)
+    if match:
+        return match.group(1)
+
     return None
+
+
+_ACTIVE_JOB_STATUSES = ("sent", "scored", "approved")
 
 
 async def _find_job_for_message(
@@ -155,7 +170,7 @@ async def _find_job_for_message(
         )
         job = result.scalar_one_or_none()
         if job:
-            proposal = await _latest_sent_proposal(session, job.id)
+            proposal = await _best_proposal_for_reply(session, job.id)
             return job, proposal
 
     if username:
@@ -165,7 +180,7 @@ async def _find_job_for_message(
             .join(Client, Job.client_id == Client.id, isouter=True)
             .where(
                 Job.platform == "kwork",
-                Job.status == "sent",
+                Job.status.in_(_ACTIVE_JOB_STATUSES),
                 or_(
                     Client.name.ilike(pattern),
                     Client.external_id.ilike(pattern),
@@ -176,20 +191,46 @@ async def _find_job_for_message(
         )
         job = result.scalar_one_or_none()
         if job:
-            proposal = await _latest_sent_proposal(session, job.id)
+            proposal = await _best_proposal_for_reply(session, job.id)
             return job, proposal
 
     return None, None
 
 
-async def _latest_sent_proposal(session, job_id: uuid.UUID) -> Proposal | None:
+async def _best_proposal_for_reply(session, job_id: uuid.UUID) -> Proposal | None:
     result = await session.execute(
-        select(Proposal)
-        .where(Proposal.job_id == job_id)
-        .order_by(Proposal.created_at.desc())
-        .limit(1)
+        select(Proposal).where(Proposal.job_id == job_id).order_by(Proposal.created_at.desc())
     )
-    return result.scalar_one_or_none()
+    proposals = list(result.scalars().all())
+    if not proposals:
+        return None
+
+    priority = {"sent": 0, "approved": 1, "edited": 2, "draft": 3}
+    proposals.sort(
+        key=lambda proposal: (
+            priority.get(proposal.status, 9),
+            -(proposal.created_at.timestamp() if proposal.created_at else 0),
+        )
+    )
+    return proposals[0]
+
+
+async def _generate_inbox_reply(
+    job: Job,
+    proposal: Proposal | None,
+    client_message: str,
+) -> tuple[str, str]:
+    from app.services.job_pipeline import JobPipelineService
+
+    pipeline = JobPipelineService()
+    agent_state = await pipeline.job_to_state(job.id)
+    agent_state["client_message"] = client_message
+    if proposal:
+        agent_state["proposal_content"] = proposal.content
+
+    chat_agent = ChatAgent()
+    result = await chat_agent.run(agent_state)
+    return str(result.get("chat_intent", "")), str(result.get("chat_reply", ""))
 
 
 def format_client_message_alert(
@@ -369,7 +410,6 @@ async def _process_and_notify(
             return 0
         bot = create_telegram_bot(settings.telegram_bot_token, settings)
 
-    chat_agent = ChatAgent()
     notified = 0
     target_chat = int(settings.telegram_admin_chat_id)
 
@@ -389,17 +429,11 @@ async def _process_and_notify(
                     project_id=project_id,
                 )
 
-                if job and proposal:
-                    from app.services.job_pipeline import JobPipelineService
-
-                    pipeline = JobPipelineService()
-                    agent_state = await pipeline.job_to_state(job.id)
-                    agent_state["client_message"] = msg.text
-                    agent_state["proposal_content"] = proposal.content
+                if job:
                     try:
-                        result = await chat_agent.run(agent_state)
-                        chat_intent = str(result.get("chat_intent", ""))
-                        chat_reply = str(result.get("chat_reply", ""))
+                        chat_intent, chat_reply = await _generate_inbox_reply(
+                            job, proposal, msg.text
+                        )
                     except Exception as exc:
                         logger.warning("ChatAgent failed for inbox message", error=str(exc))
 
@@ -574,6 +608,238 @@ async def resend_last_inbox_message(
     finally:
         if api is not None:
             await api.close()
+
+
+async def regenerate_pending_inbox_drafts(
+    settings: Settings | None = None,
+    *,
+    bot=None,
+    pending_only: bool = True,
+) -> dict[str, Any]:
+    """Regenerate draft replies for inbox pending rows and refresh Telegram messages."""
+    settings = settings or get_settings()
+    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
+        return {"skipped": True, "reason": "no_telegram"}
+
+    owns_bot = bot is None
+    if owns_bot:
+        bot = create_telegram_bot(settings.telegram_bot_token, settings)
+
+    updated = 0
+    try:
+        async with AsyncSessionLocal() as session:
+            query = select(TelegramInboxPending).order_by(TelegramInboxPending.created_at.desc())
+            if pending_only:
+                query = query.where(TelegramInboxPending.status == "pending")
+            rows = list((await session.execute(query)).scalars().all())
+
+        for pending in rows:
+            async with AsyncSessionLocal() as session:
+                row = await session.get(TelegramInboxPending, pending.id)
+                if not row:
+                    continue
+                job = await session.get(Job, row.job_id) if row.job_id else None
+                proposal = (
+                    await session.get(Proposal, row.proposal_id) if row.proposal_id else None
+                )
+                if not job:
+                    job, proposal = await _find_job_for_message(
+                        session,
+                        username=row.kwork_username,
+                        project_id=None,
+                    )
+                    if job:
+                        row.job_id = job.id
+                        row.proposal_id = proposal.id if proposal else None
+
+                if not job:
+                    continue
+
+                try:
+                    chat_intent, chat_reply = await _generate_inbox_reply(
+                        job, proposal, row.client_message
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Inbox draft regeneration failed",
+                        pending_id=str(row.id),
+                        error=str(exc),
+                    )
+                    continue
+
+                row.draft_reply = chat_reply
+                row.chat_intent = chat_intent or None
+                if proposal and not row.proposal_id:
+                    row.proposal_id = proposal.id
+                await session.commit()
+
+            if row.message_id and row.chat_id:
+                msg = ClientInboxMessage(
+                    user_id=row.kwork_user_id,
+                    username=row.kwork_username,
+                    message_id="",
+                    text=row.client_message,
+                    timestamp=0,
+                    dialog={},
+                    raw={},
+                )
+                text = format_client_message_alert(
+                    msg,
+                    job=job,
+                    chat_intent=chat_intent,
+                    chat_reply=chat_reply,
+                )
+                try:
+                    from aiogram.enums import ParseMode
+
+                    from app.telegram.keyboards import inbox_reply_keyboard
+
+                    await bot.edit_message_text(
+                        text,
+                        chat_id=row.chat_id,
+                        message_id=row.message_id,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=False,
+                        reply_markup=inbox_reply_keyboard(str(row.id)),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to refresh inbox Telegram message",
+                        pending_id=str(row.id),
+                        error=str(exc),
+                    )
+            updated += 1
+
+        return {"updated": updated}
+    finally:
+        if owns_bot and bot is not None:
+            await bot.session.close()
+
+
+async def resend_inbox_pending_notifications(
+    settings: Settings | None = None,
+    *,
+    limit: int = 2,
+    usernames: list[str] | None = None,
+    bot=None,
+) -> dict[str, Any]:
+    """Regenerate drafts and send fresh Telegram notifications for pending inbox rows."""
+    settings = settings or get_settings()
+    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
+        return {"skipped": True, "reason": "no_telegram"}
+
+    owns_bot = bot is None
+    if owns_bot:
+        bot = create_telegram_bot(settings.telegram_bot_token, settings)
+
+    target_chat = int(settings.telegram_admin_chat_id)
+    sent: list[dict[str, Any]] = []
+
+    try:
+        async with AsyncSessionLocal() as session:
+            query = (
+                select(TelegramInboxPending)
+                .where(TelegramInboxPending.status == "pending")
+                .order_by(TelegramInboxPending.created_at.desc())
+            )
+            if usernames:
+                query = query.where(TelegramInboxPending.kwork_username.in_(usernames))
+            if limit > 0:
+                query = query.limit(limit)
+            rows = list((await session.execute(query)).scalars().all())
+
+        for pending in rows:
+            async with AsyncSessionLocal() as session:
+                row = await session.get(TelegramInboxPending, pending.id)
+                if not row or row.status != "pending":
+                    continue
+
+                job = await session.get(Job, row.job_id) if row.job_id else None
+                proposal = (
+                    await session.get(Proposal, row.proposal_id) if row.proposal_id else None
+                )
+                if not job:
+                    job, proposal = await _find_job_for_message(
+                        session,
+                        username=row.kwork_username,
+                        project_id=None,
+                    )
+                    if job:
+                        row.job_id = job.id
+                        row.proposal_id = proposal.id if proposal else None
+
+                chat_intent = row.chat_intent or ""
+                chat_reply = row.draft_reply or ""
+                if job:
+                    try:
+                        chat_intent, chat_reply = await _generate_inbox_reply(
+                            job, proposal, row.client_message
+                        )
+                        row.draft_reply = chat_reply
+                        row.chat_intent = chat_intent or None
+                        if proposal and not row.proposal_id:
+                            row.proposal_id = proposal.id
+                    except Exception as exc:
+                        logger.warning(
+                            "Inbox resend draft generation failed",
+                            pending_id=str(row.id),
+                            error=str(exc),
+                        )
+
+                row.chat_id = target_chat
+                await session.commit()
+                pending_id = str(row.id)
+                client_message = row.client_message
+                username = row.kwork_username
+                user_id = row.kwork_user_id
+
+            msg = ClientInboxMessage(
+                user_id=user_id,
+                username=username,
+                message_id="",
+                text=client_message,
+                timestamp=0,
+                dialog={},
+                raw={},
+            )
+            text = format_client_message_alert(
+                msg,
+                job=job,
+                chat_intent=chat_intent,
+                chat_reply=chat_reply,
+            )
+            message = await bot.send_message(
+                target_chat,
+                text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=False,
+                reply_markup=inbox_reply_keyboard(pending_id),
+            )
+            async with AsyncSessionLocal() as session:
+                row = await session.get(TelegramInboxPending, uuid.UUID(pending_id))
+                if row:
+                    row.message_id = message.message_id
+                    await session.commit()
+
+            sent.append(
+                {
+                    "pending_id": pending_id,
+                    "username": username,
+                    "message_id": message.message_id,
+                    "draft_preview": chat_reply[:120],
+                }
+            )
+            logger.info(
+                "Inbox pending notification resent",
+                username=username,
+                pending_id=pending_id,
+                message_id=message.message_id,
+            )
+
+        return {"sent": len(sent), "items": sent}
+    finally:
+        if owns_bot and bot is not None:
+            await bot.session.close()
 
 
 async def check_kwork_inbox(

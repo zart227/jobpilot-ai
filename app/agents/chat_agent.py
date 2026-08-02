@@ -8,19 +8,58 @@ from app.schemas.agent_state import JobPilotState
 
 logger = structlog.get_logger(__name__)
 
-SYSTEM_PROMPT = """Handle client replies to freelance proposals.
+SYSTEM_PROMPT = """You help a freelancer reply to client messages on Kwork.
 
-Classify intent and respond concisely.
+Use the job posting, the proposal we already sent, and the client's new message.
+Answer in the same language as the client (usually Russian).
+Address the client's specific points; do not give a generic reply.
+
+Classify intent and draft a concise professional reply.
 
 Respond ONLY with valid JSON:
 {
   "intent": "question|negotiation|acceptance|rejection|clarification|other",
-  "reply": "your concise professional response (max 150 words)"
+  "reply": "your reply (max 200 words)"
 }
 
-Do NOT use em dash (—) in replies. Use commas or periods instead.
+Do NOT use em dash (—) in replies. Use commas or periods instead."""
 
-Be helpful, professional, and move toward closing the deal when appropriate."""
+
+def build_chat_user_prompt(
+    job: dict,
+    proposal: str,
+    client_message: str,
+) -> str:
+    lines = [
+        "=== Задача (заказ) ===",
+        f"Название: {job.get('title', '')}",
+    ]
+
+    description = str(job.get("description", "")).strip()
+    if description:
+        lines.append(f"Описание:\n{description[:2500]}")
+
+    budget_min = job.get("budget_min")
+    budget_max = job.get("budget_max")
+    currency = job.get("budget_currency") or "RUB"
+    if budget_min or budget_max:
+        lines.append(f"Бюджет: {budget_min or '?'} – {budget_max or '?'} {currency}")
+
+    skills = job.get("skills") or []
+    if skills:
+        lines.append(f"Навыки: {', '.join(str(skill) for skill in skills[:20])}")
+
+    lines.append("\n=== Наш отклик на эту задачу ===")
+    lines.append(proposal[:2500] if proposal.strip() else "(отклик не найден в базе)")
+
+    lines.append("\n=== Сообщение клиента ===")
+    lines.append(client_message[:2500])
+
+    lines.append(
+        "\nС учётом задачи, нашего отклика и сообщения клиента: "
+        "классифицируй интент и составь ответ."
+    )
+    return "\n".join(lines)
 
 
 class ChatAgent:
@@ -35,17 +74,7 @@ class ChatAgent:
         if not client_message:
             return {"chat_intent": "none", "chat_reply": ""}
 
-        user_prompt = f"""Job context:
-Title: {job.get('title', '')}
-Platform: {job.get('platform', '')}
-
-Original proposal sent:
-{proposal[:1500]}
-
-Client message:
-{client_message}
-
-Classify intent and draft a reply."""
+        user_prompt = build_chat_user_prompt(job, proposal, client_message)
 
         try:
             response = await self._llm.complete(SYSTEM_PROMPT, user_prompt, temperature=0.5)

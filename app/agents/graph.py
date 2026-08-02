@@ -74,7 +74,7 @@ async def send_node(state: JobPilotState) -> dict:
     logger.info("JobPilot AI proposal sent", job_id=job_id, success=success, error=error)
     return {
         "approval_status": "sent" if success else "pending",
-        "outcome_status": "sent" if success else "draft",
+        "outcome_status": "sent" if success else "send_failed",
         "send_error": error or "",
         "send_debug": debug or {},
     }

@@ -829,7 +829,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
         await reward_system.record_outcome(
             uuid.UUID(job_id),
             uuid.UUID(proposal_id),
-            state.get("outcome_status", "sent" if send_success else "draft"),
+            state.get("outcome_status", "sent" if send_success else "send_failed"),
         )
         return send_success, send_error, send_debug
 

@@ -4,10 +4,12 @@ from app.services.kwork_api import clean_kwork_message_text
 from app.services.kwork_inbox import (
     ClientInboxMessage,
     InboxState,
+    _extract_project_id,
     _is_from_client,
     _message_key,
     format_client_message_alert,
 )
+from app.agents.chat_agent import build_chat_user_prompt
 
 
 def test_clean_kwork_message_text() -> None:
@@ -64,4 +66,31 @@ def test_format_client_message_alert() -> None:
     )
     assert "buyer" in text
     assert "Черновик ответа" in text
-    assert "Черновик ответа" in text
+
+
+def test_extract_project_id_from_message_html() -> None:
+    message = {
+        "message": (
+            'Тема: <a href="https://kwork.ru/projects/3228711">AI проект</a>'
+        )
+    }
+    assert _extract_project_id(message, {}) == "3228711"
+
+
+def test_build_chat_user_prompt_includes_job_proposal_and_client() -> None:
+    prompt = build_chat_user_prompt(
+        {
+            "title": "Бот",
+            "description": "Нужен Telegram-бот",
+            "budget_min": 10000,
+            "budget_max": 20000,
+            "budget_currency": "RUB",
+            "skills": ["Python"],
+        },
+        "Мы готовы сделать за 5 дней",
+        "Какой срок?",
+    )
+    assert "Бот" in prompt
+    assert "Наш отклик" in prompt
+    assert "Мы готовы" in prompt
+    assert "Какой срок" in prompt
