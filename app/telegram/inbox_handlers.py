@@ -6,6 +6,7 @@ import uuid
 import structlog
 from aiogram import F, Router
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -47,6 +48,14 @@ def format_inbox_edit_preview(
         f"<b>Ваша правка:</b> {html.escape(instruction)}\n\n"
         f"{html.escape(preview)}"
     )
+
+
+async def _safe_clear_reply_markup(message) -> None:
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 def register_inbox_handlers(router: Router) -> None:
@@ -202,7 +211,6 @@ def register_inbox_handlers(router: Router) -> None:
             await session.commit()
 
         await state.clear()
-        await callback.message.edit_reply_markup(reply_markup=None)
         await _send_inbox_reply(callback, pending_id, edited=True, reply_text=new_reply)
 
 
@@ -249,7 +257,7 @@ async def _send_inbox_reply(
         proposal_id=proposal_id,
     )
 
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await _safe_clear_reply_markup(callback.message)
     if success:
         label = "отредактированный ответ" if edited else "ответ"
         await callback.message.answer(

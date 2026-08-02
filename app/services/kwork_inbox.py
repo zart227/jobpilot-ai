@@ -470,6 +470,112 @@ async def _process_and_notify(
     return notified
 
 
+async def _find_last_client_message(
+    api,
+    *,
+    my_username: str,
+    my_user_id: int | None,
+    username: str | None = None,
+    user_id: int | None = None,
+) -> tuple[ClientInboxMessage | None, dict[str, Any] | None]:
+    dialogs = await api.get_dialogs()
+    if not dialogs:
+        return None, None
+
+    if username:
+        dialog = next(
+            (d for d in dialogs if str(d.get("username", "")).lower() == username.lower()),
+            None,
+        )
+    elif user_id:
+        dialog = next((d for d in dialogs if int(d.get("user_id") or 0) == int(user_id)), None)
+    else:
+        dialog = max(
+            dialogs,
+            key=lambda d: int(d.get("last_message_time") or d.get("time") or 0),
+        )
+
+    if not dialog:
+        return None, None
+
+    dialog_username = str(dialog.get("username") or "")
+    dialog_user_id = dialog.get("user_id")
+    if not dialog_username or not dialog_user_id:
+        return None, dialog
+
+    messages = await api.get_messages(dialog_username)
+    client_messages: list[ClientInboxMessage] = []
+    for message in messages or []:
+        if not _is_from_client(message, my_username, my_user_id):
+            continue
+        text = clean_kwork_message_text(str(message.get("message", message.get("text", ""))))
+        client_messages.append(
+            ClientInboxMessage(
+                user_id=int(dialog_user_id),
+                username=dialog_username,
+                message_id=str(message.get("MID") or message.get("id") or message.get("message_id") or ""),
+                text=text,
+                timestamp=int(message.get("time") or message.get("sent_timestamp") or 0),
+                dialog=dialog,
+                raw=message,
+            )
+        )
+
+    if not client_messages:
+        return None, dialog
+
+    client_messages.sort(key=lambda item: item.timestamp)
+    return client_messages[-1], dialog
+
+
+async def resend_last_inbox_message(
+    settings: Settings | None = None,
+    *,
+    username: str | None = None,
+    user_id: int | None = None,
+    bot=None,
+) -> dict[str, Any]:
+    """Re-notify Telegram for the latest client inbox message (with EDIT/SEND buttons)."""
+    settings = settings or get_settings()
+    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
+        return {"skipped": True, "reason": "no_telegram"}
+
+    api = None
+    try:
+        api = await create_kwork_api(settings)
+        actor = await api.get_actor()
+        my_username = str(actor.get("username") or "")
+        my_user_id = int(actor["id"]) if actor.get("id") else None
+
+        msg, dialog = await _find_last_client_message(
+            api,
+            my_username=my_username,
+            my_user_id=my_user_id,
+            username=username,
+            user_id=user_id,
+        )
+        if msg is None:
+            return {"skipped": True, "reason": "no_client_message", "dialog": dialog}
+
+        notified = await _process_and_notify(settings, [msg], bot=bot)
+        return {
+            "resent": notified > 0,
+            "notified": notified,
+            "username": msg.username,
+            "user_id": msg.user_id,
+            "message_preview": msg.text[:120],
+        }
+    except KworkAuthError as exc:
+        logger.warning("Kwork inbox resend auth failed", error=str(exc))
+        return {"skipped": True, "error": str(exc)}
+    except Exception as exc:
+        logger.error("Kwork inbox resend failed", error=str(exc))
+        return {"skipped": True, "error": str(exc)}
+    finally:
+        if api is not None:
+            await api.close()
+
+
 async def check_kwork_inbox(
     settings: Settings | None = None,
     *,
