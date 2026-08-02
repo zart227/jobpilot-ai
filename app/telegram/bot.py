@@ -28,6 +28,7 @@ from app.services.kwork_pause import format_kwork_pause_reason, get_kwork_pause_
 from app.services.proposal_sender import ProposalSender
 from app.services.reward_system import RewardSystem
 from app.telegram.dev_agent_handlers import register_dev_agent_handlers
+from app.telegram.inbox_handlers import register_inbox_handlers
 from app.telegram.keyboards import approval_keyboard, edit_preview_keyboard
 from app.services.dev_agent_service import (
     DevAgentConfigurationError,
@@ -413,6 +414,10 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
     register_dev_agent_handlers(dev_router, dev_agent)
     dp.include_router(dev_router)
 
+    inbox_router = Router()
+    register_inbox_handlers(inbox_router)
+    dp.include_router(inbox_router)
+
     @dp.message(Command("start"))
     async def cmd_start(message: Message) -> None:
         dev_hint = ""
@@ -422,7 +427,8 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             "👋 <b>JobPilot AI</b> is running.\n\n"
             "I will send you freelance job alerts with proposals.\n"
             "Use buttons: APPROVE | EDIT | SKIP | Задание\n\n"
-            "EDIT: напишите инструкцию для LLM (например: «сделай короче»)."
+            "EDIT: напишите инструкцию для LLM (например: «сделай короче»).\n"
+            "Входящие от Kwork: ОТПРАВИТЬ | EDIT | SKIP."
             f"{dev_hint}",
             parse_mode=ParseMode.HTML,
         )
@@ -862,7 +868,7 @@ async def run_bot() -> None:
         await dp.start_polling(bot)
     finally:
         if cursor_client is not None:
-            await cursor_client.close()
+            await cursor_client.aclose()
 
 
 def main() -> None:

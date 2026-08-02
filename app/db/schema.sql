@@ -130,3 +130,21 @@ CREATE TABLE IF NOT EXISTS telegram_pending (
 );
 
 CREATE INDEX IF NOT EXISTS idx_telegram_pending_status ON telegram_pending(status);
+
+CREATE TABLE IF NOT EXISTS telegram_inbox_pending (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID REFERENCES interactions(id) ON DELETE SET NULL,
+    job_id UUID REFERENCES jobs(id) ON DELETE SET NULL,
+    proposal_id UUID REFERENCES proposals(id) ON DELETE SET NULL,
+    kwork_user_id BIGINT NOT NULL,
+    kwork_username VARCHAR(255) NOT NULL,
+    client_message TEXT NOT NULL,
+    draft_reply TEXT NOT NULL DEFAULT '',
+    chat_intent VARCHAR(64),
+    chat_id BIGINT NOT NULL,
+    message_id BIGINT,
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_inbox_pending_status ON telegram_inbox_pending(status);

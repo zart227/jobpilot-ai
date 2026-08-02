@@ -13,6 +13,8 @@ from app.services.kwork_browser import refresh_kwork_pause_from_kwork
 from app.services.kwork_pause import KWORK_PLATFORM, get_kwork_pause_reason, is_kwork_paused
 from app.telegram.bot import notify_new_proposal
 from app.llm.ollama_usage import maybe_notify_ollama_usage_warning
+from app.llm.openai_usage import maybe_notify_openai_usage_warning
+from app.services.kwork_inbox import check_kwork_inbox as run_kwork_inbox_check
 from app.utils.proxy import create_telegram_bot
 
 logger = structlog.get_logger(__name__)
@@ -100,6 +102,14 @@ async def _scrape_and_process() -> dict:
             await maybe_notify_ollama_usage_warning(settings, bot)
         except Exception as exc:
             logger.warning("Ollama usage alert failed", error=str(exc))
+        try:
+            await maybe_notify_openai_usage_warning(settings, bot)
+        except Exception as exc:
+            logger.warning("OpenAI usage alert failed", error=str(exc))
+        try:
+            await run_kwork_inbox_check(settings, bot=bot)
+        except Exception as exc:
+            logger.warning("Kwork inbox check failed", error=str(exc))
         finally:
             await bot.session.close()
 
@@ -173,6 +183,11 @@ async def _scrape_and_process() -> dict:
 @celery_app.task(name="app.tasks.scrape_tasks.refresh_kwork_pause")
 def refresh_kwork_pause_task() -> dict:
     return _run_async(refresh_kwork_pause_from_kwork(force=True))
+
+
+@celery_app.task(name="app.tasks.scrape_tasks.check_kwork_inbox")
+def check_kwork_inbox_task() -> dict:
+    return _run_async(run_kwork_inbox_check())
 
 
 @celery_app.task(name="app.tasks.scrape_tasks.process_single_job")

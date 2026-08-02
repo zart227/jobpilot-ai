@@ -29,6 +29,10 @@ celery_app.conf.update(
             "task": "app.tasks.scrape_tasks.refresh_kwork_pause",
             "schedule": timedelta(hours=max(1, settings.kwork_pause_check_interval_hours)),
         },
+        "check-kwork-inbox": {
+            "task": "app.tasks.scrape_tasks.check_kwork_inbox",
+            "schedule": timedelta(minutes=max(5, settings.kwork_inbox_check_interval_minutes)),
+        },
     },
 )
 

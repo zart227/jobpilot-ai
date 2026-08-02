@@ -183,3 +183,25 @@ class TelegramPending(Base):
     message_id: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TelegramInboxPending(Base):
+    __tablename__ = "telegram_inbox_pending"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    interaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("proposals.id", ondelete="SET NULL")
+    )
+    kwork_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    kwork_username: Mapped[str] = mapped_column(String(255), nullable=False)
+    client_message: Mapped[str] = mapped_column(Text, nullable=False)
+    draft_reply: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    chat_intent: Mapped[str | None] = mapped_column(String(64))
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

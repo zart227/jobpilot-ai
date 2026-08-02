@@ -49,3 +49,47 @@ def approval_keyboard(pending_id: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def inbox_reply_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ ОТПРАВИТЬ",
+                    callback_data=f"inbox_approve:{pending_id}",
+                ),
+                InlineKeyboardButton(
+                    text="✏️ EDIT",
+                    callback_data=f"inbox_edit:{pending_id}",
+                ),
+                InlineKeyboardButton(
+                    text="⏭ SKIP",
+                    callback_data=f"inbox_skip:{pending_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def inbox_edit_preview_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Отправить на Kwork",
+                    callback_data=f"inbox_edit_send:{pending_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Ещё правки",
+                    callback_data=f"inbox_edit_more:{pending_id}",
+                ),
+                InlineKeyboardButton(
+                    text="⏭ Отмена",
+                    callback_data=f"inbox_edit_cancel:{pending_id}",
+                ),
+            ],
+        ]
+    )
