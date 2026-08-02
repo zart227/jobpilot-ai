@@ -1,0 +1,17 @@
+[Unit]
+Description=JobPilot Cursor SDK Bridge (dev-agent for Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/jobpilot-ai
+Environment=CURSOR_BRIDGE_PORT=9247
+Environment=CURSOR_BRIDGE_INTERNAL_PORT=19247
+ExecStart=%h/jobpilot-ai/.venv/bin/python %h/jobpilot-ai/scripts/run_cursor_bridge.py --workspace %h/jobpilot-ai --port 19247 --public-port 9247 --force
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

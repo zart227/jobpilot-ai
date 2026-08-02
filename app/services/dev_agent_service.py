@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,7 @@ from sqlalchemy import func, select
 from app.config import Settings, get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
+from app.services.dev_agent_audit import log_dev_agent_event
 from app.services.kwork_pause import format_kwork_pause_reason, get_kwork_pause_reason, is_kwork_paused
 from app.services.reward_system import RewardSystem
 
@@ -171,6 +173,21 @@ class DevAgentService:
     def _agent_key(self, chat_id: int) -> str:
         return AGENT_ID_KEY.format(chat_id=chat_id)
 
+    def _build_agent_options(self) -> Any:
+        from cursor_sdk import AgentOptions, LocalAgentOptions
+
+        workspace = resolve_agent_workspace(self._settings)
+        return AgentOptions(
+            api_key=self._settings.cursor_api_key,
+            model=self._settings.cursor_model,
+            local=LocalAgentOptions(cwd=workspace),
+        )
+
+    def _build_send_options(self) -> Any:
+        from cursor_sdk import SendOptions
+
+        return SendOptions(model=self._settings.cursor_model)
+
     async def reset_session(self, chat_id: int) -> None:
         agent_id = await self._redis.get(self._agent_key(chat_id))
         if agent_id:
@@ -180,7 +197,7 @@ class DevAgentService:
 
                 agent = await AsyncAgent.resume(
                     raw_id,
-                    AgentOptions(api_key=self._settings.cursor_api_key),
+                    self._build_agent_options(),
                     client=self._client,
                 )
                 await agent.close()
@@ -189,29 +206,28 @@ class DevAgentService:
         await self._redis.delete(self._agent_key(chat_id))
 
     async def _get_or_create_agent(self, chat_id: int) -> Any:
-        from cursor_sdk import AgentOptions, AsyncAgent, LocalAgentOptions
+        from cursor_sdk import AsyncAgent
 
+        options = self._build_agent_options()
         stored = await self._redis.get(self._agent_key(chat_id))
         if stored:
             agent_id = stored.decode() if isinstance(stored, bytes) else str(stored)
             try:
                 return await AsyncAgent.resume(
                     agent_id,
-                    AgentOptions(api_key=self._settings.cursor_api_key),
+                    options,
                     client=self._client,
                 )
             except Exception as exc:
                 logger.warning("Dev agent resume failed, creating new", error=str(exc))
                 await self._redis.delete(self._agent_key(chat_id))
 
-        workspace = resolve_agent_workspace(self._settings)
         agent = await AsyncAgent.create(
-            AgentOptions(
-                api_key=self._settings.cursor_api_key,
-                model=self._settings.cursor_model,
-                local=LocalAgentOptions(cwd=workspace),
-            ),
+            options,
             client=self._client,
+            model=self._settings.cursor_model,
+            api_key=self._settings.cursor_api_key,
+            local=options.local,
         )
         await self._redis.set(self._agent_key(chat_id), agent.agent_id)
         return agent
@@ -221,14 +237,38 @@ class DevAgentService:
 
         lock = self._locks.setdefault(chat_id, asyncio.Lock())
         prompt = f"{DEV_AGENT_SYSTEM_PREFIX}{message.strip()}"
+        started = time.monotonic()
+
+        log_dev_agent_event(
+            "request_started",
+            chat_id=chat_id,
+            settings=self._settings,
+            request=message.strip(),
+            model=self._settings.cursor_model,
+        )
 
         async with lock:
             agent = await self._get_or_create_agent(chat_id)
             try:
-                run = await agent.send(prompt)
-                result = await run.wait()
+                run = await agent.send(prompt, self._build_send_options())
+                result = await asyncio.wait_for(
+                    run.wait(),
+                    timeout=self._settings.cursor_agent_timeout_seconds,
+                )
                 text = await run.text()
+                duration = round(time.monotonic() - started, 1)
                 if result.status == "error":
+                    log_dev_agent_event(
+                        "request_failed",
+                        chat_id=chat_id,
+                        settings=self._settings,
+                        request=message.strip(),
+                        run_id=run.id,
+                        agent_id=agent.agent_id,
+                        status=result.status,
+                        duration_sec=duration,
+                        response_preview=(text or "")[:500],
+                    )
                     return DevAgentResult(
                         text=text or "Агент завершил работу с ошибкой.",
                         status="error",
@@ -236,16 +276,59 @@ class DevAgentService:
                         agent_id=agent.agent_id,
                         error=f"Run {run.id} failed",
                     )
+                log_dev_agent_event(
+                    "request_completed",
+                    chat_id=chat_id,
+                    settings=self._settings,
+                    request=message.strip(),
+                    run_id=run.id,
+                    agent_id=agent.agent_id,
+                    status=result.status,
+                    duration_sec=duration,
+                    response_preview=(text or "")[:500],
+                )
                 return DevAgentResult(
                     text=text or "(пустой ответ)",
                     status=result.status,
                     run_id=run.id,
                     agent_id=agent.agent_id,
                 )
+            except TimeoutError as exc:
+                duration = round(time.monotonic() - started, 1)
+                log_dev_agent_event(
+                    "request_timeout",
+                    chat_id=chat_id,
+                    settings=self._settings,
+                    request=message.strip(),
+                    agent_id=agent.agent_id,
+                    duration_sec=duration,
+                    timeout_sec=self._settings.cursor_agent_timeout_seconds,
+                )
+                raise TimeoutError(
+                    f"Агент не ответил за {int(self._settings.cursor_agent_timeout_seconds)} с. "
+                    "Проверьте логи: data/dev_agent_logs/"
+                ) from exc
             except CursorAgentError as exc:
+                log_dev_agent_event(
+                    "request_failed",
+                    chat_id=chat_id,
+                    settings=self._settings,
+                    request=message.strip(),
+                    error=exc.message,
+                    retryable=exc.is_retryable,
+                    duration_sec=round(time.monotonic() - started, 1),
+                )
                 logger.error("Dev agent startup failed", error=exc.message, retryable=exc.is_retryable)
                 raise
             except Exception as exc:
+                log_dev_agent_event(
+                    "request_failed",
+                    chat_id=chat_id,
+                    settings=self._settings,
+                    request=message.strip(),
+                    error=str(exc),
+                    duration_sec=round(time.monotonic() - started, 1),
+                )
                 logger.error("Dev agent run failed", error=str(exc))
                 raise
 
@@ -293,6 +376,10 @@ class DevAgentService:
         if ollama_status:
             lines.append(f"Ollama: {ollama_status}")
 
+        openai_status = await self._check_openai_usage()
+        if openai_status:
+            lines.append(f"OpenAI: {openai_status}")
+
         workspace = resolve_agent_workspace(self._settings)
         lines.append(f"\nWorkspace: <code>{workspace}</code>")
         lines.append(f"Модель агента: <code>{self._settings.cursor_model}</code>")
@@ -339,6 +426,30 @@ class DevAgentService:
                 parts.append(f"сессия {snapshot.session.percent:.0f}%")
             if snapshot.weekly:
                 parts.append(f"неделя {snapshot.weekly.percent:.0f}%")
+            return ", ".join(parts) if parts else "ok"
+        except Exception as exc:
+            return f"ошибка проверки ({exc})"
+
+    async def _check_openai_usage(self) -> str | None:
+        if not (
+            self._settings.openai_session_token
+            or self._settings.openai_admin_api_key
+            or self._settings.openai_budget_usd > 0
+        ):
+            return None
+        try:
+            from app.llm.openai_usage import get_openai_usage
+
+            snapshot = await get_openai_usage(self._settings)
+            if not snapshot.has_data():
+                return "баланс не настроен"
+            remaining = snapshot.remaining_usd()
+            if remaining is not None:
+                parts = [f"остаток ${remaining:.2f}"]
+            else:
+                parts = []
+            if snapshot.month_spend_usd is not None:
+                parts.append(f"месяц ${snapshot.month_spend_usd:.2f}")
             return ", ".join(parts) if parts else "ok"
         except Exception as exc:
             return f"ошибка проверки ({exc})"
