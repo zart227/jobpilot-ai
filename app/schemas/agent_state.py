@@ -38,6 +38,8 @@ class JobPilotState(TypedDict, total=False):
     client_message: str
     chat_intent: str
     chat_reply: str
+    conversation_history: list[dict[str, str]]
+    conversation_context: str
     outcome_status: str
     send_error: str
     send_debug: dict

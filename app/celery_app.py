@@ -33,7 +33,16 @@ celery_app.conf.update(
             "task": "app.tasks.scrape_tasks.check_kwork_inbox",
             "schedule": timedelta(minutes=max(5, settings.kwork_inbox_check_interval_minutes)),
         },
+        "deliver-notification-outbox": {
+            "task": "app.tasks.scrape_tasks.deliver_notification_outbox",
+            "schedule": timedelta(minutes=2),
+        },
+        "reindex-pending-embeddings": {
+            "task": "app.tasks.embedding_tasks.reindex_pending_embeddings",
+            "schedule": timedelta(minutes=30),
+        },
     },
 )
 
-import app.tasks.scrape_tasks  # noqa: E402, F401
+import app.tasks.embedding_tasks
+import app.tasks.scrape_tasks  # noqa: F401

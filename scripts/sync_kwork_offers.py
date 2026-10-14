@@ -11,8 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
-import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import or_, select
@@ -68,7 +67,7 @@ async def refresh_session(page, output: Path) -> bool:
 
 async def sync_project_ids(project_ids: set[str]) -> list[dict[str, str]]:
     synced: list[dict[str, str]] = []
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     async with AsyncSessionLocal() as session:
         for project_id in sorted(project_ids, key=int):

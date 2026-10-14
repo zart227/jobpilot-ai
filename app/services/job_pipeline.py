@@ -1,11 +1,18 @@
 import uuid
-from datetime import datetime
 
 import structlog
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.db.models import Client, Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
+from app.db.workflow_states import (
+    JOB_STATUS_FILTERED,
+    JOB_STATUS_PERMANENT_ERROR,
+    JOB_STATUS_RETRYABLE_ERROR,
+    JOB_STATUS_SCORED,
+    job_allows_pipeline_persist,
+)
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.job import NormalizedJob
 
@@ -26,6 +33,13 @@ class JobPipelineService:
             row = existing.scalar_one_or_none()
             if row:
                 updated = False
+                if normalized.client and row.client_id:
+                    existing_client = await session.get(Client, row.client_id)
+                    if existing_client:
+                        existing_client.rating = normalized.client.rating
+                        existing_client.reviews_count = normalized.client.reviews_count
+                        existing_client.metadata_ = normalized.client.metadata
+                        updated = True
                 if normalized.description and len(normalized.description) > len(row.description or ""):
                     row.description = normalized.description
                     updated = True
@@ -46,17 +60,20 @@ class JobPipelineService:
 
             client_id = None
             if normalized.client:
-                client_result = await session.execute(
-                    select(Client).where(
-                        Client.platform == normalized.platform,
-                        Client.external_id == normalized.client.external_id,
+                external_id = normalized.client.external_id
+                client = None
+                if external_id:
+                    client_result = await session.execute(
+                        select(Client).where(
+                            Client.platform == normalized.platform,
+                            Client.external_id == external_id,
+                        )
                     )
-                )
-                client = client_result.scalar_one_or_none()
+                    client = client_result.scalar_one_or_none()
                 if not client:
                     client = Client(
                         platform=normalized.platform,
-                        external_id=normalized.client.external_id,
+                        external_id=external_id,
                         name=normalized.client.name,
                         rating=normalized.client.rating,
                         reviews_count=normalized.client.reviews_count,
@@ -64,6 +81,10 @@ class JobPipelineService:
                     )
                     session.add(client)
                     await session.flush()
+                else:
+                    client.rating = normalized.client.rating
+                    client.reviews_count = normalized.client.reviews_count
+                    client.metadata_ = normalized.client.metadata
                 client_id = client.id
 
             job = Job(
@@ -85,13 +106,30 @@ class JobPipelineService:
             await session.commit()
             await session.refresh(job)
 
-            memory = get_memory_store()
-            job_text = f"{job.title} {job.description}"
-            await memory.store_job_embedding(
-                str(job.id),
-                job_text,
-                {"platform": job.platform, "title": job.title},
-            )
+            try:
+                memory = get_memory_store()
+                job_text = f"{job.title} {job.description}"
+                await memory.store_job_embedding(
+                    str(job.id),
+                    job_text,
+                    {"platform": job.platform, "title": job.title},
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Job embedding deferred",
+                    job_id=str(job.id),
+                    error=str(exc),
+                )
+                raw = dict(job.raw_data or {})
+                raw["embedding_pending"] = True
+                job.raw_data = raw
+                await session.commit()
+            else:
+                raw = dict(job.raw_data or {})
+                if raw.get("embedding_pending"):
+                    raw["embedding_pending"] = False
+                    job.raw_data = raw
+                    await session.commit()
 
             return job.id
 
@@ -119,11 +157,63 @@ class JobPipelineService:
                 logger.info("JobPilot AI skip pipeline: job already sent", job_id=str(job_id))
                 return None
 
+            if not job_allows_pipeline_persist(job.status):
+                logger.info(
+                    "JobPilot AI skip pipeline: protected job status",
+                    job_id=str(job_id),
+                    status=job.status,
+                )
+                return None
+
+            if state.get("pipeline_processing_error"):
+                retryable = bool(state.get("processing_retryable", True))
+                job.status = (
+                    JOB_STATUS_RETRYABLE_ERROR if retryable else JOB_STATUS_PERMANENT_ERROR
+                )
+                job.processing_error_type = "retryable" if retryable else "permanent"
+                job.processing_stage = state.get("processing_stage")
+                job.relevance_reason = (
+                    state.get("relevance_reason")
+                    or state.get("error")
+                    or "processing error"
+                )
+                job.processing_claim_owner = None
+                job.processing_claim_token = None
+                job.processing_claimed_at = None
+                await session.commit()
+                return None
+
             job.is_relevant = state.get("is_relevant")
             job.relevance_reason = state.get("relevance_reason")
             job.score = state.get("score")
             job.score_breakdown = state.get("score_breakdown", {})
-            job.status = "scored" if state.get("score") else "filtered"
+            threshold = get_settings().min_score_threshold
+            if state.get("is_relevant") is False:
+                from app.services.job_freshness import append_decision_audit
+
+                append_decision_audit(
+                    job,
+                    action="filtered",
+                    reason=str(state.get("relevance_reason") or "not relevant"),
+                    source=str(state.get("filter_source") or "pipeline"),
+                )
+                job.status = JOB_STATUS_FILTERED
+            elif state.get("score") is not None and state.get("score") >= threshold:
+                job.status = JOB_STATUS_SCORED
+            elif state.get("score") is not None:
+                job.status = JOB_STATUS_FILTERED
+            else:
+                job.status = JOB_STATUS_FILTERED
+
+            job.processing_claim_owner = None
+            job.processing_claim_token = None
+            job.processing_claimed_at = None
+            job.processing_stage = None
+            job.processing_error_type = None
+
+            from app.services.pipeline_llm_ledger import persist_stage_log
+
+            persist_stage_log(job, state)
 
             proposal_id = None
             content = state.get("proposal_content")
@@ -259,6 +349,17 @@ class JobPipelineService:
             session.add(pending)
             await session.commit()
 
+    async def job_to_chat_state(self, job_id: uuid.UUID, *, client_message: str = "", **kwargs) -> dict:
+        from app.services.conversation_context_service import build_chat_agent_state
+
+        async with AsyncSessionLocal() as session:
+            return await build_chat_agent_state(
+                session,
+                job_id,
+                client_message=client_message,
+                **kwargs,
+            )
+
     async def job_to_state(self, job_id: uuid.UUID) -> dict:
         async with AsyncSessionLocal() as session:
             job = await session.get(Job, job_id)
@@ -268,12 +369,14 @@ class JobPipelineService:
             client_name = None
             client_rating = None
             client_reviews = 0
+            client_metadata = {}
             if job.client_id:
                 client = await session.get(Client, job.client_id)
                 if client:
                     client_name = client.name
                     client_rating = float(client.rating) if client.rating else None
                     client_reviews = client.reviews_count
+                    client_metadata = client.metadata_ or {}
 
             return {
                 "job_id": str(job.id),
@@ -292,5 +395,6 @@ class JobPipelineService:
                     "client_name": client_name,
                     "client_rating": client_rating,
                     "client_reviews": client_reviews,
+                    "client_completed_paid_orders": client_metadata.get("completed_paid_orders"),
                 },
             }

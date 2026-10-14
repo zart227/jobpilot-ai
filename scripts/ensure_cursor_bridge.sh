@@ -49,32 +49,32 @@ if port_listening && [[ -f "${ROOT}/data/cursor_bridge.env" ]]; then
 fi
 
 "${ROOT}/scripts/stop_cursor_bridge.sh" >/dev/null 2>&1 || true
-systemctl --user stop jobpilot-cursor-bridge.service >/dev/null 2>&1 || true
 mkdir -p "${ROOT}/data"
 
-if systemctl --user is-active jobpilot-cursor-bridge.service >/dev/null 2>&1; then
-  echo "Cursor bridge systemd service is active"
-  exit 0
+if systemctl --user show-environment >/dev/null 2>&1; then
+  echo "Starting persistent Cursor bridge service..."
+  "${ROOT}/scripts/install_cursor_bridge_service.sh"
+  BRIDGE_PID="$(systemctl --user show jobpilot-cursor-bridge.service --property=MainPID --value)"
+else
+  echo "Starting Cursor bridge on 127.0.0.1:${INTERNAL_PORT}..."
+  nohup "$PYTHON" "${ROOT}/scripts/run_cursor_bridge.py" \
+    --workspace "$CURSOR_WORKSPACE_HOST" \
+    --host 127.0.0.1 \
+    --port "$INTERNAL_PORT" \
+    --public-port "$PUBLIC_PORT" \
+    --force \
+    --daemon \
+    >>"$LOG_FILE" 2>&1 &
+  BRIDGE_PID=$!
 fi
-
-echo "Starting Cursor bridge on 127.0.0.1:${INTERNAL_PORT}..."
-nohup "$PYTHON" "${ROOT}/scripts/run_cursor_bridge.py" \
-  --workspace "$CURSOR_WORKSPACE_HOST" \
-  --host 127.0.0.1 \
-  --port "$INTERNAL_PORT" \
-  --public-port "$PUBLIC_PORT" \
-  --force \
-  --daemon \
-  >>"$LOG_FILE" 2>&1 &
-BRIDGE_PID=$!
 
 for _ in $(seq 1 45); do
   if port_listening && [[ -f "${ROOT}/data/cursor_bridge.env" ]]; then
     echo "$BRIDGE_PID" >"$PID_FILE"
     echo "Cursor bridge ready (pid $BRIDGE_PID, docker :${PUBLIC_PORT} → :${INTERNAL_PORT})"
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^jobpilot-telegram$'; then
-      echo "Restarting telegram-bot to pick up bridge credentials..."
-      docker compose restart telegram-bot >/dev/null
+      echo "Recreating telegram-bot to pick up bridge credentials..."
+      docker compose up -d --no-deps --force-recreate telegram-bot >/dev/null
     fi
     exit 0
   fi

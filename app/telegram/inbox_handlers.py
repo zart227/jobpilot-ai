@@ -10,14 +10,20 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
 
 from app.agents.edit_reply_agent import EditReplyAgent
 from app.db.models import Job, Proposal, TelegramInboxPending
 from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
-from app.services.kwork_inbox import send_kwork_inbox_reply
+from app.services.kwork_conversation import resolve_conversation_context
+from app.services.kwork_inbox import (
+    _fetch_kwork_thread,
+    _get_kwork_actor,
+    send_kwork_inbox_reply,
+)
+from app.telegram.access import pending_matches_callback
 from app.telegram.keyboards import inbox_edit_preview_keyboard
+from app.utils.delivery_alerts import format_inbox_send_failure
 from app.utils.formatting import extract_site_order_id, sanitize_proposal_text
 
 logger = structlog.get_logger(__name__)
@@ -95,12 +101,23 @@ def register_inbox_handlers(router: Router) -> None:
                 await session.get(Proposal, pending.proposal_id) if pending.proposal_id else None
             )
             order_id = ""
+            conversation_context = ""
             if job:
                 order_id = extract_site_order_id(
                     external_id=job.external_id,
                     url=job.url,
                     platform=job.platform,
                 ) or ""
+                my_username, my_user_id = await _get_kwork_actor()
+                thread = await _fetch_kwork_thread(pending.kwork_username)
+                conversation_context = await resolve_conversation_context(
+                    session,
+                    job,
+                    client_message=pending.client_message,
+                    thread_messages=thread or None,
+                    my_username=my_username,
+                    my_user_id=my_user_id,
+                )
 
         await state.set_state(EditInboxReplyState.waiting_for_instruction)
         await state.update_data(
@@ -112,6 +129,7 @@ def register_inbox_handlers(router: Router) -> None:
             job_description=job.description if job else "",
             proposal_content=proposal.content if proposal else "",
             order_id=order_id,
+            conversation_context=conversation_context,
             edit_steps=[],
         )
         await callback.message.answer(
@@ -139,6 +157,7 @@ def register_inbox_handlers(router: Router) -> None:
         job_description = data.get("job_description") or ""
         proposal_content = data.get("proposal_content") or ""
         order_id = data.get("order_id") or None
+        conversation_context = data.get("conversation_context") or ""
 
         await message.answer("⏳ Применяю правки через LLM...")
         try:
@@ -150,6 +169,7 @@ def register_inbox_handlers(router: Router) -> None:
                 job_title=job_title,
                 job_description=job_description,
                 proposal_content=proposal_content,
+                conversation_context=conversation_context,
             )
         except LLMServiceError as exc:
             await message.answer(format_llm_error_message(exc, order_id), parse_mode=ParseMode.HTML)
@@ -235,6 +255,9 @@ async def _send_inbox_reply(
         if not pending:
             await callback.answer("Request expired", show_alert=True)
             return
+        if not pending_matches_callback(pending, callback):
+            await callback.answer("Карточка устарела", show_alert=True)
+            return
         if pending.status not in ("pending", "edited"):
             await callback.answer("Already processed", show_alert=True)
             return
@@ -274,6 +297,6 @@ async def _send_inbox_reply(
         )
     else:
         await callback.message.answer(
-            f"❌ Не удалось отправить ответ клиенту {username}.\n{error or 'Unknown error'}",
+            format_inbox_send_failure(username, error),
             parse_mode=ParseMode.HTML,
         )

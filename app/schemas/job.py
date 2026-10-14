@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -55,8 +55,17 @@ class ProposalResponse(BaseModel):
 
 
 class OutcomeRequest(BaseModel):
-    status: str = Field(description="sent | ignored | replied | hired")
+    status: Literal["sent", "ignored", "replied", "hired"]
     notes: str | None = None
+    event_key: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Idempotency key; default job:proposal:status",
+    )
+    proposal_id: UUID | None = Field(
+        default=None,
+        description="Proposal tied to this outcome; defaults to latest for the job",
+    )
 
 
 class ChatRequest(BaseModel):

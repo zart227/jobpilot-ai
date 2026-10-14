@@ -13,12 +13,12 @@ services:
         container_name: jobpilot-postgres
         environment:
             POSTGRES_USER: jobpilot
-            POSTGRES_PASSWORD: jobpilot_secret
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jobpilot_secret}
             POSTGRES_DB: jobpilot_ai
         volumes:
             - postgres_data:/var/lib/postgresql/data
         ports:
-            - "5434:5432"
+            - "127.0.0.1:5434:5432"
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U jobpilot -d jobpilot_ai"]
             interval: 5s
@@ -29,7 +29,7 @@ services:
         image: redis:7-alpine
         container_name: jobpilot-redis
         ports:
-            - "6379:6379"
+            - "127.0.0.1:6379:6379"
         healthcheck:
             test: ["CMD", "redis-cli", "ping"]
             interval: 5s
@@ -40,8 +40,8 @@ services:
         image: qdrant/qdrant:v1.13.6
         container_name: jobpilot-qdrant
         ports:
-            - "6333:6333"
-            - "6334:6334"
+            - "127.0.0.1:6333:6333"
+            - "127.0.0.1:6334:6334"
         volumes:
             - qdrant_data:/qdrant/storage
         healthcheck:
@@ -73,6 +73,8 @@ services:
                 condition: service_healthy
         volumes:
             - ./app:/app/app
+            - ./alembic.ini:/app/alembic.ini:ro
+            - ./alembic:/app/alembic:ro
             - ./scripts:/app/scripts
             - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
             - ./data:/app/data
@@ -95,6 +97,8 @@ services:
                 condition: service_healthy
         volumes:
             - ./app:/app/app
+            - ./alembic.ini:/app/alembic.ini:ro
+            - ./alembic:/app/alembic:ro
             - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
             - ./data:/app/data
 
@@ -112,6 +116,8 @@ services:
                 condition: service_healthy
         volumes:
             - ./app:/app/app
+            - ./alembic.ini:/app/alembic.ini:ro
+            - ./alembic:/app/alembic:ro
             - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
             - ./data:/app/data
 
@@ -143,6 +149,8 @@ services:
                 condition: service_started
         volumes:
             - ./app:/app/app
+            - ./alembic.ini:/app/alembic.ini:ro
+            - ./alembic:/app/alembic:ro
             - ./scripts:/app/scripts
             - ./data:/app/data
             - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro

@@ -2,7 +2,7 @@ import structlog
 
 from app.config import get_settings
 from app.llm.errors import classify_llm_error
-from app.llm.provider import get_simple_llm_provider
+from app.llm.provider import get_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
@@ -38,7 +38,7 @@ Kwork offer rules:
 class EditProposalAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._llm = get_simple_llm_provider()
+        self._llm = get_llm_provider()
         self._memory = get_memory_store()
 
     async def run(

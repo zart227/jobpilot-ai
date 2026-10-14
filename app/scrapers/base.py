@@ -7,7 +7,7 @@ from typing import Any
 import structlog
 from playwright.async_api import Browser, Page, async_playwright
 
-from app.schemas.job import ClientInfo, NormalizedJob
+from app.schemas.job import NormalizedJob
 
 logger = structlog.get_logger(__name__)
 

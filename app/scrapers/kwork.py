@@ -28,8 +28,16 @@ class KworkScraper(BaseScraper):
         self._password = settings.kwork_password
         self._category_url = settings.kwork_category_url
         self._max_pages = settings.kwork_max_pages
+        self._buyer_cache: dict[str, dict] = {}
 
     async def scrape(self) -> list[NormalizedJob]:
+        from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
+
+        if is_kwork_paused():
+            reason = get_kwork_pause_reason() or "Kwork приостановлен"
+            logger.info("Kwork scraper skipped: connects limit pause", reason=reason)
+            return []
+
         jobs: list[NormalizedJob] = []
         seen_ids: set[str] = set()
         playwright, browser, page = await self._launch_browser()
@@ -91,7 +99,7 @@ class KworkScraper(BaseScraper):
         return f"{base}{sep}page={page_num}"
 
     async def _login(self, page: Any) -> None:
-        from app.services.kwork_browser import dismiss_overlays, login
+        from app.services.kwork_browser import login
 
         logged_in = await login(page, self._email, self._password)
         if not logged_in:
@@ -122,6 +130,11 @@ class KworkScraper(BaseScraper):
             client_el = card.locator('a[href*="/user/"]').first
             client_name = (await client_el.text_content() or "").strip() or None
 
+            client_href = await client_el.get_attribute("href")
+            history = {}
+            if client_href and client_href.startswith("/user/"):
+                history = await self._read_buyer_history(page, client_href)
+
             deadline_text = (await card.locator(".want-card__informers, .color-gray").first.text_content() or "")
             deadline = self._parse_kwork_deadline(deadline_text)
 
@@ -138,12 +151,32 @@ class KworkScraper(BaseScraper):
                 skills=skills,
                 deadline=deadline,
                 url=url,
-                client=ClientInfo(name=client_name, external_id=client_name),
+                client=ClientInfo(name=client_name, external_id=client_href or client_name, rating=history.get("rating"), metadata=history),
                 raw_data={"source": "kwork.ru"},
             )
         except Exception as exc:
             logger.warning("Kwork card extraction failed", error=str(exc))
             return None
+
+    async def _read_buyer_history(self, page: Any, href: str) -> dict:
+        from app.services.opportunity_policy import parse_buyer_history
+
+        if href in self._buyer_cache:
+            return self._buyer_cache[href]
+        detail = await page.context.new_page()
+        result = {}
+        try:
+            url = f"https://kwork.ru{href}"
+            await detail.goto(url, wait_until="domcontentloaded", timeout=45000)
+            result = parse_buyer_history(await detail.locator("body").inner_text())
+            result["profile_url"] = url
+            result["checked_at"] = datetime.now().isoformat()
+        except Exception as exc:
+            logger.warning("Buyer history unavailable", error=str(exc))
+        finally:
+            await detail.close()
+        self._buyer_cache[href] = result
+        return result
 
     def _project_external_id(self, url: str | None, title: str) -> str:
         if url:

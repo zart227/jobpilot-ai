@@ -11,10 +11,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 from cursor_sdk import CursorAgentError
 
-from app.config import get_settings
+from app.llm.errors import format_llm_error_message
 from app.services.dev_agent_audit import read_recent_dev_agent_logs
 from app.services.dev_agent_service import DevAgentConfigurationError, docker_bridge_hint
-from app.llm.errors import format_llm_error_message
+from app.telegram.access import is_admin_chat_message as is_admin_chat
 
 if TYPE_CHECKING:
     from app.services.dev_agent_service import DevAgentService
@@ -37,16 +37,6 @@ def split_telegram_messages(text: str, limit: int = TELEGRAM_MAX_MESSAGE) -> lis
         chunks.append(text[offset : offset + limit])
         offset += limit
     return chunks
-
-
-def is_admin_chat(message: Message) -> bool:
-    settings = get_settings()
-    if not settings.telegram_admin_chat_id:
-        return False
-    try:
-        return message.chat.id == int(settings.telegram_admin_chat_id)
-    except ValueError:
-        return False
 
 
 def register_dev_agent_handlers(router: Router, dev_agent: DevAgentService | None) -> None:

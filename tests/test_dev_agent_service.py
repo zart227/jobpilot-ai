@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,6 +51,7 @@ def test_write_bridge_env_file(tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "CURSOR_BRIDGE_BASE_URL=http://host.docker.internal:9247" in content
     assert f"CURSOR_WORKSPACE_HOST={tmp_path}" in content
+    assert oct(path.stat().st_mode & 0o777) == oct(0o600)
 
 
 def test_split_telegram_messages():

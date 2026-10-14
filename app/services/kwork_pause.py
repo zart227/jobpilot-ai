@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -17,9 +17,10 @@ logger = structlog.get_logger(__name__)
 KWORK_PLATFORM = "kwork"
 
 CONNECTS_REPLENISH_RE = re.compile(
-    r"коннекты будут пополнены\s+(\d{1,2}\s+[а-яё]+)",
-    re.IGNORECASE,
+    r"(?:коннекты будут пополнены|дата пополнения)\s+(\d{1,2}\s+[а-яё]+)",
+    re.IGNORECASE | re.MULTILINE,
 )
+CONNECTS_REMAINING_RE = re.compile(r"осталось\s+(\d+)\s+из\s+\d+", re.IGNORECASE)
 
 RU_MONTHS: dict[str, int] = {
     "января": 1,
@@ -127,6 +128,13 @@ def extract_connects_replenish_text(body: str) -> str | None:
     return match.group(1).strip()
 
 
+def extract_connects_remaining(body: str) -> int | None:
+    match = CONNECTS_REMAINING_RE.search(body)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def parse_replenish_date_ru(text: str, *, today: date | None = None) -> date | None:
     cleaned = text.strip().lower()
     match = re.match(r"(\d{1,2})\s+([а-яё]+)", cleaned)
@@ -170,23 +178,69 @@ def resolve_pause_until(settings: Settings | None = None) -> date | None:
     return _manual_pause_until(settings)
 
 
+def is_kwork_connects_pause_active(settings: Settings | None = None) -> bool:
+    settings = settings or get_settings()
+    if not settings.kwork_pause_enabled or not settings.kwork_pause_auto:
+        return False
+    state = load_pause_state(settings)
+    return bool(state and state.paused)
+
+
+def is_kwork_manual_pause_active(settings: Settings | None = None) -> bool:
+    settings = settings or get_settings()
+    if not settings.kwork_pause_enabled:
+        return False
+    if not settings.kwork_pause_auto:
+        manual_until = _manual_pause_until(settings)
+        if manual_until and _local_today(settings) < manual_until:
+            return True
+    state = load_pause_state(settings)
+    if state and state.paused and not settings.kwork_pause_auto:
+        return is_kwork_paused(settings)
+    return False
+
+
+def is_kwork_offers_paused(settings: Settings | None = None) -> bool:
+    """Pause Kwork scrape, pipeline and proposal delivery (connects or manual)."""
+    return is_kwork_paused(settings)
+
+
+def is_kwork_inbox_paused(settings: Settings | None = None) -> bool:
+    """Inbox polling: manual pause always; connects pause only if configured."""
+    settings = settings or get_settings()
+    if not settings.kwork_pause_enabled:
+        return False
+    if is_kwork_manual_pause_active(settings):
+        return True
+    if is_kwork_connects_pause_active(settings):
+        return settings.kwork_pause_block_inbox_on_connects
+    return False
+
+
 def is_kwork_paused(settings: Settings | None = None) -> bool:
     settings = settings or get_settings()
     if not settings.kwork_pause_enabled:
         return False
 
-    until = resolve_pause_until(settings)
-    if until is None:
-        state = load_pause_state(settings)
-        return bool(state and state.paused)
-
-    today = _local_today(settings)
-    if today >= until:
-        if load_pause_state(settings):
-            clear_pause_state(settings)
-            logger.info("JobPilot AI Kwork pause auto-resumed", resume_on=until.isoformat())
+    state = load_pause_state(settings)
+    if state and state.paused:
+        until = state.paused_until
+        if until is None:
+            return True
+        today = _local_today(settings)
+        if today < until:
+            return True
+        if settings.kwork_pause_auto:
+            # Replenish date passed but probe has not confirmed availability — keep pause.
+            return True
+        clear_pause_state(settings)
+        logger.info("JobPilot AI Kwork pause auto-resumed", resume_on=until.isoformat())
         return False
-    return True
+
+    manual_until = _manual_pause_until(settings)
+    if manual_until is None:
+        return False
+    return _local_today(settings) < manual_until
 
 
 def kwork_resume_on(settings: Settings | None = None) -> date | None:
@@ -201,7 +255,7 @@ def format_kwork_pause_reason(settings: Settings | None = None) -> str:
     until_text = until.strftime("%d.%m.%Y") if until else "?"
     return (
         f"Kwork приостановлен до {until_text} — лимит коннектов исчерпан. "
-        "Скрейпинг, генерация откликов и отправка отключены."
+        "Поиск новых заданий, генерация откликов и отправка отключены."
     )
 
 
@@ -227,7 +281,7 @@ def should_refresh_pause_state(settings: Settings | None = None) -> bool:
     if state is None or state.checked_at is None:
         return True
 
-    age_hours = (datetime.now(timezone.utc) - state.checked_at).total_seconds() / 3600
+    age_hours = (datetime.now(UTC) - state.checked_at).total_seconds() / 3600
     return age_hours >= max(1, settings.kwork_pause_check_interval_hours)
 
 
@@ -237,10 +291,11 @@ def apply_connects_probe_result(
     page_text: str = "",
     source: str = "browser",
     confident: bool = True,
+    connects_available_confirmed: bool = False,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     if not limit_exhausted:
         if not confident:
@@ -280,6 +335,21 @@ def apply_connects_probe_result(
             }
 
         previous = load_pause_state(settings)
+        if previous and previous.paused and not connects_available_confirmed:
+            previous.checked_at = now
+            previous.source = source
+            save_pause_state(previous, settings)
+            logger.info(
+                "JobPilot AI Kwork pause kept: probe inconclusive for resume",
+                source=source,
+            )
+            return {
+                "paused": True,
+                "unchanged": True,
+                "reason": "paused_without_connects_confirmation",
+                "source": source,
+            }
+
         clear_pause_state(settings)
         if previous and previous.paused:
             logger.info("JobPilot AI Kwork pause cleared: connects available", source=source)

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lockfile-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify lockfile install
+        run: sh scripts/verify_lockfile.sh
+
+      - name: Ruff
+        run: ruff check app tests scripts
+
+      - name: Pytest (unit)
+        run: pytest -q
+
+      - name: Audit remediation matrix
+        run: python scripts/audit_remediation_status.py
+
+      - name: Remediation verify (gates)
+        run: ./scripts/remediation_verify.sh
+
+      - name: Live signoff absent in CI (expected)
+        run: |
+          if python scripts/validate_live_signoff.py; then
+            echo "live_kwork_signoff.json must not be committed to CI"
+            exit 1
+          fi
+
+      - name: pip check
+        run: pip check
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jobpilot
+          POSTGRES_PASSWORD: jobpilot_ci
+          POSTGRES_DB: jobpilot_ai_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jobpilot -d jobpilot_ai_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://jobpilot:jobpilot_ci@localhost:5432/jobpilot_ai_test
+      REDIS_URL: redis://localhost:6379/2
+      CELERY_BROKER_URL: redis://localhost:6379/2
+      CELERY_RESULT_BACKEND: redis://localhost:6379/3
+      QDRANT_URL: http://localhost:6333
+      JOBPILOT_INTEGRATION_TESTS: "1"
+      API_AUTH_REQUIRED: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: sh scripts/verify_lockfile.sh
+
+      - name: Alembic upgrade head
+        run: alembic upgrade head
+
+      - name: Integration pytest
+        run: pytest -q tests/test_integration_db.py tests/test_migration_preflight_integration.py tests/test_acceptance_dry_run.py tests/test_acceptance_inbox_flow.py tests/test_send_attempt_inbox_concurrency.py tests/test_send_attempt_reconcile.py tests/test_notification_outbox_delivery.py tests/test_job_processing_integration.py
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -t jobpilot-ai:ci .

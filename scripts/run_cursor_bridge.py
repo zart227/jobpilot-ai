@@ -57,7 +57,7 @@ def _bridge_healthy(port: int) -> bool:
 def _print_existing_config(port: int) -> None:
     if BRIDGE_ENV_FILE.is_file():
         print("Cursor bridge already running:")
-        print(BRIDGE_ENV_FILE.read_text(encoding="utf-8"))
+        print(f"Configuration: {BRIDGE_ENV_FILE}")
     pid = _read_pid()
     if pid:
         print(f"Bridge process pid {pid}, port {port}")
@@ -119,7 +119,7 @@ async def main() -> None:
     endpoint = client._owned_bridge.endpoint if client._owned_bridge else None
     if endpoint is None:
         print("Bridge started but endpoint is unknown", file=sys.stderr)
-        await client.close()
+        await client.aclose()
         raise SystemExit(1)
 
     docker_url = f"http://host.docker.internal:{args.public_port}"
@@ -146,7 +146,7 @@ async def main() -> None:
         await stop.wait()
     finally:
         PID_FILE.unlink(missing_ok=True)
-        await client.close()
+        await client.aclose()
         print("Bridge stopped.")
 
 

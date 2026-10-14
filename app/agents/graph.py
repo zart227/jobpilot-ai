@@ -17,7 +17,7 @@ def _min_score_threshold() -> int:
 
 
 def route_after_filter(state: JobPilotState) -> str:
-    if state.get("error"):
+    if state.get("pipeline_processing_error") or state.get("error"):
         return "end"
     if state.get("is_relevant"):
         return "score"
@@ -25,8 +25,10 @@ def route_after_filter(state: JobPilotState) -> str:
 
 
 def route_after_score(state: JobPilotState) -> str:
+    if state.get("pipeline_processing_error"):
+        return "end"
     score = state.get("score", 0)
-    if score >= _min_score_threshold():
+    if score is not None and score >= _min_score_threshold():
         return "propose"
     return "end"
 

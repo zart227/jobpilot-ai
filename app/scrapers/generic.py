@@ -1,5 +1,7 @@
+import hashlib
 import json
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import structlog
 
@@ -32,7 +34,10 @@ class GenericMarketplaceScraper(BaseScraper):
     def __init__(self, url: str | None = None, selectors: dict[str, str] | None = None) -> None:
         settings = get_settings()
         self._url = url or settings.generic_scraper_url
-        raw = selectors or json.loads(settings.generic_scraper_selectors or "{}")
+        if selectors is not None:
+            raw = selectors
+        else:
+            raw = json.loads(settings.generic_scraper_selectors or "{}")
         self._selectors = {**DEFAULT_SELECTORS, **raw}
 
     async def scrape(self) -> list[NormalizedJob]:
@@ -67,9 +72,11 @@ class GenericMarketplaceScraper(BaseScraper):
             desc_el = card.locator(self._selectors["description"]).first
             description = (await desc_el.text_content() or title).strip()
 
-            budget_el = card.locator(self._selectors["budget"]).first
-            budget_text = (await budget_el.text_content() or "").strip()
-            budget_min, budget_max, currency = self._parse_budget(budget_text)
+            budget_min, budget_max, currency = None, None, "USD"
+            budget_els = card.locator(self._selectors["budget"])
+            if await budget_els.count() > 0:
+                budget_text = (await budget_els.first.text_content() or "").strip()
+                budget_min, budget_max, currency = self._parse_budget(budget_text)
 
             skills: list[str] = []
             skill_els = card.locator(self._selectors["skills"])
@@ -78,18 +85,22 @@ class GenericMarketplaceScraper(BaseScraper):
                 if skill:
                     skills.append(skill)
 
-            deadline_el = card.locator(self._selectors["deadline"]).first
-            deadline_text = (await deadline_el.text_content() or "").strip()
-            deadline = self._parse_deadline(deadline_text)
+            deadline = None
+            deadline_els = card.locator(self._selectors["deadline"])
+            if await deadline_els.count() > 0:
+                deadline_text = (await deadline_els.first.text_content() or "").strip()
+                deadline = self._parse_deadline(deadline_text)
 
-            client_el = card.locator(self._selectors["client"]).first
-            client_name = (await client_el.text_content() or "").strip() or None
+            client_name = None
+            client_els = card.locator(self._selectors["client"])
+            if await client_els.count() > 0:
+                client_name = (await client_els.first.text_content() or "").strip() or None
 
-            link_el = card.locator(self._selectors["link"]).first
-            href = await link_el.get_attribute("href") if await link_el.count() else None
-            url = href if href and href.startswith("http") else self._url
+            link_els = card.locator(self._selectors["link"])
+            href = await link_els.first.get_attribute("href") if await link_els.count() else None
+            url = urljoin(self._url, href) if href else self._url
 
-            external_id = self._make_external_id(title, url or str(index))
+            external_id = self._external_id_from_url(url) or self._make_external_id(title, url or str(index))
 
             return NormalizedJob(
                 platform=self.platform,
@@ -108,3 +119,14 @@ class GenericMarketplaceScraper(BaseScraper):
         except Exception as exc:
             logger.warning("Failed to extract job card", index=index, error=str(exc))
             return None
+
+    def _external_id_from_url(self, url: str | None) -> str | None:
+        if not url:
+            return None
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip('/')}"
+        if parsed.query:
+            normalized = f"{normalized}?{parsed.query}"
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]

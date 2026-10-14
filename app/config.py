@@ -1,7 +1,8 @@
+import json
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,8 +16,39 @@ class Settings(BaseSettings):
     app_name: str = Field(default="JobPilot AI", alias="APP_NAME")
     app_env: str = Field(default="development", alias="APP_ENV")
     debug: bool = Field(default=False, alias="DEBUG")
+    platform_dry_run: bool = Field(
+        default=False,
+        alias="PLATFORM_DRY_RUN",
+        description="Skip real Kwork/Telegram platform API calls; still records send_attempts and DB state",
+    )
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
+    api_auth_token: str = Field(
+        default="",
+        alias="API_AUTH_TOKEN",
+        description="Bearer or X-API-Key token for HTTP API (required when API_AUTH_REQUIRED=true)",
+    )
+    api_auth_required: bool = Field(default=False, alias="API_AUTH_REQUIRED")
+    api_list_limit_max: int = Field(default=200, ge=1, le=1000, alias="API_LIST_LIMIT_MAX")
+    api_rate_limit_enabled: bool = Field(default=True, alias="API_RATE_LIMIT_ENABLED")
+    api_rate_limit_requests: int = Field(
+        default=120,
+        ge=1,
+        le=10_000,
+        alias="API_RATE_LIMIT_REQUESTS",
+        description="Max authenticated/anonymous API requests per client per window",
+    )
+    api_rate_limit_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        alias="API_RATE_LIMIT_WINDOW_SECONDS",
+    )
+    api_rate_limit_fail_open: bool = Field(
+        default=True,
+        alias="API_RATE_LIMIT_FAIL_OPEN",
+        description="If Redis is down, allow traffic (false = 503)",
+    )
 
     database_url: str = Field(
         default="postgresql+asyncpg://jobpilot:jobpilot_secret@localhost:5432/jobpilot_ai",
@@ -33,13 +65,13 @@ class Settings(BaseSettings):
         default="jobpilot_ai", alias="QDRANT_COLLECTION_PREFIX"
     )
 
-    llm_provider: Literal["openai", "anthropic", "cursor"] = Field(
+    llm_provider: Literal["openai", "anthropic", "cursor", "openrouter"] = Field(
         default="openai", alias="LLM_PROVIDER"
     )
-    llm_simple_provider: Literal["ollama", "openai", "anthropic", "cursor", "same"] = Field(
+    llm_simple_provider: Literal["ollama", "openai", "anthropic", "cursor", "openrouter", "same"] = Field(
         default="ollama",
         alias="LLM_SIMPLE_PROVIDER",
-        description="Provider for filter/score/chat/learning; proposal uses LLM_PROVIDER",
+        description="Provider for filter/learning/summaries; scoring uses OLLAMA_SCORING_MODEL; proposals and chats use LLM_PROVIDER",
     )
     ollama_base_url: str = Field(
         default="https://ollama.com",
@@ -50,7 +82,8 @@ class Settings(BaseSettings):
         alias="OLLAMA_API_KEY",
         description="Ollama Cloud API key (ollama.com/settings/keys); optional for local ollama signin",
     )
-    ollama_model: str = Field(default="minimax-m2.5", alias="OLLAMA_MODEL")
+    ollama_model: str = Field(default="nemotron-3-nano:30b", alias="OLLAMA_MODEL")
+    ollama_scoring_model: str = Field(default="gpt-oss:120b", alias="OLLAMA_SCORING_MODEL")
     ollama_timeout_seconds: float = Field(default=120.0, alias="OLLAMA_TIMEOUT_SECONDS")
     ollama_session_cookie: str = Field(
         default="",
@@ -79,6 +112,12 @@ class Settings(BaseSettings):
         alias="OLLAMA_AUTO_FALLBACK",
         description="Fall back to OPENAI_SIMPLE_MODEL for simple LLM when Ollama limits are critical",
     )
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    openrouter_model: str = Field(default="openrouter/free", alias="OPENROUTER_MODEL")
+    openrouter_simple_model: str = Field(default="openrouter/free", alias="OPENROUTER_SIMPLE_MODEL")
+    openrouter_timeout_seconds: float = Field(default=120.0, gt=0, alias="OPENROUTER_TIMEOUT_SECONDS")
+    openrouter_fallback_to_ollama: bool = Field(default=True, alias="OPENROUTER_FALLBACK_TO_OLLAMA")
+    openrouter_proxy_list: str = Field(default="", alias="OPENROUTER_PROXY_LIST")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_simple_model: str = Field(
@@ -189,6 +228,11 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
     telegram_admin_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_CHAT_ID")
+    telegram_admin_user_id: str = Field(
+        default="",
+        alias="TELEGRAM_ADMIN_USER_ID",
+        description="Telegram user id allowed to approve/send (recommended in production)",
+    )
 
     developer_name: str = Field(default="Developer", alias="DEVELOPER_NAME")
     developer_skills: str = Field(
@@ -207,6 +251,11 @@ class Settings(BaseSettings):
         default="n8n", alias="DEVELOPER_EXCLUDED_SKILLS"
     )
 
+    review_first_mode: bool = Field(default=True, alias="REVIEW_FIRST_MODE")
+    review_max_hours: float = Field(default=8.0, gt=0, alias="REVIEW_MAX_HOURS")
+    client_min_rating: float = Field(default=4.8, ge=0, le=5, alias="CLIENT_MIN_RATING")
+    client_min_paid_orders: int = Field(default=1, ge=1, alias="CLIENT_MIN_PAID_ORDERS")
+
     scrape_interval_minutes: int = Field(default=30, alias="SCRAPE_INTERVAL_MINUTES")
     enabled_scrapers: str = Field(default="generic,kwork", alias="ENABLED_SCRAPERS")
     generic_scraper_url: str = Field(
@@ -218,6 +267,11 @@ class Settings(BaseSettings):
     kwork_password: str = Field(default="", alias="KWORK_PASSWORD")
     kwork_category_url: str = Field(
         default="https://kwork.ru/projects?a=1", alias="KWORK_CATEGORY_URL"
+    )
+    kwork_skip_portfolio_jobs: bool = Field(
+        default=True,
+        alias="KWORK_SKIP_PORTFOLIO_JOBS",
+        description="Skip Kwork jobs that require portfolio kworks (sites/SaaS/apps)",
     )
     kwork_max_pages: int = Field(default=5, alias="KWORK_MAX_PAGES")
     kwork_scrape_login: bool = Field(
@@ -267,19 +321,135 @@ class Settings(BaseSettings):
         default=15,
         alias="KWORK_INBOX_CHECK_INTERVAL_MINUTES",
     )
+    job_processing_lease_seconds: int = Field(
+        default=900,
+        ge=60,
+        alias="JOB_PROCESSING_LEASE_SECONDS",
+    )
+    job_processing_backoff_seconds: int = Field(
+        default=120,
+        ge=10,
+        alias="JOB_PROCESSING_BACKOFF_SECONDS",
+    )
+    kwork_pause_block_inbox_on_connects: bool = Field(
+        default=False,
+        alias="KWORK_PAUSE_BLOCK_INBOX_ON_CONNECTS",
+        description="When true, connects-exhausted pause also stops inbox polling",
+    )
+    send_attempt_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        alias="SEND_ATTEMPT_MAX_ATTEMPTS",
+    )
+    send_attempt_lease_seconds: int = Field(
+        default=180,
+        ge=30,
+        alias="SEND_ATTEMPT_LEASE_SECONDS",
+    )
+    send_attempt_base_backoff_seconds: int = Field(
+        default=60,
+        ge=1,
+        alias="SEND_ATTEMPT_BASE_BACKOFF_SECONDS",
+    )
+    notification_outbox_max_attempts: int = Field(
+        default=8,
+        ge=1,
+        alias="NOTIFICATION_OUTBOX_MAX_ATTEMPTS",
+    )
+    notification_outbox_lease_seconds: int = Field(
+        default=120,
+        ge=10,
+        alias="NOTIFICATION_OUTBOX_LEASE_SECONDS",
+    )
+    notification_outbox_base_backoff_seconds: int = Field(
+        default=30,
+        ge=1,
+        alias="NOTIFICATION_OUTBOX_BASE_BACKOFF_SECONDS",
+    )
     kwork_inbox_state_file: str = Field(
         default="data/kwork_inbox_state.json",
         alias="KWORK_INBOX_STATE_FILE",
     )
 
     min_score_threshold: int = Field(default=35, alias="MIN_SCORE_THRESHOLD")
+    job_max_age_hours: int = Field(
+        default=168,
+        ge=1,
+        alias="JOB_MAX_AGE_HOURS",
+        description="Skip proposal generation for jobs older than this many hours",
+    )
+    job_skip_expired_deadlines: bool = Field(
+        default=True,
+        alias="JOB_SKIP_EXPIRED_DEADLINES",
+    )
 
     scoring_weights: str = Field(
         default='{"skill_match":0.30,"budget":0.20,"complexity":0.15,"client_quality":0.20,"competition":0.15}',
         alias="SCORING_WEIGHTS",
     )
+    learning_min_outcomes: int = Field(
+        default=10,
+        ge=1,
+        alias="LEARNING_MIN_OUTCOMES",
+        description="Minimum recorded outcomes before activating learned scoring weights",
+    )
+    embedding_provider: str = Field(
+        default="openai",
+        alias="EMBEDDING_PROVIDER",
+        description="Embedding API for Qdrant (independent from LLM_PROVIDER)",
+    )
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        alias="EMBEDDING_MODEL",
+    )
+    embedding_dimensions: int = Field(
+        default=1536,
+        ge=1,
+        alias="EMBEDDING_DIMENSIONS",
+    )
+
+    @field_validator("generic_scraper_selectors")
+    @classmethod
+    def _validate_generic_scraper_selectors(cls, value: str) -> str:
+        try:
+            parsed = json.loads(value or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "GENERIC_SCRAPER_SELECTORS must be valid JSON (object of CSS selector strings)"
+            ) from exc
+        if not isinstance(parsed, dict):
+            # Pydantic wraps ValueError in ValidationError; TypeError escapes validation.
+            raise ValueError("GENERIC_SCRAPER_SELECTORS must be a JSON object")  # noqa: TRY004
+        return value
+
+
+def _drop_legacy_shell_database_url() -> None:
+    """README/compose use host 5434; stale shell exports often still point at 5433."""
+    import os
+
+    url = os.environ.get("DATABASE_URL", "")
+    if ":5433/" in url:
+        os.environ.pop("DATABASE_URL", None)
+
+
+def _drop_invalid_generic_scraper_selectors_env() -> None:
+    """Prefer .env when the process environment has a dotenv-mangled selectors string."""
+    import os
+
+    raw = os.environ.get("GENERIC_SCRAPER_SELECTORS")
+    if not raw:
+        return
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return
+    except json.JSONDecodeError:
+        pass
+    os.environ.pop("GENERIC_SCRAPER_SELECTORS", None)
 
 
 @lru_cache
 def get_settings() -> Settings:
+    _drop_legacy_shell_database_url()
+    _drop_invalid_generic_scraper_selectors_env()
     return Settings()

@@ -1,5 +1,4 @@
 import json
-import re
 
 import structlog
 from sqlalchemy import select
@@ -7,8 +6,12 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.models import ScoringWeight
 from app.db.session import AsyncSessionLocal
-from app.llm.provider import get_simple_llm_provider
+from app.llm.errors import LLMServiceError
+from app.llm.provider import get_scoring_llm_provider
 from app.schemas.agent_state import JobPilotState
+from app.schemas.llm_outputs import is_validation_error, parse_scoring_output
+from app.services.opportunity_policy import REVIEW_WEIGHTS
+from app.services.pipeline_llm_ledger import append_stage_log
 
 logger = structlog.get_logger(__name__)
 
@@ -28,13 +31,16 @@ Respond ONLY with valid JSON:
 }
 
 Higher score = better opportunity for this developer.
+Prioritize first reviews, clear small deliverables and low competition with scarce connects.
+Complexity: higher score means easier and faster. Low payment is acceptable.
+Never invent buyer history or equate reviews with completed paid orders.
 If job requires excluded skills as primary stack, score below 20."""
 
 
 class ScoringAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
-        self._llm = get_simple_llm_provider()
+        self._llm = get_scoring_llm_provider()
 
     async def run(self, state: JobPilotState) -> dict:
         job = state.get("job_data", {})
@@ -58,20 +64,39 @@ Platform: {job.get('platform')}"""
 
         try:
             response = await self._llm.complete(SYSTEM_PROMPT, user_prompt, temperature=0.3)
-            parsed = self._parse_response(response)
-            weighted_score = self._compute_weighted_score(parsed["breakdown"], weights)
+            parsed = parse_scoring_output(response, tuple(weights.keys()))
+            breakdown = parsed.breakdown.model_dump()
+            weighted_score = self._compute_weighted_score(breakdown, weights)
             final_score = min(100, max(0, int(weighted_score)))
 
             logger.info("ScoringAgent result", score=final_score, title=job.get("title"))
             return {
                 "score": final_score,
-                "score_breakdown": parsed["breakdown"],
+                "score_breakdown": breakdown,
+                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
+            }
+        except LLMServiceError as exc:
+            logger.error("ScoringAgent LLM error", error=str(exc), kind=exc.kind.value)
+            return {
+                "pipeline_processing_error": True,
+                "processing_retryable": exc.retryable,
+                "processing_stage": "scoring",
+                "error": str(exc),
+                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
             }
         except Exception as exc:
             logger.error("ScoringAgent failed", error=str(exc))
-            return {"score": 0, "score_breakdown": {}, "error": str(exc)}
+            return {
+                "pipeline_processing_error": True,
+                "processing_retryable": not is_validation_error(exc),
+                "processing_stage": "scoring",
+                "error": str(exc),
+                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
+            }
 
     async def _get_active_weights(self) -> dict[str, float]:
+        if self._settings.review_first_mode:
+            return REVIEW_WEIGHTS.copy()
         default = json.loads(self._settings.scoring_weights)
         async with AsyncSessionLocal() as session:
             result = await session.execute(
@@ -91,21 +116,14 @@ Platform: {job.get('platform')}"""
         total = 0.0
         weight_sum = 0.0
         for key, weight in weights.items():
-            value = breakdown.get(key, 50.0)
+            if key not in breakdown:
+                raise ValueError(f"missing scoring criterion: {key}")
+            value = breakdown[key]
             total += float(value) * float(weight)
             weight_sum += float(weight)
-        return total / weight_sum if weight_sum else 50.0
-
-    def _parse_response(self, response: str) -> dict:
-        match = re.search(r"\{.*\}", response, re.DOTALL)
-        if not match:
-            return {"score": 50, "breakdown": {}, "summary": "parse error"}
-        data = json.loads(match.group())
-        return {
-            "score": int(data.get("score", 50)),
-            "breakdown": {k: float(v) for k, v in data.get("breakdown", {}).items()},
-            "summary": str(data.get("summary", "")),
-        }
+        if not weight_sum:
+            raise ValueError("empty scoring weights")
+        return total / weight_sum
 
 
 async def scoring_node(state: JobPilotState) -> dict:

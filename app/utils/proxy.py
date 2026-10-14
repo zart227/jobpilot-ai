@@ -15,7 +15,7 @@ from app.config import Settings, get_settings
 
 logger = structlog.get_logger(__name__)
 
-ServiceName = Literal["openai", "telegram", "ollama"]
+ServiceName = Literal["openai", "telegram", "ollama", "openrouter"]
 _pool_cache: dict[str, ProxyRotator] = {}
 
 
@@ -128,6 +128,8 @@ def get_service_proxy_list(settings: Settings, service: ServiceName) -> Path | N
         return None
     if service == "openai":
         list_value = settings.openai_proxy_list
+    elif service == "openrouter":
+        list_value = settings.openrouter_proxy_list
     elif service == "ollama":
         list_value = settings.ollama_proxy_list or settings.openai_proxy_list
     else:

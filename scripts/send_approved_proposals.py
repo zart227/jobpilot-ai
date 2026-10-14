@@ -18,10 +18,10 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
-from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
+from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
+from app.services.kwork_pause import get_kwork_pause_reason
 from app.services.proposal_sender import ProposalSender
 from app.telegram.bot import format_send_outcome_message
-from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
 from app.utils.formatting import extract_site_order_id
 from app.utils.proxy import send_telegram_message
 

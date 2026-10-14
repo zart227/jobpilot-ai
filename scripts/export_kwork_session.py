@@ -56,7 +56,7 @@ async def main() -> None:
     print(f"Сессия сохранена: {output.resolve()}")
     print()
     print("Добавьте в .env:")
-    print(f"KWORK_STORAGE_STATE=/app/data/kwork_session.json")
+    print("KWORK_STORAGE_STATE=/app/data/kwork_session.json")
     print()
     print("Перезапустите бота:")
     print("docker compose up -d --force-recreate telegram-bot")

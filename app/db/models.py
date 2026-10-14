@@ -5,13 +5,17 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -23,6 +27,9 @@ class Base(DeclarativeBase):
 
 class Client(Base):
     __tablename__ = "clients"
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", name="uq_clients_platform_external_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     platform: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -41,6 +48,13 @@ class Client(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint("platform", "external_id", name="uq_jobs_platform_external_id"),
+        CheckConstraint("score IS NULL OR (score >= 0 AND score <= 100)", name="ck_jobs_score_range"),
+        Index("idx_jobs_status", "status"),
+        Index("idx_jobs_platform", "platform"),
+        Index("idx_jobs_processing_next_attempt", "processing_next_attempt_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     platform: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -60,6 +74,13 @@ class Job(Base):
     score: Mapped[int | None] = mapped_column(Integer)
     score_breakdown: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="new")
+    processing_claim_owner: Mapped[str | None] = mapped_column(String(64))
+    processing_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    processing_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    processing_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    processing_stage: Mapped[str | None] = mapped_column(String(64))
+    processing_error_type: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -73,6 +94,18 @@ class Job(Base):
 
 class Proposal(Base):
     __tablename__ = "proposals"
+    __table_args__ = (
+        Index("idx_proposals_job_id", "job_id"),
+        Index("idx_proposals_status", "status"),
+        Index(
+            "uq_proposals_one_active_per_job",
+            "job_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('draft', 'pending_approval', 'approved', 'edited', 'sending')"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
@@ -134,6 +167,7 @@ class Interaction(Base):
 
 class Outcome(Base):
     __tablename__ = "outcomes"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_outcomes_event_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
@@ -143,6 +177,7 @@ class Outcome(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     reward: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped[Job] = relationship(back_populates="outcomes")
@@ -151,6 +186,7 @@ class Outcome(Base):
 
 class Reward(Base):
     __tablename__ = "rewards"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_rewards_event_key"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
@@ -160,6 +196,7 @@ class Reward(Base):
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     reward_value: Mapped[int] = mapped_column(Integer, default=0)
     context: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -184,6 +221,101 @@ class TelegramPending(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    job: Mapped["Job"] = relationship(foreign_keys=[job_id])
+    proposal: Mapped["Proposal"] = relationship(foreign_keys=[proposal_id])
+
+
+class SendAttempt(Base):
+    __tablename__ = "send_attempts"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_send_attempts_idempotency"),
+        Index("idx_send_attempts_status_next", "status", "next_attempt_at"),
+        Index("idx_send_attempts_job", "job_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"))
+    proposal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("proposals.id", ondelete="SET NULL")
+    )
+    inbox_pending_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_inbox_pending.id", ondelete="SET NULL")
+    )
+    snapshot_content: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_version: Mapped[int | None] = mapped_column(Integer)
+    snapshot_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    claim_owner: Mapped[str | None] = mapped_column(String(64))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    platform_response: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    job: Mapped["Job | None"] = relationship(foreign_keys=[job_id])
+    proposal: Mapped["Proposal | None"] = relationship(foreign_keys=[proposal_id])
+
+
+class InboundMessage(Base):
+    __tablename__ = "inbound_messages"
+    __table_args__ = (
+        UniqueConstraint("platform", "message_key", name="uq_inbound_platform_message_key"),
+        Index("idx_inbound_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    platform: Mapped[str] = mapped_column(String(32), nullable=False, default="kwork")
+    message_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    thread_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    kwork_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    kwork_username: Mapped[str | None] = mapped_column(String(255))
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="received")
+    interaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    inbox_pending_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_inbox_pending.id", ondelete="SET NULL")
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notification_outbox"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_notification_outbox_idempotency"),
+        Index("idx_notification_outbox_status_next", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    reference_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    reference_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_owner: Mapped[str | None] = mapped_column(String(64))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
 
 class TelegramInboxPending(Base):
     __tablename__ = "telegram_inbox_pending"
@@ -205,3 +337,6 @@ class TelegramInboxPending(Base):
     message_id: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped["Job | None"] = relationship(foreign_keys=[job_id])
+    proposal: Mapped["Proposal | None"] = relationship(foreign_keys=[proposal_id])

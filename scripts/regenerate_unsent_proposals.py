@@ -9,7 +9,7 @@ from app.config import get_settings
 from app.db.models import Job, Proposal
 from app.db.session import AsyncSessionLocal
 from app.services.job_pipeline import JobPipelineService
-from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
+from app.services.kwork_pause import get_kwork_pause_reason
 from app.telegram.bot import notify_new_proposal
 from app.utils.proxy import create_telegram_bot
 

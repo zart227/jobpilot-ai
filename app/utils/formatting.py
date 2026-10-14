@@ -103,17 +103,6 @@ def format_budget(
     return "Не указан"
 
 
-def ensure_proposal_greeting(text: str, language: str = "ru") -> str:
-    """Prepend a greeting if the proposal starts without one."""
-    stripped = text.lstrip()
-    if language.startswith("ru"):
-        if not stripped.lower().startswith(("здравствуйте", "добрый", "привет")):
-            return f"Здравствуйте. {stripped}"
-    elif not stripped.lower().startswith(("hello", "hi", "hey", "dear")):
-        return f"Hello. {stripped}"
-    return text
-
-
 def ensure_greeting(text: str, language: str = "ru") -> str:
     text = text.strip()
     if not text:
@@ -130,18 +119,6 @@ def ensure_greeting(text: str, language: str = "ru") -> str:
 def detect_job_language(title: str, description: str) -> str:
     sample = f"{title} {description[:200]}"
     return "ru" if re.search(r"[а-яА-ЯёЁ]", sample) else "en"
-
-
-def ensure_proposal_greeting(text: str, *, russian: bool = True) -> str:
-    """Prepend a greeting if the proposal does not already start with one."""
-    stripped = text.strip()
-    if not stripped:
-        return stripped
-    lower = stripped.lower()
-    if lower.startswith(("здравствуйте", "привет", "добрый день", "добрый вечер", "hello", "hi")):
-        return stripped
-    greeting = "Здравствуйте." if russian else "Hello."
-    return f"{greeting} {stripped}"
 
 
 def sanitize_proposal_text(text: str) -> str:
@@ -256,10 +233,11 @@ def ensure_proposal_greeting(text: str, language: str = "ru") -> str:
     if not stripped:
         return text
     lower = stripped.lower()
-    greetings_ru = ("здравствуйте", "добрый день", "добрый вечер", "привет")
-    greetings_en = ("hello", "hi", "dear", "good morning", "good afternoon")
-    greetings = greetings_ru if language == "ru" else greetings_en
+    lang = "ru" if language.startswith("ru") else "en"
+    greetings_ru = ("здравствуйте", "добрый день", "добрый вечер", "привет", "добрый")
+    greetings_en = ("hello", "hi", "dear", "good morning", "good afternoon", "hey")
+    greetings = greetings_ru if lang == "ru" else greetings_en
     if any(lower.startswith(g) for g in greetings):
         return text
-    greeting = "Здравствуйте." if language == "ru" else "Hello."
+    greeting = "Здравствуйте." if lang == "ru" else "Hello."
     return f"{greeting} {stripped}"

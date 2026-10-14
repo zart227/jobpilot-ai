@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +11,16 @@ import structlog
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 
 from app.config import get_settings
-from app.services.kwork_pause import extract_connects_replenish_text
-from app.utils.formatting import KWORK_MAX_OFFER_CHARS, competitive_offer_price
+from app.services.kwork_pause import (
+    extract_connects_remaining,
+    extract_connects_replenish_text,
+    record_connects_limit_detected,
+)
+from app.utils.formatting import (
+    KWORK_MAX_OFFER_CHARS,
+    competitive_offer_price,
+    extract_site_order_id,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -62,7 +70,26 @@ def is_kwork_connects_limit_error(error: str | None) -> bool:
 
 def _connects_limit_exhausted(body: str) -> bool:
     lowered = body.lower()
-    return "лимит коннект" in lowered or "исчерпали лимит коннект" in lowered
+    if "лимит коннект" in lowered or "исчерпали лимит коннект" in lowered:
+        return True
+    remaining = extract_connects_remaining(body)
+    return remaining is not None and remaining == 0
+
+
+CONNECTS_BALANCE_RE = re.compile(r"(\d+)\s*коннект", re.IGNORECASE)
+
+
+def _connects_balance_available(body: str) -> bool:
+    """True when page shows positive connects balance and no limit/replenish message."""
+    if _connects_limit_exhausted(body) or extract_connects_replenish_text(body):
+        return False
+    remaining = extract_connects_remaining(body)
+    if remaining is not None:
+        return remaining > 0
+    match = CONNECTS_BALANCE_RE.search(body)
+    if match:
+        return int(match.group(1)) > 0
+    return False
 
 
 def _order_closed_in_body(body: str) -> bool:
@@ -84,6 +111,7 @@ def _order_closed_in_body(body: str) -> bool:
 def _propose_offer_locators(page: Page):
     return (
         page.locator('.js-link-resume-error:has-text("Предложить услугу")'),
+        page.locator('span.kw-button:has-text("Предложить услугу")'),
         page.get_by_role("button", name="Предложить услугу"),
         page.get_by_role("link", name="Предложить услугу"),
         page.locator('button:has-text("Предложить услугу")'),
@@ -225,9 +253,7 @@ async def _has_active_session(page: Page) -> bool:
         return False
     if _is_on_login_page(page.url):
         return False
-    if await _is_access_blocked(page):
-        return False
-    return True
+    return not await _is_access_blocked(page)
 
 
 def _is_on_login_page(url: str) -> bool:
@@ -449,7 +475,7 @@ async def _get_seller_state(page: Page) -> dict[str, Any]:
 
 
 def _debug_base_name(label: str) -> tuple[str, str]:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", label)[:80]
     return timestamp, f"{timestamp}_{safe_label}"
 
@@ -787,8 +813,8 @@ async def _open_edit_offer_form(
     await page.wait_for_timeout(2500)
 
     edit_locators = (
-        page.get_by_role("link", name=re.compile(r"редактировать\s+предложение", re.I)),
-        page.get_by_role("button", name=re.compile(r"редактировать\s+предложение", re.I)),
+        page.get_by_role("link", name=re.compile(r"редактировать\s+предложение", re.IGNORECASE)),
+        page.get_by_role("button", name=re.compile(r"редактировать\s+предложение", re.IGNORECASE)),
         page.locator('a[href*="edit_offer"]'),
         page.locator('a[href*="new_offer"][href*="edit"]'),
     )
@@ -918,7 +944,9 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
     await page.wait_for_timeout(2000)
 
     if await _detect_connects_limit_on_page(page):
-        return await _connects_limit_error_from_page(page)
+        error = await _connects_limit_error_from_page(page)
+        record_connects_limit_detected(error, source="diagnose_offer")
+        return error
 
     propose_locators = _propose_offer_locators(page)
     has_propose_button = False
@@ -964,7 +992,9 @@ async def _diagnose_offer_blocker(page: Page, job_url: str) -> str | None:
 
     body = (await page.inner_text("body")).lower()
     if propose_button_disabled and await _detect_connects_limit_on_page(page):
-        return await _connects_limit_error_from_page(page)
+        error = await _connects_limit_error_from_page(page)
+        record_connects_limit_detected(error, source="diagnose_offer_disabled")
+        return error
     if _order_closed_in_body(body):
         return KWORK_ORDER_CLOSED_ERROR
     if not has_propose_button:
@@ -1061,7 +1091,7 @@ async def _fill_offer_form(
         discount_percent=settings.kwork_offer_discount_percent,
     )
 
-    filled, method = await _fill_price_input(page, price)
+    filled, _method = await _fill_price_input(page, price)
     if not filled:
         raise RuntimeError("Поле стоимости не найдено на форме Kwork")
 
@@ -1147,6 +1177,8 @@ async def _fail_offer(
         "debug_file": debug_file,
         **log_kwargs,
     }
+    if label == "connects_limit_exhausted" or is_kwork_connects_limit_error(error):
+        record_connects_limit_detected(error, source=f"offer:{label}")
     return False, error, debug
 
 
@@ -1674,8 +1706,73 @@ async def _send_kwork_offer_locked(
     return last_result
 
 
+async def verify_kwork_offer_submitted(job_url: str) -> bool:
+    """Read-only check whether our offer appears submitted for the project (reconciliation)."""
+    from app.utils.proxy import get_proxy_candidates, mark_proxy_failed, mask_proxy
+
+    settings = get_settings()
+    project_id = extract_site_order_id(url=job_url, platform="kwork")
+    if not project_id:
+        return False
+
+    candidates = list(get_proxy_candidates(settings, "openai"))
+    if None not in candidates:
+        candidates.insert(0, None)
+
+    for proxy in candidates:
+        playwright: Playwright | None = None
+        browser: Browser | None = None
+        label = mask_proxy(proxy) if proxy else "direct"
+        try:
+            playwright, browser, page = await launch_browser(proxy=proxy)
+            logged_in = await login(page, settings.kwork_email, settings.kwork_password)
+            if not logged_in:
+                if proxy:
+                    mark_proxy_failed(settings, "openai", proxy)
+                continue
+            if await _verify_offer_on_project_page(page, project_id):
+                return True
+        except Exception as exc:
+            logger.warning(
+                "Kwork offer verify failed",
+                job_url=job_url,
+                proxy=label,
+                error=str(exc),
+            )
+            if proxy:
+                mark_proxy_failed(settings, "openai", proxy)
+        finally:
+            if playwright and browser:
+                await close_browser(playwright, browser)
+    return False
+
+
 async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
     settings = get_settings()
+
+    listing_url = settings.kwork_category_url or "https://kwork.ru/projects?a=1"
+    await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2500)
+    if await _is_access_blocked(page) or "/login" in page.url:
+        return {"error": "session_or_access", "limit_exhausted": False}
+
+    page_text = await _visible_page_texts(page)
+    if _connects_limit_exhausted(page_text) or extract_connects_replenish_text(page_text):
+        return {
+            "limit_exhausted": True,
+            "confident": True,
+            "page_text": page_text,
+            "project_url": listing_url,
+        }
+    remaining = extract_connects_remaining(page_text)
+    if remaining is not None and remaining > 0:
+        return {
+            "limit_exhausted": False,
+            "confident": True,
+            "connects_available_confirmed": True,
+            "page_text": page_text,
+            "project_url": listing_url,
+        }
 
     for connects_url in (
         "https://kwork.ru/connects",
@@ -1693,13 +1790,14 @@ async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
                 "page_text": page_text,
                 "project_url": connects_url,
             }
-
-    listing_url = settings.kwork_category_url or "https://kwork.ru/projects?a=1"
-    await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
-
-    if await _is_access_blocked(page) or "/login" in page.url:
-        return {"error": "session_or_access", "limit_exhausted": False}
+        if _connects_balance_available(page_text):
+            return {
+                "limit_exhausted": False,
+                "confident": True,
+                "connects_available_confirmed": True,
+                "page_text": page_text,
+                "project_url": connects_url,
+            }
 
     project_urls: list[str] = []
     links = page.locator('a[href*="/projects/"]')
@@ -1738,14 +1836,54 @@ async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
             button = locator.first
             if not await button.is_visible():
                 continue
-            if not await button.is_disabled():
+            if await button.is_disabled():
+                body_lower = page_text.lower()
+                if _order_closed_in_body(body_lower):
+                    continue
+                if await _detect_connects_limit_on_page(page):
+                    return {
+                        "limit_exhausted": True,
+                        "confident": True,
+                        "page_text": page_text,
+                        "project_url": project_url,
+                    }
                 return {
-                    "limit_exhausted": False,
+                    "limit_exhausted": True,
                     "confident": True,
                     "page_text": page_text,
                     "project_url": project_url,
                 }
-            break
+            try:
+                await button.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+            try:
+                await button.click(force=True)
+                await page.wait_for_timeout(2500)
+                page_text = await _visible_page_texts(page)
+                last_text = page_text
+            except Exception:
+                pass
+            if await _detect_connects_limit_on_page(page):
+                return {
+                    "limit_exhausted": True,
+                    "confident": True,
+                    "page_text": page_text,
+                    "project_url": project_url,
+                }
+            if await _offer_form_visible(page):
+                return {
+                    "limit_exhausted": False,
+                    "confident": False,
+                    "page_text": page_text,
+                    "project_url": project_url,
+                }
+            return {
+                "limit_exhausted": False,
+                "confident": False,
+                "page_text": page_text,
+                "project_url": project_url,
+            }
 
     return {
         "limit_exhausted": False,
@@ -1783,6 +1921,7 @@ async def refresh_kwork_pause_from_kwork(*, force: bool = False) -> dict[str, An
                 page_text=str(probe.get("page_text", "")),
                 source="browser_probe",
                 confident=bool(probe.get("confident", True)),
+                connects_available_confirmed=bool(probe.get("connects_available_confirmed")),
             )
         except Exception as exc:
             last_error = str(exc)

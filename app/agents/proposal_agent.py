@@ -4,6 +4,7 @@ from app.config import get_settings
 from app.llm.provider import get_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.agent_state import JobPilotState
+from app.services.pipeline_llm_ledger import append_stage_log
 from app.utils.formatting import (
     competitive_offer_price,
     finalize_kwork_proposal,
@@ -50,7 +51,7 @@ This text is sent directly to the buyer on Kwork. One connect is spent per offer
 
 Kwork selling rules (from Kwork training, critical):
 1. NO templates. Never reuse the same wording across projects.
-2. Relevant portfolio is mandatory. Pick the closest case from DEVELOPER PORTFOLIO and explain
+2. Never invent portfolio links, clients, results or paid experience. Label personal demos as personal demos. If no relevant supplied case exists, omit it and explain your approach. Pick the closest case from DEVELOPER PORTFOLIO and explain
    what it has in common with the buyer's task (stack, domain, architecture).
 3. Describe HOW you will work: tools, approach, key steps. Suggest improvements if appropriate.
 4. End with 2-3 numbered clarifying questions about THIS project.
@@ -107,8 +108,13 @@ class ProposalAgent:
         is_kwork = job.get("platform") == "kwork"
 
         job_context = f"{job.get('title', '')} {job.get('description', '')[:500]}"
-        similar = await self._memory.search_similar_proposals(job_context)
-        phrases = await self._memory.search_phrases(job_context)
+        try:
+            similar = await self._memory.search_similar_proposals(job_context)
+            phrases = await self._memory.search_phrases(job_context)
+        except Exception as exc:
+            logger.warning("ProposalAgent memory retrieval skipped", error=str(exc))
+            similar = []
+            phrases = []
 
         examples = ""
         if similar:
@@ -126,7 +132,11 @@ class ProposalAgent:
             phrase_hint = f"\nHigh-conversion phrases to naturally incorporate: {', '.join(phrases[:3])}"
 
         edit_pref_hint = ""
-        edit_prefs = await self._memory.search_edit_preferences(job_context, limit=5)
+        try:
+            edit_prefs = await self._memory.search_edit_preferences(job_context, limit=5)
+        except Exception as exc:
+            logger.warning("ProposalAgent edit preference retrieval skipped", error=str(exc))
+            edit_prefs = []
         if edit_prefs:
             seen: set[str] = set()
             lines: list[str] = []
@@ -219,6 +229,7 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
                 "proposal_content": parsed["proposal"],
                 "execution_plan": parsed["execution_plan"],
                 "timeline": parsed["timeline"],
+                "llm_stage_log": append_stage_log(state, "proposal", "main"),
             }
         except Exception as exc:
             logger.error("ProposalAgent failed", error=str(exc))
@@ -227,6 +238,7 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
                 "execution_plan": "",
                 "timeline": "",
                 "error": str(exc),
+                "llm_stage_log": append_stage_log(state, "proposal", "main"),
             }
 
     def _parse_response(self, response: str) -> dict:

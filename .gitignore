@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 .env
+.jobpilot_integration_test.env
+backups/
 .venv/
 venv/
 data/kwork_session.json
@@ -17,6 +19,7 @@ data/ollama_usage_alert.json
 data/openai_usage_alert.json
 data/cursor_bridge.env
 data/cursor_bridge.pid
+data/live_kwork_signoff.json
 data/cursor_bridge_socat.pid
 data/dev_agent_logs/
 data/cursor_bridge.log

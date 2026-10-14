@@ -4,7 +4,7 @@ import asyncio
 import html
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal
+from typing import Literal
 
 
 class LLMErrorKind(str, Enum):

@@ -68,12 +68,46 @@ Services:
 | Service       | Port | Description                                       |
 | ------------- | ---- | ------------------------------------------------- |
 | api           | 8000 | FastAPI REST API                                  |
-| postgres      | 5433 | Structured data (5432 занят — см. docker-compose) |
+| postgres      | 5434 | Structured data (host `127.0.0.1:5434` → container 5432) |
 | redis         | 6379 | Celery broker                                     |
 | qdrant        | 6333 | Vector memory                                     |
 | celery-worker | —    | Scraping + pipeline jobs                          |
 | celery-beat   | —    | Periodic scraping                                 |
 | telegram-bot  | —    | Approval UI                                       |
+
+### Remediation & release gates
+
+Automated remediation checklists are documented in [docs/remediation-closeout.md](docs/remediation-closeout.md). Before a permitted live Kwork send:
+
+```bash
+make verify        # checklist + audit + unit tests
+make autonomous    # full local run: ruff, 176 pytest, drills, rollout smoke
+make audit-status  # regenerate docs/audit-remediation-matrix.md
+make drill         # staging drills: audit, preflight, cursor-bridge policy, /ready
+make redis-drill   # stop redis → /ready 503 → recover (local compose)
+make dependency-drill  # same for postgres
+make rollout       # preflight + alembic + smoke (on DB copy / staging)
+```
+
+Integration tests must use a separate PostgreSQL database whose name ends in
+`_test`. Set `DATABASE_URL` explicitly, and set `REDIS_URL`, `CELERY_BROKER_URL`
+and `CELERY_RESULT_BACKEND` to Redis databases 2 or higher. The test runner
+rejects the working database and broker to prevent test notifications entering
+the live Telegram queue.
+
+Live Kwork prep: [docs/live-kwork-prep.md](docs/live-kwork-prep.md).
+
+Set `PLATFORM_DRY_RUN=true` in `.env` until live acceptance is explicitly approved ([docs/kwork-live-acceptance.md](docs/kwork-live-acceptance.md)).
+
+### Production profile
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+```
+
+API runs without `--reload`; code comes from the image only. Writable state: `./data`.
+
+Operational docs: [docs/runbook.md](docs/runbook.md), [docs/ops-logging-policy.md](docs/ops-logging-policy.md).
 
 ### 3. Verify
 
@@ -120,7 +154,8 @@ If bridge stops, restart: `python scripts/run_cursor_bridge.py` then `docker com
 
 | Method | Path                 | Description               |
 | ------ | -------------------- | ------------------------- |
-| GET    | `/health`            | Health check              |
+| GET    | `/health`            | Liveness (no deps)        |
+| GET    | `/ready`             | Readiness (Postgres, Redis; Qdrant optional) |
 | GET    | `/jobs`              | List jobs                 |
 | GET    | `/jobs/{id}`         | Job details               |
 | POST   | `/jobs/{id}/process` | Re-run pipeline for job   |
@@ -128,6 +163,7 @@ If bridge stops, restart: `python scripts/run_cursor_bridge.py` then `docker com
 | POST   | `/chat`              | Client reply → ChatAgent  |
 | POST   | `/outcomes/{id}`     | Record outcome + learning |
 | GET    | `/stats`             | System statistics         |
+| POST   | `/send-attempts/{id}/reconcile` | Read-only reconcile after `unknown_result` (auth) |
 
 ## Reward System
 
@@ -140,6 +176,15 @@ If bridge stops, restart: `python scripts/run_cursor_bridge.py` then `docker com
 
 LearningAgent adjusts scoring weights and stores successful proposals in Qdrant.
 
+## Scrapers
+
+| Platform | `ENABLED_SCRAPERS` | Status |
+| -------- | ------------------ | ------ |
+| Kwork | `kwork` | Supported (Playwright listing + optional login) |
+| Generic | `generic` | Configurable CSS selectors via `GENERIC_SCRAPER_*` |
+| Upwork | `upwork` | Experimental — may require manual fixes |
+| FL.ru | `fl_ru` | Experimental — may require manual fixes |
+
 ## Adding a Scraper
 
 1. Create `app/scrapers/your_platform.py` extending `BaseScraper`.
@@ -151,13 +196,15 @@ LearningAgent adjusts scoring weights and stores successful proposals in Qdrant.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -r requirements-lock.txt && pip install --no-deps -e ".[dev]"
+# or: pip install -e ".[dev]"  then regenerate lock with pip freeze
 playwright install chromium
 
 # Start infrastructure
 docker compose up postgres redis qdrant -d
 
-python scripts/init_db.py
+python scripts/migration_preflight.py   # optional, before upgrade on existing data
+python scripts/init_db.py               # alembic upgrade head
 uvicorn app.main:app --reload
 celery -A app.celery_app worker --loglevel=info
 celery -A app.celery_app beat --loglevel=info
@@ -171,3 +218,43 @@ See `.env.example` for the full list.
 ## License
 
 MIT
+
+### Модели по задачам
+
+`OLLAMA_MODEL=nemotron-3-nano:30b` используется для фильтрации, обучения и сводок переписки. `OLLAMA_SCORING_MODEL=gpt-oss:120b` используется для оценки заказов. Отклики, ответы клиентам и правки текстов используют основной `LLM_PROVIDER=openai` и существующий `OPENAI_MODEL`. При исчерпании лимита Ollama оценка переключается на `OPENAI_MODEL`, рутина на `OPENAI_SIMPLE_MODEL`, если включён `OLLAMA_AUTO_FALLBACK`. После изменения настроек перезапустите приложение и Celery workers.
+
+
+### OpenRouter и бесплатные модели
+
+Для бесплатной фильтрации, обучения и сводок задайте в `.env`:
+
+```dotenv
+OPENROUTER_API_KEY=ваш-ключ
+LLM_SIMPLE_PROVIDER=openrouter
+OPENROUTER_SIMPLE_MODEL=openrouter/free
+OPENROUTER_FALLBACK_TO_OLLAMA=true
+```
+
+Ключ создаётся на https://openrouter.ai/settings/keys. `openrouter/free` выбирает
+доступную бесплатную модель; для стабильного поведения можно указать конкретный
+идентификатор с `:free` из актуального каталога OpenRouter. Не добавляйте `:free`
+к произвольной модели: бесплатный вариант должен существовать в каталоге.
+
+Основные отклики, чаты и оценка заказов при таком выборе используют `LLM_PROVIDER`.
+Чтобы перевести их на OpenRouter, задайте `LLM_PROVIDER=openrouter` и
+`OPENROUTER_MODEL=openrouter/free`. Когда `LLM_SIMPLE_PROVIDER=ollama`, оценка
+по-прежнему использует `OLLAMA_SCORING_MODEL`, а резерв Ollama — OpenAI.
+
+При HTTP 402/429, временном сбое сети/сервера, пустом или обрезанном ответе
+OpenRouter переключается на `OLLAMA_MODEL`, если резерв включён. В этой ветке
+переход Ollama на платный OpenAI отключён. Ошибки ключа не маскируются резервом.
+Для строгого режима без резерва задайте `OPENROUTER_FALLBACK_TO_OLLAMA=false`.
+Проверка JSON агентами сохраняется; некорректный JSON обрабатывается существующей
+валидацией. Бесплатные модели имеют квоты и могут быть недоступны при нагрузке.
+
+OpenRouter использует общий `PROXY`, если задан, или отдельный
+`OPENROUTER_PROXY_LIST`; список OpenAI автоматически не наследуется.
+Учёт баланса OpenAI не включает OpenRouter. Журнал этапов показывает настроенную
+модель, а не фактическую модель бесплатного маршрутизатора или резерва.
+Эмбеддинги остаются на OpenAI и требуют отдельного `OPENAI_API_KEY`.
+После изменения `.env` перезапустите приложение и Celery workers.

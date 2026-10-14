@@ -1,0 +1,10 @@
+{
+  "approved_by": "your-name",
+  "approved_at": "2026-10-14",
+  "kwork_order_id": "12345678",
+  "kwork_dialog_username": "test_buyer",
+  "send_attempt_id": "00000000-0000-0000-0000-000000000001",
+  "snapshot_verified": true,
+  "ui_matches_db": true,
+  "notes": "Staging test order; single confirmed_sent; no duplicate send on second approve"
+}

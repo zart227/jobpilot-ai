@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from app.services.dev_agent_audit import log_dev_agent_event, read_recent_dev_agent_logs
 

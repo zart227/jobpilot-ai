@@ -1,5 +1,5 @@
-import html
 import asyncio
+import html
 import uuid
 from typing import Any
 
@@ -16,27 +16,33 @@ from sqlalchemy import select
 
 from app.agents.edit_proposal_agent import EditProposalAgent
 from app.agents.graph import compile_jobpilot_graph
-from app.agents.learning_agent import LearningAgent
 from app.config import get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
-from app.services.edit_preference_service import EditPreferenceService
-from app.services.job_pipeline import JobPipelineService
-from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
-from app.services.kwork_pause import format_kwork_pause_reason, get_kwork_pause_reason, is_kwork_paused
-from app.services.proposal_sender import ProposalSender
-from app.services.reward_system import RewardSystem
-from app.telegram.dev_agent_handlers import register_dev_agent_handlers
-from app.telegram.inbox_handlers import register_inbox_handlers
-from app.telegram.keyboards import approval_keyboard, edit_preview_keyboard
 from app.services.dev_agent_service import (
     DevAgentConfigurationError,
     DevAgentService,
     create_cursor_client,
-    docker_bridge_hint,
     resolve_agent_workspace,
 )
+from app.services.edit_preference_service import EditPreferenceService
+from app.services.job_pipeline import JobPipelineService
+from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
+from app.services.kwork_pause import (
+    format_kwork_pause_reason,
+    get_kwork_pause_reason,
+    is_kwork_paused,
+)
+from app.services.notification_outbox import deliver_notification_outbox, enqueue_notification
+from app.services.proposal_sender import ProposalSender
+from app.services.reward_system import RewardSystem
+from app.telegram.access import pending_matches_callback
+from app.telegram.admin_middleware import TelegramAdminMiddleware
+from app.telegram.commands import register_command_menu
+from app.telegram.dev_agent_handlers import register_dev_agent_handlers
+from app.telegram.inbox_handlers import register_inbox_handlers
+from app.telegram.keyboards import edit_preview_keyboard
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
     extract_site_order_id,
@@ -182,6 +188,26 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
 
     order_id_line = _order_id_html_line(job)
 
+    buyer_line = ""
+    if job.client_id:
+        client = job.client
+        if client:
+            paid = (client.metadata_ or {}).get("completed_paid_orders")
+            rating = client.rating
+            parts = []
+            if rating is not None:
+                parts.append(f"рейтинг {rating}")
+            if paid is not None:
+                parts.append(f"оплаченных заказов (источник: профиль Kwork): {paid}")
+            if parts:
+                buyer_line = f"<b>Заказчик:</b> {html.escape(', '.join(parts))}\n"
+
+    breakdown_line = ""
+    breakdown = job.score_breakdown or {}
+    if isinstance(breakdown, dict) and breakdown:
+        items = ", ".join(f"{html.escape(str(k))}={v}" for k, v in breakdown.items())
+        breakdown_line = f"<b>Оценка по критериям:</b> {items}\n"
+
     return (
         f"<b>JobPilot AI Alert</b>\n\n"
         f"<b>New job found:</b>\n\n"
@@ -190,7 +216,9 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
         f"<b>Platform:</b> {html.escape(job.platform)}\n"
         f"<b>Budget:</b> {html.escape(budget)}\n"
         f"{offer_line}"
-        f"<b>Score:</b> {score or 0}/100\n\n"
+        f"{buyer_line}"
+        f"<b>Score:</b> {score or 0}/100\n"
+        f"{breakdown_line}\n"
         f"<b>Proposal preview:</b>\n\n"
         f"{html.escape(preview)}"
     )
@@ -372,10 +400,20 @@ async def notify_new_proposal(
     settings = get_settings()
     target_chat = chat_id or int(settings.telegram_admin_chat_id)
 
+    from sqlalchemy.orm import selectinload
+
     async with AsyncSessionLocal() as session:
-        job = await session.get(Job, job_id)
+        job = await session.get(Job, job_id, options=[selectinload(Job.client)])
         proposal = await session.get(Proposal, proposal_id)
         if not job or not proposal:
+            return None
+
+        if job.platform == "kwork" and is_kwork_paused():
+            logger.info(
+                "JobPilot AI skip new proposal notification while Kwork paused",
+                job_id=str(job_id),
+                reason=get_kwork_pause_reason(),
+            )
             return None
 
         text = format_job_alert(job, proposal, job.score)
@@ -391,16 +429,38 @@ async def notify_new_proposal(
         session.add(pending)
         await session.flush()
 
-        message = await bot.send_message(
+        pending_id = str(pending.id)
+        await enqueue_notification(
+            kind="proposal_approval",
+            idempotency_key=f"proposal_approval:{pending_id}",
             chat_id=target_chat,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=approval_keyboard(str(pending.id)),
+            payload={
+                "pending_id": pending_id,
+                "job_id": str(job_id),
+                "proposal_id": str(proposal_id),
+                "alert_text": text,
+            },
+            reference_type="telegram_pending",
+            reference_id=pending.id,
+            session=session,
         )
-
-        pending.message_id = message.message_id
         await session.commit()
-        return message.message_id
+
+    delivery = await deliver_notification_outbox(settings, bot=bot, limit=5)
+    if delivery.get("delivered"):
+        async with AsyncSessionLocal() as session:
+            pending = await session.execute(
+                select(TelegramPending)
+                .where(
+                    TelegramPending.job_id == job_id,
+                    TelegramPending.proposal_id == proposal_id,
+                )
+                .order_by(TelegramPending.created_at.desc())
+                .limit(1)
+            )
+            row = pending.scalar_one_or_none()
+            return row.message_id if row else None
+    return None
 
 
 def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
@@ -408,6 +468,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
     redis = Redis.from_url(settings.redis_url)
     storage = RedisStorage(redis=redis)
     dp = Dispatcher(storage=storage)
+    dp.update.middleware(TelegramAdminMiddleware())
     bot = create_telegram_bot(settings.telegram_bot_token, settings)
 
     dev_router = Router()
@@ -467,6 +528,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             if not pending:
                 await callback.answer("Request expired", show_alert=True)
                 return
+            if not pending_matches_callback(pending, callback):
+                await callback.answer("Карточка устарела", show_alert=True)
+                return
             job = await session.get(Job, pending.job_id)
             if not job:
                 await callback.answer("Job not found", show_alert=True)
@@ -486,6 +550,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 return
             if pending.status != "pending":
                 await callback.answer("Already processed", show_alert=True)
+                return
+            if not pending_matches_callback(pending, callback):
+                await callback.answer("Карточка устарела", show_alert=True)
                 return
             job = await session.get(Job, pending.job_id)
             proposal = await session.get(Proposal, pending.proposal_id)
@@ -528,7 +595,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
 
         data = await state.get_data()
         job_id = data["job_id"]
-        proposal_id = data["proposal_id"]
+        data["proposal_id"]
         pending_id = data["pending_id"]
         before = data.get("draft_content") or data.get("original_content", "")
         order_id = data.get("order_id") or None
@@ -704,6 +771,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             if not pending or pending.status != "pending":
                 await callback.answer("Already processed", show_alert=True)
                 return
+            if not pending_matches_callback(pending, callback):
+                await callback.answer("Карточка устарела", show_alert=True)
+                return
             job_id = str(pending.job_id)
             proposal_id = str(pending.proposal_id)
             job = await session.get(Job, pending.job_id)
@@ -746,16 +816,15 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 await callback.answer("⏭ Skipped")
             except Exception:
                 pass
-            reward_system = RewardSystem()
-            await reward_system.record_outcome(
-                uuid.UUID(job_id), uuid.UUID(proposal_id), "ignored"
-            )
-            learning = LearningAgent()
-            pipeline = JobPipelineService()
-            state = await pipeline.job_to_state(uuid.UUID(job_id))
-            state["outcome_status"] = "ignored"
-            state["approval_status"] = "skipped"
-            await learning.run(state)
+            from app.services.outcome_service import record_outcome_and_learn
+
+            async with AsyncSessionLocal() as session:
+                await record_outcome_and_learn(
+                    session,
+                    job_id=uuid.UUID(job_id),
+                    proposal_id=uuid.UUID(proposal_id),
+                    status="ignored",
+                )
             await callback.message.answer("JobPilot AI: job skipped.")
             return
 
@@ -815,9 +884,6 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             send_success = send_result.get("outcome_status") == "sent"
             send_error = send_result.get("send_error") or None
             send_debug = send_result.get("send_debug") or None
-            learning = LearningAgent()
-            learn_result = await learning.run(state)
-            state.update(learn_result)
         else:
             result = await graph.ainvoke(state)
             state.update(result)
@@ -825,12 +891,17 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             send_error = state.get("send_error") or None
             send_debug = state.get("send_debug") or None
 
-        reward_system = RewardSystem()
-        await reward_system.record_outcome(
-            uuid.UUID(job_id),
-            uuid.UUID(proposal_id),
-            state.get("outcome_status", "sent" if send_success else "send_failed"),
-        )
+        from app.services.outcome_service import record_outcome_and_learn
+
+        outcome_status = state.get("outcome_status", "sent" if send_success else "send_failed")
+        async with AsyncSessionLocal() as session:
+            await record_outcome_and_learn(
+                session,
+                job_id=uuid.UUID(job_id),
+                proposal_id=uuid.UUID(proposal_id),
+                status=outcome_status,
+                allow_internal=outcome_status == "send_failed",
+            )
         return send_success, send_error, send_debug
 
     dp["bot_instance"] = bot
@@ -865,6 +936,7 @@ async def run_bot() -> None:
 
     logger.info("JobPilot AI Telegram bot starting")
     try:
+        await register_command_menu(bot, int(settings.telegram_admin_chat_id))
         await dp.start_polling(bot)
     finally:
         if cursor_client is not None:

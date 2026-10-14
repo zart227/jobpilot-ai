@@ -3,7 +3,6 @@
 import asyncio
 import json
 import re
-import sys
 
 from app.agents.filter_agent import SYSTEM_PROMPT as FILTER_PROMPT
 from app.agents.scoring_agent import SYSTEM_PROMPT as SCORING_PROMPT

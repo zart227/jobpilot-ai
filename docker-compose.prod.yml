@@ -1,0 +1,24 @@
+# Production overrides: no --reload, restart policies, image-only app code.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+services:
+    api:
+        command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data
+
+    celery-worker:
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data
+
+    celery-beat:
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data
+
+    telegram-bot:
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data

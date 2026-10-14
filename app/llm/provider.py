@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import structlog
 from langchain_anthropic import ChatAnthropic
@@ -17,6 +17,9 @@ from app.utils.proxy import (
     mark_proxy_failed,
     mask_proxy,
 )
+
+if TYPE_CHECKING:
+    from ollama import AsyncClient
 
 logger = structlog.get_logger(__name__)
 
@@ -151,11 +154,71 @@ class OpenAIProvider(LLMProvider):
         raise NotImplementedError("OpenAI SDK provider does not expose a LangChain chat model")
 
 
+class OpenRouterProvider(LLMProvider):
+    """OpenAI-compatible chat API with an optional, non-paid Ollama fallback."""
+
+    def __init__(self, settings: Settings, *, model: str | None = None) -> None:
+        if not settings.openrouter_api_key.strip():
+            raise ValueError("OPENROUTER_API_KEY is required when using OpenRouter")
+        self._settings = settings
+        self._model = model or settings.openrouter_model
+
+    async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        # Free-model limits are shared across proxies; do not rotate on 429.
+        proxy = get_proxy_candidates(self._settings, "openrouter")[0]
+        client = AsyncOpenAI(
+            api_key=self._settings.openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=self._settings.openrouter_timeout_seconds,
+            max_retries=0,
+            http_client=build_httpx_async_client(
+                proxy=proxy, timeout_seconds=self._settings.openrouter_timeout_seconds,
+            ),
+        )
+        try:
+            response = await client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=kwargs.get("temperature", 0.7),
+            )
+            if not response.choices:
+                raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned no choices", True)
+            choice = response.choices[0]
+            content = choice.message.content
+            if choice.finish_reason == "length" or not content or not content.strip():
+                raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned incomplete text", True)
+            return content
+        except (APIConnectionError, APIStatusError, LLMServiceError) as exc:
+            recoverable = (
+                isinstance(exc, APIConnectionError)
+                or isinstance(exc, APIStatusError)
+                and exc.status_code in {402, 408, 429, 500, 502, 503, 504}
+                or isinstance(exc, LLMServiceError) and exc.retryable
+            )
+            if not recoverable or not self._settings.openrouter_fallback_to_ollama:
+                raise
+            logger.warning("OpenRouter unavailable, falling back to Ollama", model=self._model)
+            fallback_settings = self._settings.model_copy(update={"ollama_auto_fallback": False})
+            return await OllamaProvider(fallback_settings).complete(
+                system_prompt, user_prompt, **kwargs,
+            )
+        finally:
+            await client.close()
+
+    def get_chat_model(self) -> BaseChatModel:
+        raise NotImplementedError("OpenRouter provider does not expose a LangChain chat model")
+
+
 class OllamaProvider(LLMProvider):
     """Ollama chat via official ollama-python SDK (local or https://ollama.com)."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, model: str | None = None, fallback_model: str | None = None) -> None:
         self._settings = settings
+        self._model = model or settings.ollama_model
+        self._fallback_model = fallback_model or settings.openai_simple_model
 
     def _client(self, proxy: str | None) -> "AsyncClient":
         from ollama import AsyncClient
@@ -188,18 +251,18 @@ class OllamaProvider(LLMProvider):
         try:
             response = await asyncio.wait_for(
                 client.chat(
-                    model=self._settings.ollama_model,
+                    model=self._model,
                     messages=messages,
                     options={"temperature": temperature},
                 ),
                 timeout=self._settings.ollama_timeout_seconds,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise classify_llm_error(exc) from exc
         except ResponseError as exc:
             logger.error(
                 "Ollama request failed",
-                model=self._settings.ollama_model,
+                model=self._model,
                 status_code=exc.status_code,
                 error=exc.error,
                 proxy=mask_proxy(proxy) if proxy else None,
@@ -213,7 +276,7 @@ class OllamaProvider(LLMProvider):
         content = response.message.content
         logger.info(
             "Ollama response",
-            model=self._settings.ollama_model,
+            model=self._model,
             proxy=mask_proxy(proxy) if proxy else None,
         )
         return content if isinstance(content, str) else str(content)
@@ -229,7 +292,7 @@ class OllamaProvider(LLMProvider):
         reason: str,
         **kwargs: Any,
     ) -> str:
-        model = self._settings.openai_simple_model
+        model = self._fallback_model
         logger.warning(
             "Ollama limits exceeded, falling back to OpenAI",
             model=model,
@@ -348,8 +411,10 @@ class AnthropicProvider(LLMProvider):
 
 def _build_provider(
     cfg: Settings,
-    provider: Literal["openai", "anthropic", "cursor", "ollama"],
+    provider: Literal["openai", "anthropic", "cursor", "ollama", "openrouter"],
 ) -> LLMProvider:
+    if provider == "openrouter":
+        return OpenRouterProvider(cfg)
     if provider == "cursor":
         logger.info("JobPilot AI using Cursor SDK", model=cfg.cursor_model)
         return CursorProvider(cfg)
@@ -369,7 +434,7 @@ def get_llm_provider(settings: Settings | None = None) -> LLMProvider:
 
 
 def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
-    """Filter, scoring, chat, learning — cheaper/faster models."""
+    """Filtering, learning and conversation summaries — routine tasks."""
     cfg = settings or get_settings()
     simple = cfg.llm_simple_provider
     if simple == "same":
@@ -386,6 +451,18 @@ def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
                 weekly=snapshot.weekly.percent if snapshot.weekly else None,
             )
             return OpenAIProvider(cfg, model=cfg.openai_simple_model)
+    if simple == "openrouter":
+        return OpenRouterProvider(cfg, model=cfg.openrouter_simple_model)
     if simple == "openai":
         return OpenAIProvider(cfg, model=cfg.openai_simple_model)
     return _build_provider(cfg, simple)
+
+
+def get_scoring_llm_provider(settings: Settings | None = None) -> LLMProvider:
+    """Use stronger reasoning for scoring, with the main provider as fallback."""
+    cfg = settings or get_settings()
+    if cfg.llm_simple_provider == "ollama":
+        return OllamaProvider(
+            cfg, model=cfg.ollama_scoring_model, fallback_model=cfg.openai_model
+        )
+    return get_llm_provider(cfg)

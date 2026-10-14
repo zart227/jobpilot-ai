@@ -1,18 +1,17 @@
-import json
-import re
-
 import structlog
 
-from app.llm.provider import get_simple_llm_provider
+from app.llm.provider import get_llm_provider
 from app.schemas.agent_state import JobPilotState
+from app.schemas.llm_outputs import is_validation_error, parse_chat_output
 
 logger = structlog.get_logger(__name__)
 
 SYSTEM_PROMPT = """You help a freelancer reply to client messages on Kwork.
 
-Use the job posting, the proposal we already sent, and the client's new message.
+Use the job posting, our proposal, the conversation summary, and the client's latest message.
 Answer in the same language as the client (usually Russian).
-Address the client's specific points; do not give a generic reply.
+Address the client's specific points; stay consistent with prior messages in the thread.
+Do not repeat what was already said in our previous replies unless the client asks again.
 
 Classify intent and draft a concise professional reply.
 
@@ -25,10 +24,43 @@ Respond ONLY with valid JSON:
 Do NOT use em dash (—) in replies. Use commas or periods instead."""
 
 
+def format_conversation_history(
+    turns: list[dict[str, str]] | None,
+    *,
+    max_turns: int = 20,
+    max_chars: int = 4000,
+) -> str:
+    if not turns:
+        return "(ранее сообщений не было)"
+
+    role_labels = {
+        "client": "Клиент",
+        "freelancer": "Вы",
+    }
+    lines: list[str] = []
+    total_chars = 0
+    for turn in turns[-max_turns:]:
+        role = role_labels.get(turn.get("role", ""), "Участник")
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+        line = f"{role}: {text}"
+        if total_chars + len(line) > max_chars:
+            remaining = max_chars - total_chars
+            if remaining > 40:
+                lines.append(line[: remaining - 3] + "...")
+            break
+        lines.append(line)
+        total_chars += len(line) + 1
+    return "\n".join(lines) if lines else "(ранее сообщений не было)"
+
+
 def build_chat_user_prompt(
     job: dict,
     proposal: str,
     client_message: str,
+    conversation_context: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> str:
     lines = [
         "=== Задача (заказ) ===",
@@ -52,11 +84,17 @@ def build_chat_user_prompt(
     lines.append("\n=== Наш отклик на эту задачу ===")
     lines.append(proposal[:2500] if proposal.strip() else "(отклик не найден в базе)")
 
-    lines.append("\n=== Сообщение клиента ===")
+    lines.append("\n=== История переписки ===")
+    if conversation_context is not None:
+        lines.append(conversation_context.strip() or "(ранее сообщений не было)")
+    else:
+        lines.append(format_conversation_history(conversation_history))
+
+    lines.append("\n=== Последнее сообщение клиента ===")
     lines.append(client_message[:2500])
 
     lines.append(
-        "\nС учётом задачи, нашего отклика и сообщения клиента: "
+        "\nС учётом задачи, нашего отклика, истории переписки и последнего сообщения клиента: "
         "классифицируй интент и составь ответ."
     )
     return "\n".join(lines)
@@ -64,7 +102,7 @@ def build_chat_user_prompt(
 
 class ChatAgent:
     def __init__(self) -> None:
-        self._llm = get_simple_llm_provider()
+        self._llm = get_llm_provider()
 
     async def run(self, state: JobPilotState) -> dict:
         job = state.get("job_data", {})
@@ -74,29 +112,33 @@ class ChatAgent:
         if not client_message:
             return {"chat_intent": "none", "chat_reply": ""}
 
-        user_prompt = build_chat_user_prompt(job, proposal, client_message)
+        user_prompt = build_chat_user_prompt(
+            job,
+            proposal,
+            client_message,
+            conversation_context=state.get("conversation_context"),
+            conversation_history=state.get("conversation_history") or [],
+        )
 
         try:
             response = await self._llm.complete(SYSTEM_PROMPT, user_prompt, temperature=0.5)
-            parsed = self._parse_response(response)
-            logger.info("ChatAgent response", intent=parsed["intent"])
+            parsed = parse_chat_output(response)
+            logger.info("ChatAgent response", intent=parsed.intent)
             return {
-                "chat_intent": parsed["intent"],
-                "chat_reply": parsed["reply"],
+                "chat_intent": parsed.intent,
+                "chat_reply": parsed.reply,
             }
         except Exception as exc:
             logger.error("ChatAgent failed", error=str(exc))
-            return {"chat_intent": "error", "chat_reply": "", "error": str(exc)}
-
-    def _parse_response(self, response: str) -> dict:
-        match = re.search(r"\{.*\}", response, re.DOTALL)
-        if match:
-            data = json.loads(match.group())
+            retryable = not is_validation_error(exc)
             return {
-                "intent": str(data.get("intent", "other")),
-                "reply": str(data.get("reply", "")),
+                "chat_intent": "error",
+                "chat_reply": "",
+                "error": str(exc),
+                "pipeline_processing_error": True,
+                "processing_retryable": retryable,
+                "processing_stage": "chat",
             }
-        return {"intent": "other", "reply": response[:500]}
 
 
 async def chat_node(state: JobPilotState) -> dict:

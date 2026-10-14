@@ -15,7 +15,11 @@ from app.config import Settings, get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.services.dev_agent_audit import log_dev_agent_event
-from app.services.kwork_pause import format_kwork_pause_reason, get_kwork_pause_reason, is_kwork_paused
+from app.services.kwork_pause import (
+    format_kwork_pause_reason,
+    get_kwork_pause_reason,
+    is_kwork_paused,
+)
 from app.services.reward_system import RewardSystem
 
 if TYPE_CHECKING:
@@ -193,7 +197,7 @@ class DevAgentService:
         if agent_id:
             raw_id = agent_id.decode() if isinstance(agent_id, bytes) else str(agent_id)
             try:
-                from cursor_sdk import AgentOptions, AsyncAgent
+                from cursor_sdk import AsyncAgent
 
                 agent = await AsyncAgent.resume(
                     raw_id,
@@ -475,4 +479,8 @@ def write_bridge_env_file(
         ),
         encoding="utf-8",
     )
+    try:
+        env_path.chmod(0o600)
+    except OSError as exc:
+        logger.warning("Could not chmod bridge env file", path=str(env_path), error=str(exc))
     return env_path

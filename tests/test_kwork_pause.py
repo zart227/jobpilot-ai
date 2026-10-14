@@ -1,6 +1,18 @@
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
+
+import pytest
 
 from app.config import Settings
+
+FIXED_LOCAL_TODAY = date(2026, 7, 7)
+
+
+@pytest.fixture(autouse=True)
+def freeze_kwork_local_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.kwork_pause._local_today",
+        lambda _settings: FIXED_LOCAL_TODAY,
+    )
 from app.services.kwork_pause import (
     KworkPauseState,
     apply_connects_probe_result,
@@ -11,7 +23,6 @@ from app.services.kwork_pause import (
     load_pause_state,
     parse_replenish_date_ru,
     save_pause_state,
-    clear_pause_state,
 )
 
 
@@ -23,6 +34,16 @@ def test_parse_replenish_date_ru() -> None:
 def test_extract_replenish_text() -> None:
     text = "Важно! Ваши коннекты будут пополнены 10 июля."
     assert extract_connects_replenish_text(text) == "10 июля"
+    listing = "Коннекты\nОсталось 0 из 30\nДата пополнения\n10 августа"
+    assert extract_connects_replenish_text(listing) == "10 августа"
+
+
+def test_extract_connects_remaining() -> None:
+    from app.services.kwork_pause import extract_connects_remaining
+
+    assert extract_connects_remaining("Осталось 0 из 30") == 0
+    assert extract_connects_remaining("Осталось 5 из 30") == 5
+    assert extract_connects_remaining("no connects here") is None
 
 
 def test_manual_pause_bootstrap_without_state_file(tmp_path) -> None:
@@ -55,8 +76,10 @@ def test_manual_pause_before_resume_date(tmp_path) -> None:
 def test_auto_pause_from_probe_and_resume(tmp_path) -> None:
     state_file = tmp_path / "pause.json"
     settings = Settings(
+        _env_file=None,
         KWORK_PAUSE_ENABLED=True,
         KWORK_PAUSE_AUTO=True,
+        KWORK_PAUSE_UNTIL="",
         KWORK_PAUSE_TIMEZONE="Europe/Moscow",
         KWORK_PAUSE_STATE_FILE=str(state_file),
         KWORK_PAUSE_CHECK_INTERVAL_HOURS=1,
@@ -76,15 +99,45 @@ def test_auto_pause_from_probe_and_resume(tmp_path) -> None:
         KworkPauseState(
             paused=True,
             paused_until=date(2026, 7, 7),
-            checked_at=datetime.now(timezone.utc),
+            checked_at=datetime.now(UTC),
         ),
         settings,
+    )
+    assert is_kwork_paused(settings) is True
+    apply_connects_probe_result(
+        limit_exhausted=False,
+        page_text="У вас 5 коннектов",
+        connects_available_confirmed=True,
+        settings=settings,
     )
     assert is_kwork_paused(settings) is False
     assert load_pause_state(settings) is None
 
 
 def test_probe_clears_pause_when_connects_available(tmp_path) -> None:
+    state_file = tmp_path / "pause.json"
+    settings = Settings(
+        _env_file=None,
+        KWORK_PAUSE_ENABLED=True,
+        KWORK_PAUSE_AUTO=True,
+        KWORK_PAUSE_UNTIL="",
+        KWORK_PAUSE_STATE_FILE=str(state_file),
+    )
+    save_pause_state(
+        KworkPauseState(paused=True, paused_until=date(2026, 7, 10)),
+        settings,
+    )
+    apply_connects_probe_result(
+        limit_exhausted=False,
+        page_text="У вас 5 коннектов",
+        connects_available_confirmed=True,
+        settings=settings,
+    )
+    assert load_pause_state(settings) is None
+    assert is_kwork_paused(settings) is False
+
+
+def test_probe_keeps_pause_without_connects_confirmation(tmp_path) -> None:
     state_file = tmp_path / "pause.json"
     settings = Settings(
         KWORK_PAUSE_ENABLED=True,
@@ -95,9 +148,51 @@ def test_probe_clears_pause_when_connects_available(tmp_path) -> None:
         KworkPauseState(paused=True, paused_until=date(2026, 7, 10)),
         settings,
     )
-    apply_connects_probe_result(limit_exhausted=False, settings=settings)
-    assert load_pause_state(settings) is None
+    result = apply_connects_probe_result(
+        limit_exhausted=False,
+        confident=True,
+        connects_available_confirmed=False,
+        settings=settings,
+    )
+    assert result["unchanged"] is True
+    assert result["reason"] == "paused_without_connects_confirmation"
+    assert is_kwork_paused(settings) is True
+
+
+def test_manual_pause_not_active_after_resume_date(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "pause.json"
+    settings = Settings(
+        KWORK_PAUSE_ENABLED=True,
+        KWORK_PAUSE_AUTO=False,
+        KWORK_PAUSE_UNTIL="2026-07-10",
+        KWORK_PAUSE_TIMEZONE="Europe/Moscow",
+        KWORK_PAUSE_STATE_FILE=str(state_file),
+    )
+    monkeypatch.setattr(
+        "app.services.kwork_pause._local_today",
+        lambda _settings: date(2026, 7, 11),
+    )
     assert is_kwork_paused(settings) is False
+
+
+def test_manual_pause_active_on_day_before_resume(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_file = tmp_path / "pause.json"
+    settings = Settings(
+        KWORK_PAUSE_ENABLED=True,
+        KWORK_PAUSE_AUTO=False,
+        KWORK_PAUSE_UNTIL="2026-07-10",
+        KWORK_PAUSE_TIMEZONE="Europe/Moscow",
+        KWORK_PAUSE_STATE_FILE=str(state_file),
+    )
+    monkeypatch.setattr(
+        "app.services.kwork_pause._local_today",
+        lambda _settings: date(2026, 7, 9),
+    )
+    assert is_kwork_paused(settings) is True
 
 
 def test_kwork_pause_disabled(tmp_path) -> None:
