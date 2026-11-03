@@ -22,7 +22,8 @@ class BaseScraper(ABC):
     async def _launch_browser(self) -> tuple[Any, Browser, Page]:
         playwright = await async_playwright().start()
         browser = await playwright.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context()
+        page = await context.new_page()
         return playwright, browser, page
 
     async def _close_browser(self, playwright: Any, browser: Browser) -> None:

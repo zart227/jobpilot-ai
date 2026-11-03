@@ -1,5 +1,7 @@
 # Автономный прогон remediation (без участия владельца)
 
+> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+
 Одна команда для всего, что можно проверить локально **без** реального Kwork UI:
 
 ```bash
@@ -16,7 +18,7 @@ make autonomous
 | Шаг | Содержание |
 | --- | ---------- |
 | Ruff | `ruff check app tests scripts` |
-| Checklist gate | `REMEDIATION_MAX_OPEN=0`, 115/115 |
+| Checklist gate | `REMEDIATION_MAX_OPEN=0` — сейчас release blocked |
 | Unit verify | `remediation_verify.sh` (без integration в shell) |
 | Integration DB | `bootstrap_integration_db.sh` → `jobpilot_ai_test` на compose **5434**, Redis DB **2–3** |
 | Full pytest | `176` тестов с `JOBPILOT_INTEGRATION_TESTS=1` |
@@ -36,4 +38,4 @@ make autonomous
 
 ## После прогона (14.10.2026)
 
-Лог: `make autonomous` exit 0 · pytest **176 passed** · checklist **0 open** · signoff OK (dry-run).
+Лог: `make autonomous` exit 0 · pytest **176 passed** · прежний checklist **0 open** был отменён повторным аудитом; dry-run signoff не подтверждает live.

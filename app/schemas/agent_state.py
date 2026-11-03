@@ -16,8 +16,15 @@ class JobData(TypedDict, total=False):
     deadline: str | None
     url: str | None
     client_name: str | None
+    client_id: str | None
     client_rating: float | None
     client_reviews: int
+    client_projects_posted: int | None
+    client_hire_percent: int | None
+    client_stats_source: str | None
+    client_evidence_revision: str | None
+    listing_revision: str | None
+    opportunity_assessment: dict | None
 
 
 class JobPilotState(TypedDict, total=False):
@@ -28,6 +35,7 @@ class JobPilotState(TypedDict, total=False):
     proposal_id: str
     is_relevant: bool
     relevance_reason: str
+    opportunity_assessment: dict
     score: int
     score_breakdown: dict[str, float]
     proposal_content: str

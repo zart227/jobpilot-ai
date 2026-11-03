@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import re
 from typing import Any
@@ -40,8 +41,15 @@ class QdrantMemoryStore:
         slug = re.sub(r"[^a-zA-Z0-9_]+", "_", self._settings.embedding_model)
         return slug.strip("_") or "default"
 
+    def _provider_slug(self) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9_]+", "_", self._settings.embedding_provider)
+        return slug.strip("_") or "default"
+
     def _collection_name(self, name: str) -> str:
-        return f"{self._prefix}_{name}_{self._model_slug()}"
+        return (
+            f"{self._prefix}_{name}_{self._provider_slug()}_"
+            f"{self._model_slug()}_d{self._vector_dim}"
+        )
 
     def _ensure_collections(self) -> None:
         existing = {c.name for c in self._client.get_collections().collections}
@@ -75,12 +83,12 @@ class QdrantMemoryStore:
         proposal_id: str,
         content: str,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         try:
             vector = await self._embed(content)
         except EmbeddingUnavailableError as exc:
             logger.warning("Skipping successful proposal embedding", error=str(exc))
-            return
+            return False
         point = PointStruct(
             id=self._point_id(proposal_id),
             vector=vector,
@@ -92,17 +100,23 @@ class QdrantMemoryStore:
                 **(metadata or {}),
             },
         )
-        self._client.upsert(
-            collection_name=self._collection_name("successful_proposals"),
-            points=[point],
-        )
+        try:
+            await asyncio.to_thread(
+                self._client.upsert,
+                collection_name=self._collection_name("successful_proposals"),
+                points=[point],
+            )
+        except Exception as exc:
+            logger.warning("Successful proposal upsert failed", error=str(exc))
+            return False
+        return True
 
-    async def store_pricing_phrase(self, phrase: str, score: float) -> None:
+    async def store_pricing_phrase(self, phrase: str, score: float) -> bool:
         try:
             vector = await self._embed(phrase)
         except EmbeddingUnavailableError as exc:
             logger.warning("Skipping phrase embedding", error=str(exc))
-            return
+            return False
         point_id = int(hashlib.md5(phrase.encode()).hexdigest()[:8], 16)
         point = PointStruct(
             id=point_id,
@@ -114,17 +128,23 @@ class QdrantMemoryStore:
                 "embedding_model": self._settings.embedding_model,
             },
         )
-        self._client.upsert(
-            collection_name=self._collection_name("high_conversion_phrases"),
-            points=[point],
-        )
+        try:
+            await asyncio.to_thread(
+                self._client.upsert,
+                collection_name=self._collection_name("high_conversion_phrases"),
+                points=[point],
+            )
+        except Exception as exc:
+            logger.warning("Phrase upsert failed", error=str(exc))
+            return False
+        return True
 
-    async def store_job_embedding(self, job_id: str, job_text: str, metadata: dict[str, Any]) -> None:
+    async def store_job_embedding(self, job_id: str, job_text: str, metadata: dict[str, Any]) -> bool:
         try:
             vector = await self._embed(job_text)
         except EmbeddingUnavailableError as exc:
             logger.warning("Skipping job embedding", error=str(exc))
-            return
+            return False
         point = PointStruct(
             id=self._point_id(job_id),
             vector=vector,
@@ -135,10 +155,12 @@ class QdrantMemoryStore:
                 **metadata,
             },
         )
-        self._client.upsert(
+        await asyncio.to_thread(
+            self._client.upsert,
             collection_name=self._collection_name("job_embeddings"),
             points=[point],
         )
+        return True
 
     def _vector_search(
         self,
@@ -169,7 +191,8 @@ class QdrantMemoryStore:
         except EmbeddingUnavailableError as exc:
             logger.warning("Semantic proposal search disabled", error=str(exc))
             return []
-        results = self._vector_search(
+        results = await asyncio.to_thread(
+            self._vector_search,
             self._collection_name("successful_proposals"),
             vector,
             limit,
@@ -182,7 +205,8 @@ class QdrantMemoryStore:
         except EmbeddingUnavailableError as exc:
             logger.warning("Semantic phrase search disabled", error=str(exc))
             return []
-        results = self._vector_search(
+        results = await asyncio.to_thread(
+            self._vector_search,
             self._collection_name("high_conversion_phrases"),
             vector,
             limit,
@@ -195,13 +219,13 @@ class QdrantMemoryStore:
         original_content: str,
         edited_content: str,
         metadata: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         key = f"{instruction}:{original_content[:120]}:{edited_content[:120]}"
         try:
             vector = await self._embed(f"{instruction}\n{original_content[:300]}")
         except EmbeddingUnavailableError as exc:
             logger.warning("Skipping edit preference embedding", error=str(exc))
-            return
+            return False
         point = PointStruct(
             id=self._point_id(key),
             vector=vector,
@@ -214,10 +238,16 @@ class QdrantMemoryStore:
                 **(metadata or {}),
             },
         )
-        self._client.upsert(
-            collection_name=self._collection_name("edit_preferences"),
-            points=[point],
-        )
+        try:
+            await asyncio.to_thread(
+                self._client.upsert,
+                collection_name=self._collection_name("edit_preferences"),
+                points=[point],
+            )
+        except Exception as exc:
+            logger.warning("Edit preference upsert failed", error=str(exc))
+            return False
+        return True
 
     async def search_edit_preferences(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
@@ -225,7 +255,8 @@ class QdrantMemoryStore:
         except EmbeddingUnavailableError as exc:
             logger.warning("Semantic edit preference search disabled", error=str(exc))
             return []
-        results = self._vector_search(
+        results = await asyncio.to_thread(
+            self._vector_search,
             self._collection_name("edit_preferences"),
             vector,
             limit,
@@ -243,7 +274,8 @@ class QdrantMemoryStore:
             query_filter = Filter(
                 must=[FieldCondition(key="platform", match=MatchValue(value=platform))]
             )
-        results = self._vector_search(
+        results = await asyncio.to_thread(
+            self._vector_search,
             self._collection_name("job_embeddings"),
             vector,
             limit,

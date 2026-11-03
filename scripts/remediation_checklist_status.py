@@ -1,46 +1,36 @@
 #!/usr/bin/env python3
-"""Report open remediation checklist items (expect only live Kwork until owner signs off)."""
+"""Release gate: open criteria block release; do not require dishonest closure in tests."""
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKLIST = ROOT / "docs" / "remediation-checklists.md"
-MAX_ALLOWED_OPEN = int(__import__("os").environ.get("REMEDIATION_MAX_OPEN", "0"))
 
 
 def main() -> int:
     text = CHECKLIST.read_text(encoding="utf-8")
-    open_items: list[str] = []
-    for line in text.splitlines():
-        if line.startswith("- [ ]"):
-            open_items.append(line.removeprefix("- [ ] ").strip())
-
+    open_items = [line[6:].strip() for line in text.splitlines() if line.startswith("- [ ]")]
     closed = len(re.findall(r"^- \[x\]", text, re.MULTILINE))
     print(f"remediation-checklists: {closed} closed, {len(open_items)} open")
     for item in open_items:
-        print(f"  OPEN: {item[:120]}{'...' if len(item) > 120 else ''}")
-
-    if len(open_items) > MAX_ALLOWED_OPEN:
+        print(f"  OPEN: {item[:120]}")
+    maximum = int(os.environ.get("REMEDIATION_MAX_OPEN", "0"))
+    if len(open_items) > maximum:
         print(
-            f"\nUnexpected: more than {MAX_ALLOWED_OPEN} open items "
-            "(expected only live Kwork acceptance).",
-            file=sys.stderr,
+            f"Release blocked: {len(open_items)} open criteria, allowed {maximum}.", file=sys.stderr
         )
         return 1
-    if open_items and not all(
-        "Kwork" in item or "live" in item.lower() or "разрешение" in item.lower()
-        for item in open_items
-    ):
-        print("\nOpen items should be live Kwork only.", file=sys.stderr)
-        return 1
-    if not open_items and MAX_ALLOWED_OPEN > 0:
-        print("Checklist gate OK (fully closed).")
-        return 0
-    print("Checklist gate OK.")
+    if open_items:
+        print(
+            "Checklist gate threshold satisfied; open criteria remain, this is not release approval."
+        )
+    else:
+        print("Checklist gate OK; separate runtime/live evidence is still required.")
     return 0
 
 

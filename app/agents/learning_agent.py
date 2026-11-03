@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections import Counter
 
@@ -10,7 +11,7 @@ from app.db.session import AsyncSessionLocal
 from app.llm.provider import get_simple_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.agent_state import JobPilotState
-from app.schemas.llm_outputs import is_validation_error, parse_learning_output
+from app.schemas.llm_outputs import parse_learning_output
 from app.services.reward_constants import REWARD_MAP
 from app.services.scoring_weights_validation import validate_scoring_weights
 
@@ -35,7 +36,7 @@ class LearningAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._llm = get_simple_llm_provider()
-        self._memory = get_memory_store()
+        self._memory = None
 
     async def run(self, state: JobPilotState) -> dict:
         outcome_status = state.get("outcome_status", "sent")
@@ -56,7 +57,10 @@ Analyze patterns and suggest weight adjustments."""
             response = await self._llm.complete(SYSTEM_PROMPT, user_prompt, temperature=0.3)
             parsed = parse_learning_output(response)
             await self._persist_weights(parsed.weights)
-            await self._store_success_patterns(state, outcome_status)
+            try:
+                await self._store_success_patterns(state, outcome_status)
+            except Exception as exc:
+                logger.warning("LearningAgent memory update deferred", error=str(exc))
 
             payload = {
                 "weights": parsed.weights,
@@ -70,11 +74,12 @@ Analyze patterns and suggest weight adjustments."""
             }
         except Exception as exc:
             logger.error("LearningAgent failed", error=str(exc))
+            from app.services.pipeline_processing_errors import pipeline_error_from_exception
+
             return {
                 "reward": reward,
                 "learning_notes": str(exc),
-                "error": str(exc),
-                "pipeline_processing_error": is_validation_error(exc),
+                **pipeline_error_from_exception(exc, stage="learning"),
             }
 
     async def _gather_stats(self) -> dict:
@@ -136,22 +141,54 @@ Analyze patterns and suggest weight adjustments."""
         proposal_id = str(state.get("proposal_id", "") or "")
         version = state.get("proposal_version", "")
         job = state.get("job_data", {})
-        if proposal and proposal_id:
-            memory_key = f"{proposal_id}:{outcome}:{version}"
-            await self._memory.store_successful_proposal(
+        if not proposal or not proposal_id:
+            return
+        from app.services.memory_index_queue import (
+            KIND_PRICING_PHRASE,
+            KIND_SUCCESSFUL_PROPOSAL,
+            enqueue_memory_index,
+        )
+
+        memory = self._memory
+        if memory is None:
+            try:
+                memory = await asyncio.to_thread(get_memory_store)
+                self._memory = memory
+            except Exception as exc:
+                logger.warning("LearningAgent memory unavailable; queueing patterns", error=str(exc))
+                memory = None
+
+        memory_key = f"{proposal_id}:{outcome}:{version}"
+        metadata = {
+            "outcome": outcome,
+            "platform": job.get("platform"),
+            "proposal_id": proposal_id,
+            "proposal_version": version,
+        }
+        stored = False
+        if memory is not None:
+            stored = await memory.store_successful_proposal(memory_key, proposal, metadata)
+        if not stored:
+            await enqueue_memory_index(
+                KIND_SUCCESSFUL_PROPOSAL,
                 memory_key,
-                proposal,
-                {
-                    "outcome": outcome,
-                    "platform": job.get("platform"),
-                    "proposal_id": proposal_id,
-                    "proposal_version": version,
-                },
+                {"memory_key": memory_key, "content": proposal, "metadata": metadata},
             )
-            for sentence in proposal.split(".")[:3]:
-                phrase = sentence.strip()
-                if len(phrase) > 20:
-                    await self._memory.store_pricing_phrase(phrase, 0.8 if outcome == "hired" else 0.5)
+        for sentence in proposal.split(".")[:3]:
+            phrase = sentence.strip()
+            if len(phrase) <= 20:
+                continue
+            score = 0.8 if outcome == "hired" else 0.5
+            phrase_key = f"phrase:{phrase[:200]}"
+            phrase_stored = False
+            if memory is not None:
+                phrase_stored = await memory.store_pricing_phrase(phrase, score)
+            if not phrase_stored:
+                await enqueue_memory_index(
+                    KIND_PRICING_PHRASE,
+                    phrase_key,
+                    {"phrase": phrase, "score": score},
+                )
 
 async def learning_node(state: JobPilotState) -> dict:
     agent = LearningAgent()

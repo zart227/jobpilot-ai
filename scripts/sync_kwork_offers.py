@@ -26,6 +26,7 @@ from app.services.kwork_browser import (
     login,
 )
 from app.utils.proxy import get_proxy_candidates, mask_proxy
+from app.utils.storage_state import save_browser_storage_state
 
 OFFERS_URLS = (
     "https://kwork.ru/manage_orders?tab=offers",
@@ -60,8 +61,7 @@ async def refresh_session(page, output: Path) -> bool:
     if not logged_in or await _is_access_blocked(page):
         return False
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    await page.context.storage_state(path=str(output))
+    await save_browser_storage_state(page.context, output)
     return True
 
 

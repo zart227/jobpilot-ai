@@ -1,6 +1,8 @@
 # Live Kwork — один лист для владельца
 
-[remediation-checklists.md](remediation-checklists.md): **115/115** (dry-run signoff уже в журнале). Ниже — **опциональная** проверка в UI Kwork перед продом; backlog: [remediation-progress.md § Остаток работ](remediation-progress.md#остаток-работ-честная-сводка).
+> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+
+[remediation-checklists.md](remediation-checklists.md): **44/115 подтверждено; 71 открыт** (dry-run signoff уже в журнале). Ниже — **отдельная** проверка в UI Kwork перед продом; backlog: [remediation-progress.md § Остаток работ](remediation-progress.md).
 
 ## До отправки
 
@@ -21,7 +23,7 @@ python scripts/validate_live_signoff.py
 ./scripts/mark_live_checklist_complete.sh --dry-run   # посмотреть diff
 ./scripts/close_live_kwork_remediation.sh           # journal + [x] + final gate
 # или вручную: mark_live_checklist_complete.sh && REMEDIATION_MAX_OPEN=0 python scripts/remediation_checklist_status.py
-make checklist-report          # ожидается 0 open
+make checklist-report          # ожидается 71 open; release gate nonzero
 ```
 
 ## Что проверить глазами

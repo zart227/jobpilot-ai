@@ -1,15 +1,18 @@
+import asyncio
+
 import structlog
 
 from app.config import get_settings
+from app.llm.errors import LLMErrorKind, LLMServiceError
 from app.llm.provider import get_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.agent_state import JobPilotState
 from app.services.pipeline_llm_ledger import append_stage_log
 from app.utils.formatting import (
-    competitive_offer_price,
     finalize_kwork_proposal,
     format_budget,
     format_offer_price,
+    resolve_kwork_offer_price,
     sanitize_proposal_text,
 )
 
@@ -100,15 +103,19 @@ class ProposalAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._llm = get_llm_provider()
-        self._memory = get_memory_store()
+        self._memory = None
 
     async def run(self, state: JobPilotState) -> dict:
-        job = state.get("job_data", {})
+        job = dict(state.get("job_data", {}))
+        if state.get("opportunity_assessment"):
+            job["opportunity_assessment"] = state["opportunity_assessment"]
         score = state.get("score", 0)
         is_kwork = job.get("platform") == "kwork"
 
         job_context = f"{job.get('title', '')} {job.get('description', '')[:500]}"
         try:
+            if self._memory is None:
+                self._memory = await asyncio.to_thread(get_memory_store)
             similar = await self._memory.search_similar_proposals(job_context)
             phrases = await self._memory.search_phrases(job_context)
         except Exception as exc:
@@ -133,7 +140,7 @@ class ProposalAgent:
 
         edit_pref_hint = ""
         try:
-            edit_prefs = await self._memory.search_edit_preferences(job_context, limit=5)
+            edit_prefs = await self._memory.search_edit_preferences(job_context, limit=5) if self._memory else []
         except Exception as exc:
             logger.warning("ProposalAgent edit preference retrieval skipped", error=str(exc))
             edit_prefs = []
@@ -160,17 +167,27 @@ class ProposalAgent:
 
         offer_price_hint = ""
         if is_kwork:
-            offer = format_offer_price(
+            assessment = job.get("opportunity_assessment") or {}
+            offer_value = resolve_kwork_offer_price(
                 job.get("budget_min"),
                 job.get("budget_max"),
-                job.get("budget_currency", "RUB"),
+                assessment,
                 self._settings.kwork_offer_discount_percent,
+            )
+            offer = (
+                f"{offer_value:,}".replace(",", " ") + " ₽"
+                if type(offer_value) is int
+                else format_offer_price(
+                    job.get("budget_min"),
+                    job.get("budget_max"),
+                    job.get("budget_currency", "RUB"),
+                    self._settings.kwork_offer_discount_percent,
+                )
             )
             if offer:
                 offer_price_hint = (
                     f"\nYOUR OFFER PRICE (quote exactly once): {offer}\n"
-                    f"(Competitive bid {int(self._settings.kwork_offer_discount_percent)}% "
-                    f"below buyer desired budget. Do NOT quote higher. "
+                    f"(Minimum reasonable price for the assessed scope. Do NOT quote higher. "
                     f"Do NOT mention allowable/max cap.)"
                 )
 
@@ -195,6 +212,7 @@ Description: {job.get('description', '')}
 Budget: {budget_label}{offer_price_hint}
 Skills: {', '.join(job.get('skills', []))}
 Deadline: {job.get('deadline', 'Not specified')}
+{('Approved planning limit: complete in at most one calendar day.' if job.get('opportunity_assessment') else '')}
 {examples}{phrase_hint}{edit_pref_hint}
 
 Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this specific job."""
@@ -205,6 +223,8 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
         try:
             response = await self._llm.complete(system_prompt, user_prompt, temperature=temperature)
             parsed = self._parse_response(response)
+            if not parsed["proposal"].strip():
+                raise LLMServiceError(LLMErrorKind.SERVER, "Empty proposal response", retryable=True)
             parsed["proposal"] = self._finalize_proposal(
                 sanitize_proposal_text(parsed["proposal"]),
                 job,
@@ -233,11 +253,13 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
             }
         except Exception as exc:
             logger.error("ProposalAgent failed", error=str(exc))
+            from app.services.pipeline_processing_errors import pipeline_error_from_exception
+
             return {
+                **pipeline_error_from_exception(exc, stage="proposal"),
                 "proposal_content": "",
                 "execution_plan": "",
                 "timeline": "",
-                "error": str(exc),
                 "llm_stage_log": append_stage_log(state, "proposal", "main"),
             }
 
@@ -273,9 +295,10 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
             return text
 
         if job.get("platform") == "kwork":
-            offer = competitive_offer_price(
+            offer = resolve_kwork_offer_price(
                 job.get("budget_min"),
                 job.get("budget_max"),
+                job.get("opportunity_assessment") or {},
                 self._settings.kwork_offer_discount_percent,
             )
             return finalize_kwork_proposal(

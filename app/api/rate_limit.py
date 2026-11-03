@@ -10,6 +10,7 @@ import redis.asyncio as redis
 from fastapi import Request
 from starlette.responses import JSONResponse
 
+from app.api.auth import validated_api_token
 from app.config import Settings, get_settings
 
 if TYPE_CHECKING:
@@ -19,19 +20,25 @@ _PUBLIC_PATHS = frozenset({"/health", "/ready", "/openapi.json", "/docs", "/redo
 
 
 def _client_rate_key(request: Request, settings: Settings) -> str:
-    auth = request.headers.get("authorization") or ""
-    api_key = request.headers.get("x-api-key") or ""
-    if api_key.strip():
-        material = f"key:{api_key.strip()}"
-    elif auth.lower().startswith("bearer "):
-        material = f"bearer:{auth[7:].strip()}"
-    elif settings.api_auth_token.strip():
-        material = "anonymous"
-    else:
-        material = "open"
+    token = validated_api_token(
+        request.headers.get("authorization"),
+        request.headers.get("x-api-key"),
+        settings,
+    )
+    if token is not None:
+        # Authenticated identity is independent of IP and unused request headers.
+        return "identity:" + hashlib.sha256(token.encode()).hexdigest()[:32]
     host = request.client.host if request.client else "unknown"
-    digest = hashlib.sha256(material.encode()).hexdigest()[:16]
-    return f"{host}:{digest}"
+    return "anonymous:" + hashlib.sha256(host.encode()).hexdigest()[:32]
+
+
+_WINDOW_SCRIPT = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 or redis.call('TTL', KEYS[1]) < 0 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
 
 
 async def _check_fixed_window(
@@ -44,9 +51,7 @@ async def _check_fixed_window(
     """Return (allowed, retry_after_seconds)."""
     window_start = int(time.time()) // window_seconds
     key = f"api_rl:{bucket}:{window_start}"
-    count = await client.incr(key)
-    if count == 1:
-        await client.expire(key, window_seconds + 1)
+    count = int(await client.eval(_WINDOW_SCRIPT, 1, key, window_seconds + 1))
     if count <= limit:
         return True, 0
     now = int(time.time())

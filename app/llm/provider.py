@@ -10,6 +10,14 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, PermissionDe
 
 from app.config import Settings, get_settings
 from app.llm.errors import LLMErrorKind, LLMServiceError, classify_llm_error
+from app.llm.model_catalog import (
+    ModelTask,
+    invalidate_ollama_catalog,
+    invalidate_openrouter_catalog,
+    is_auto_model_name,
+    resolve_ollama_model,
+    resolve_openrouter_model,
+)
 from app.llm.ollama_usage import get_ollama_usage
 from app.utils.proxy import (
     build_httpx_async_client,
@@ -157,56 +165,118 @@ class OpenAIProvider(LLMProvider):
 class OpenRouterProvider(LLMProvider):
     """OpenAI-compatible chat API with an optional, non-paid Ollama fallback."""
 
-    def __init__(self, settings: Settings, *, model: str | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        model: str | None = None,
+        task: ModelTask = ModelTask.MAIN,
+    ) -> None:
         if not settings.openrouter_api_key.strip():
             raise ValueError("OPENROUTER_API_KEY is required when using OpenRouter")
         self._settings = settings
         self._model = model or settings.openrouter_model
+        self._task = task
+        self._resolved_model: str | None = None
+
+    async def _resolve_model(self, *, refresh: bool = False) -> str:
+        if refresh:
+            invalidate_openrouter_catalog()
+            self._resolved_model = None
+        if self._resolved_model and not is_auto_model_name(self._model):
+            return self._resolved_model
+        self._resolved_model = await resolve_openrouter_model(
+            self._settings,
+            self._model,
+            task=self._task,
+        )
+        return self._resolved_model
+
+    async def _fallback(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
+        updates: dict[str, Any] = {"ollama_auto_fallback": False}
+        if is_auto_model_name(self._model):
+            updates["ollama_model"] = "auto"
+        fallback_settings = self._settings.model_copy(update=updates)
+        return await OllamaProvider(
+            fallback_settings, task=self._task,
+        ).complete(system_prompt, user_prompt, **kwargs)
 
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         # Free-model limits are shared across proxies; do not rotate on 429.
         proxy = get_proxy_candidates(self._settings, "openrouter")[0]
-        client = AsyncOpenAI(
-            api_key=self._settings.openrouter_api_key,
-            base_url="https://openrouter.ai/api/v1",
-            timeout=self._settings.openrouter_timeout_seconds,
-            max_retries=0,
-            http_client=build_httpx_async_client(
-                proxy=proxy, timeout_seconds=self._settings.openrouter_timeout_seconds,
-            ),
-        )
-        try:
-            response = await client.chat.completions.create(
-                model=self._model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=kwargs.get("temperature", 0.7),
+        last_model_error: APIStatusError | None = None
+        for attempt in range(2):
+            try:
+                model = await self._resolve_model(refresh=attempt > 0)
+            except LLMServiceError as exc:
+                if not exc.retryable or not self._settings.openrouter_fallback_to_ollama:
+                    raise
+                logger.warning("OpenRouter catalog unavailable, falling back to Ollama")
+                return await self._fallback(system_prompt, user_prompt, **kwargs)
+            client = AsyncOpenAI(
+                api_key=self._settings.openrouter_api_key,
+                base_url="https://openrouter.ai/api/v1",
+                timeout=self._settings.openrouter_timeout_seconds,
+                max_retries=0,
+                http_client=build_httpx_async_client(
+                    proxy=proxy, timeout_seconds=self._settings.openrouter_timeout_seconds,
+                ),
             )
-            if not response.choices:
-                raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned no choices", True)
-            choice = response.choices[0]
-            content = choice.message.content
-            if choice.finish_reason == "length" or not content or not content.strip():
-                raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned incomplete text", True)
-            return content
-        except (APIConnectionError, APIStatusError, LLMServiceError) as exc:
-            recoverable = (
-                isinstance(exc, APIConnectionError)
-                or isinstance(exc, APIStatusError)
-                and exc.status_code in {402, 408, 429, 500, 502, 503, 504}
-                or isinstance(exc, LLMServiceError) and exc.retryable
-            )
-            if not recoverable or not self._settings.openrouter_fallback_to_ollama:
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=kwargs.get("temperature", 0.7),
+                )
+                if not response.choices:
+                    raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned no choices", True)
+                choice = response.choices[0]
+                content = choice.message.content
+                if choice.finish_reason == "length" or not content or not content.strip():
+                    raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned incomplete text", True)
+                return content
+            except APIStatusError as exc:
+                if exc.status_code == 404 and attempt == 0 and is_auto_model_name(self._model):
+                    last_model_error = exc
+                    logger.warning(
+                        "OpenRouter auto-selected model unavailable, refreshing catalog",
+                        model=model,
+                    )
+                    continue
+                recoverable = exc.status_code in {402, 408, 429, 500, 502, 503, 504}
+                if recoverable and self._settings.openrouter_fallback_to_ollama:
+                    logger.warning(
+                        "OpenRouter unavailable, falling back to Ollama",
+                        configured_model=self._model,
+                        status_code=exc.status_code,
+                    )
+                    return await self._fallback(system_prompt, user_prompt, **kwargs)
                 raise
-            logger.warning("OpenRouter unavailable, falling back to Ollama", model=self._model)
-            fallback_settings = self._settings.model_copy(update={"ollama_auto_fallback": False})
-            return await OllamaProvider(fallback_settings).complete(
-                system_prompt, user_prompt, **kwargs,
-            )
-        finally:
-            await client.close()
+            except (APIConnectionError, LLMServiceError) as exc:
+                recoverable = (
+                    isinstance(exc, APIConnectionError)
+                    or isinstance(exc, LLMServiceError) and exc.retryable
+                )
+                if not recoverable or not self._settings.openrouter_fallback_to_ollama:
+                    raise
+                logger.warning(
+                    "OpenRouter unavailable, falling back to Ollama",
+                    configured_model=self._model,
+                    resolved_model=model,
+                )
+                return await self._fallback(system_prompt, user_prompt, **kwargs)
+            finally:
+                await client.close()
+        if last_model_error:
+            raise last_model_error
+        raise LLMServiceError(
+            LLMErrorKind.SERVER,
+            "OpenRouter completion failed after model catalog refresh",
+            retryable=False,
+        )
 
     def get_chat_model(self) -> BaseChatModel:
         raise NotImplementedError("OpenRouter provider does not expose a LangChain chat model")
@@ -215,10 +285,32 @@ class OpenRouterProvider(LLMProvider):
 class OllamaProvider(LLMProvider):
     """Ollama chat via official ollama-python SDK (local or https://ollama.com)."""
 
-    def __init__(self, settings: Settings, *, model: str | None = None, fallback_model: str | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        model: str | None = None,
+        fallback_model: str | None = None,
+        task: ModelTask = ModelTask.SIMPLE,
+    ) -> None:
         self._settings = settings
         self._model = model or settings.ollama_model
         self._fallback_model = fallback_model or settings.openai_simple_model
+        self._task = task
+        self._resolved_model: str | None = None
+
+    async def _resolve_model(self, *, refresh: bool = False) -> str:
+        if refresh:
+            invalidate_ollama_catalog()
+            self._resolved_model = None
+        if self._resolved_model and not is_auto_model_name(self._model):
+            return self._resolved_model
+        self._resolved_model = await resolve_ollama_model(
+            self._settings,
+            self._model,
+            task=self._task,
+        )
+        return self._resolved_model
 
     def _client(self, proxy: str | None) -> "AsyncClient":
         from ollama import AsyncClient
@@ -244,6 +336,8 @@ class OllamaProvider(LLMProvider):
         proxy: str | None,
         messages: list[dict[str, str]],
         temperature: float,
+        *,
+        model: str,
     ) -> str:
         from ollama import ResponseError
 
@@ -251,7 +345,7 @@ class OllamaProvider(LLMProvider):
         try:
             response = await asyncio.wait_for(
                 client.chat(
-                    model=self._model,
+                    model=model,
                     messages=messages,
                     options={"temperature": temperature},
                 ),
@@ -262,7 +356,7 @@ class OllamaProvider(LLMProvider):
         except ResponseError as exc:
             logger.error(
                 "Ollama request failed",
-                model=self._model,
+                model=model,
                 status_code=exc.status_code,
                 error=exc.error,
                 proxy=mask_proxy(proxy) if proxy else None,
@@ -274,15 +368,17 @@ class OllamaProvider(LLMProvider):
             await client.close()
 
         content = response.message.content
+        if not isinstance(content, str) or not content.strip() or getattr(response, 'done_reason', None) == 'length':
+            raise LLMServiceError(LLMErrorKind.SERVER, 'Ollama returned empty or truncated text', retryable=True)
         logger.info(
             "Ollama response",
-            model=self._model,
+            model=model,
             proxy=mask_proxy(proxy) if proxy else None,
         )
-        return content if isinstance(content, str) else str(content)
+        return content
 
     def _can_fallback_to_openai(self) -> bool:
-        return bool(self._settings.ollama_auto_fallback and self._settings.openai_api_key)
+        return bool(not is_auto_model_name(self._model) and self._settings.ollama_auto_fallback and self._settings.openai_api_key)
 
     async def _fallback_to_openai(
         self,
@@ -335,34 +431,49 @@ class OllamaProvider(LLMProvider):
         proxies = get_proxy_candidates(self._settings, "ollama")
         last_error: LLMServiceError | None = None
 
-        for proxy in proxies:
-            if proxy:
-                logger.info("Ollama request via proxy", proxy=mask_proxy(proxy))
-            try:
-                return await self._chat_once(proxy, messages, temperature)
-            except LLMServiceError as exc:
-                last_error = exc
-                if exc.kind == LLMErrorKind.QUOTA and self._can_fallback_to_openai():
-                    return await self._fallback_to_openai(
-                        system_prompt,
-                        user_prompt,
-                        reason=exc.message,
-                        **kwargs,
-                    )
-                if proxy and exc.retryable and exc.kind in {
-                    LLMErrorKind.NETWORK,
-                    LLMErrorKind.SERVER,
-                    LLMErrorKind.RATE_LIMIT,
-                }:
-                    logger.warning(
-                        "Ollama proxy failed, rotating",
-                        proxy=mask_proxy(proxy),
-                        kind=exc.kind.value,
-                        error=exc.message,
-                    )
-                    mark_proxy_failed(self._settings, "ollama", proxy)
-                    continue
-                raise
+        for attempt in range(2):
+            model = await self._resolve_model(refresh=attempt > 0)
+            for proxy in proxies:
+                if proxy:
+                    logger.info("Ollama request via proxy", proxy=mask_proxy(proxy))
+                try:
+                    return await self._chat_once(proxy, messages, temperature, model=model)
+                except LLMServiceError as exc:
+                    last_error = exc
+                    if (
+                        attempt == 0
+                        and is_auto_model_name(self._model)
+                        and exc.kind in {LLMErrorKind.SERVER, LLMErrorKind.NETWORK}
+                    ):
+                        logger.warning(
+                            "Ollama auto-selected model failed, refreshing catalog",
+                            model=model,
+                        )
+                        break
+                    if exc.kind == LLMErrorKind.QUOTA and self._can_fallback_to_openai():
+                        return await self._fallback_to_openai(
+                            system_prompt,
+                            user_prompt,
+                            reason=exc.message,
+                            **kwargs,
+                        )
+                    if proxy and exc.retryable and exc.kind in {
+                        LLMErrorKind.NETWORK,
+                        LLMErrorKind.SERVER,
+                        LLMErrorKind.RATE_LIMIT,
+                    }:
+                        logger.warning(
+                            "Ollama proxy failed, rotating",
+                            proxy=mask_proxy(proxy),
+                            kind=exc.kind.value,
+                            error=exc.message,
+                        )
+                        mark_proxy_failed(self._settings, "ollama", proxy)
+                        continue
+                    raise
+            else:
+                continue
+            continue
 
         if last_error:
             if last_error.kind == LLMErrorKind.QUOTA and self._can_fallback_to_openai():
@@ -414,7 +525,7 @@ def _build_provider(
     provider: Literal["openai", "anthropic", "cursor", "ollama", "openrouter"],
 ) -> LLMProvider:
     if provider == "openrouter":
-        return OpenRouterProvider(cfg)
+        return OpenRouterProvider(cfg, task=ModelTask.MAIN)
     if provider == "cursor":
         logger.info("JobPilot AI using Cursor SDK", model=cfg.cursor_model)
         return CursorProvider(cfg)
@@ -439,7 +550,7 @@ def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
     simple = cfg.llm_simple_provider
     if simple == "same":
         return get_llm_provider(cfg)
-    if simple == "ollama" and cfg.ollama_auto_fallback and cfg.openai_api_key:
+    if simple == "ollama" and not is_auto_model_name(cfg.ollama_model) and cfg.ollama_auto_fallback and cfg.openai_api_key:
         from app.llm.ollama_usage import get_ollama_usage_sync
 
         snapshot = get_ollama_usage_sync(cfg)
@@ -452,7 +563,7 @@ def get_simple_llm_provider(settings: Settings | None = None) -> LLMProvider:
             )
             return OpenAIProvider(cfg, model=cfg.openai_simple_model)
     if simple == "openrouter":
-        return OpenRouterProvider(cfg, model=cfg.openrouter_simple_model)
+        return OpenRouterProvider(cfg, model=cfg.openrouter_simple_model, task=ModelTask.SIMPLE)
     if simple == "openai":
         return OpenAIProvider(cfg, model=cfg.openai_simple_model)
     return _build_provider(cfg, simple)
@@ -463,6 +574,6 @@ def get_scoring_llm_provider(settings: Settings | None = None) -> LLMProvider:
     cfg = settings or get_settings()
     if cfg.llm_simple_provider == "ollama":
         return OllamaProvider(
-            cfg, model=cfg.ollama_scoring_model, fallback_model=cfg.openai_model
+            cfg, model=cfg.ollama_scoring_model, fallback_model=cfg.openai_model, task=ModelTask.SCORING
         )
     return get_llm_provider(cfg)

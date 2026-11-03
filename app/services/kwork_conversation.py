@@ -83,6 +83,8 @@ def conversation_from_interactions(
 ) -> list[dict[str, str]]:
     turns: list[dict[str, str]] = []
     for row in interactions:
+        if row.direction == "outbound" and (row.metadata_ or {}).get("dry_run") is True:
+            continue
         text = sanitize_proposal_text(row.message).strip()
         if not text:
             continue

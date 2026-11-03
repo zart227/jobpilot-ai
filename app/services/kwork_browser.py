@@ -12,15 +12,16 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 
 from app.config import get_settings
 from app.services.kwork_pause import (
-    extract_connects_remaining,
+    connects_balance_fields,
+    connects_limit_exhausted,
     extract_connects_replenish_text,
     record_connects_limit_detected,
 )
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
-    competitive_offer_price,
     extract_site_order_id,
 )
+from app.utils.storage_state import save_browser_storage_state
 
 logger = structlog.get_logger(__name__)
 
@@ -30,12 +31,15 @@ BLOCKED_TITLE = "Доступ заблокирован"
 DEBUG_SCREENSHOT_DIR = Path("data/kwork_debug")
 _kwork_send_lock = asyncio.Lock()
 
-KWORK_ORDER_CLOSED_ERROR = (
-    "Заказ закрыт на Kwork — исполнитель уже выбран, отклики не принимаются"
-)
+KWORK_ORDER_CLOSED_ERROR = "Заказ закрыт на Kwork — исполнитель уже выбран, отклики не принимаются"
 KWORK_CONNECTS_LIMIT_ERROR = (
     "Исчерпан лимит коннектов на Kwork — новые отклики на Бирже недоступны "
     "до ежемесячного пополнения"
+)
+UNAPPROVED_OPTIONAL_CONTROLS = (
+    '[name="payment_type"], [name="paymentType"], [name="title"], [name="kwork_title"], '
+    'input[name="name"], textarea[name="name"], .offer-payment-type__item, '
+    '.trumbowyg-editor[placeholder*="название"]'
 )
 
 
@@ -68,28 +72,69 @@ def is_kwork_connects_limit_error(error: str | None) -> bool:
     )
 
 
-def _connects_limit_exhausted(body: str) -> bool:
-    lowered = body.lower()
-    if "лимит коннект" in lowered or "исчерпали лимит коннект" in lowered:
-        return True
-    remaining = extract_connects_remaining(body)
-    return remaining is not None and remaining == 0
-
-
 CONNECTS_BALANCE_RE = re.compile(r"(\d+)\s*коннект", re.IGNORECASE)
 
 
 def _connects_balance_available(body: str) -> bool:
-    """True when page shows positive connects balance and no limit/replenish message."""
-    if _connects_limit_exhausted(body) or extract_connects_replenish_text(body):
+    """True when page shows positive connects balance."""
+    if connects_limit_exhausted(body):
         return False
-    remaining = extract_connects_remaining(body)
+    fields = connects_balance_fields(body)
+    remaining = fields.get("connects_remaining")
     if remaining is not None:
         return remaining > 0
     match = CONNECTS_BALANCE_RE.search(body)
     if match:
         return int(match.group(1)) > 0
     return False
+
+
+async def _read_connects_balance_from_page(page: Page) -> dict[str, int]:
+    texts = await _visible_page_texts(page)
+    fields = connects_balance_fields(texts)
+    if fields:
+        return fields
+
+    settings = get_settings()
+    listing_url = settings.kwork_category_url or "https://kwork.ru/projects?a=1"
+    try:
+        await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+    except Exception:
+        return {}
+    return connects_balance_fields(await _visible_page_texts(page))
+
+
+async def _attach_connects_balance_to_debug(
+    page: Page,
+    debug: dict[str, Any] | None,
+) -> dict[str, Any]:
+    enriched = dict(debug or {})
+    enriched.update(await _read_connects_balance_from_page(page))
+    return enriched
+
+
+async def _offer_submit_success(
+    page: Page,
+    *,
+    job_url: str,
+    content: str,
+    content_file: str | None,
+    steps: list[str],
+    offer_price: int | None,
+) -> tuple[bool, None, dict[str, Any]]:
+    debug = await _attach_connects_balance_to_debug(
+        page,
+        {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps,
+            "offer_action": "created",
+            "offer_price": offer_price,
+        },
+    )
+    return True, None, debug
 
 
 def _order_closed_in_body(body: str) -> bool:
@@ -110,6 +155,8 @@ def _order_closed_in_body(body: str) -> bool:
 
 def _propose_offer_locators(page: Page):
     return (
+        page.get_by_text("Предложить услугу", exact=True),
+        page.locator('text=Предложить услугу'),
         page.locator('.js-link-resume-error:has-text("Предложить услугу")'),
         page.locator('span.kw-button:has-text("Предложить услугу")'),
         page.get_by_role("button", name="Предложить услугу"),
@@ -131,7 +178,7 @@ async def _visible_page_texts(page: Page) -> str:
 
 
 async def _detect_connects_limit_on_page(page: Page) -> bool:
-    if _connects_limit_exhausted(await _visible_page_texts(page)):
+    if connects_limit_exhausted(await _visible_page_texts(page)):
         return True
 
     for locator in _propose_offer_locators(page):
@@ -145,7 +192,7 @@ async def _detect_connects_limit_on_page(page: Page) -> bool:
             await page.wait_for_timeout(600)
         except Exception:
             pass
-        if _connects_limit_exhausted(await _visible_page_texts(page)):
+        if connects_limit_exhausted(await _visible_page_texts(page)):
             return True
         break
     return False
@@ -173,34 +220,43 @@ async def launch_browser(*, proxy: str | None = None) -> tuple[Playwright, Brows
         "headless": True,
         "args": ["--disable-blink-features=AutomationControlled"],
     }
-    browser = await playwright.chromium.launch(**launch_kwargs)
-    context_kwargs: dict[str, Any] = {
-        "viewport": DESKTOP_VIEWPORT,
-        "locale": "ru-RU",
-        "user_agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-    }
-    if proxy:
-        from urllib.parse import urlparse
+    browser = None
+    try:
+        browser = await playwright.chromium.launch(**launch_kwargs)
+        context_kwargs: dict[str, Any] = {
+            "viewport": DESKTOP_VIEWPORT,
+            "locale": "ru-RU",
+            "user_agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        if proxy:
+            from urllib.parse import urlparse
 
-        parsed = urlparse(proxy)
-        proxy_config: dict[str, str] = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-        if parsed.username:
-            proxy_config["username"] = parsed.username
-        if parsed.password:
-            proxy_config["password"] = parsed.password
-        context_kwargs["proxy"] = proxy_config
-        logger.info("Kwork browser using proxy", proxy_host=parsed.hostname)
-    storage_state = settings.kwork_storage_state.strip()
-    if storage_state and Path(storage_state).is_file():
-        context_kwargs["storage_state"] = storage_state
-        logger.info("Kwork browser using saved storage state", path=storage_state)
+            parsed = urlparse(proxy)
+            proxy_config: dict[str, str] = {
+                "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+            }
+            if parsed.username:
+                proxy_config["username"] = parsed.username
+            if parsed.password:
+                proxy_config["password"] = parsed.password
+            context_kwargs["proxy"] = proxy_config
+            logger.info("Kwork browser using proxy", proxy_host=parsed.hostname)
+        storage_state = settings.kwork_storage_state.strip()
+        if storage_state and Path(storage_state).is_file():
+            context_kwargs["storage_state"] = storage_state
+            logger.info("Kwork browser using saved storage state", path=storage_state)
 
-    context: BrowserContext = await browser.new_context(**context_kwargs)
-    page = await context.new_page()
-    return playwright, browser, page
+        context: BrowserContext = await browser.new_context(**context_kwargs)
+        page = await context.new_page()
+        return playwright, browser, page
+    except BaseException:
+        if browser is not None:
+            await browser.close()
+        await playwright.stop()
+        raise
 
 
 async def close_browser(playwright: Playwright, browser: Browser) -> None:
@@ -241,9 +297,7 @@ async def _has_active_session(page: Page) -> bool:
     storage_state = settings.kwork_storage_state.strip()
     has_saved_session = bool(storage_state and Path(storage_state).is_file())
     url, timeout_ms = (
-        ("https://kwork.ru/", 30000)
-        if has_saved_session
-        else ("https://kwork.ru/seller", 60000)
+        ("https://kwork.ru/", 30000) if has_saved_session else ("https://kwork.ru/seller", 60000)
     )
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -346,23 +400,32 @@ def _normalize_project_url(job_url: str) -> str:
     return url
 
 
-
-async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str) -> None:
+async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str, *, require_visible: bool = True) -> None:
     editor = page.locator(f'.trumbowyg-editor[placeholder*="{placeholder_part}"]')
-    await editor.first.wait_for(state="visible", timeout=30000)
-    await editor.first.click(force=True)
-    await editor.first.fill(value)
-    field_name = await page.evaluate(
-        """(part) => {
-            const editor = [...document.querySelectorAll(".trumbowyg-editor")]
-                .find((el) => (el.getAttribute("placeholder") || "").includes(part));
-            const textarea = editor?.closest(".trumbowyg-box")?.querySelector("textarea");
-            return textarea?.getAttribute("name") || "";
-        }""",
-        placeholder_part,
+    if await editor.count() != 1:
+        raise RuntimeError("Редактор формы отсутствует или неоднозначен")
+    await editor.wait_for(state="visible" if require_visible else "attached", timeout=30000)
+    await editor.click(force=True)
+    await editor.fill(value)
+    # Playwright keyboard fill cannot reliably focus a hidden Trumbowyg textarea.
+    # Set its native value and publish the events consumed by reactive forms.
+    await editor.evaluate(
+        """(editor, value) => {
+        const fields = editor.closest('.trumbowyg-box')?.querySelectorAll('textarea');
+        if (!fields || fields.length !== 1) throw new Error('Ambiguous editor textarea');
+        const textarea = fields[0];
+        // Native contenteditable filling can introduce <div>/<br> line breaks.
+        // Keep the plain-text DOM and backing value identical to the approval.
+        editor.textContent = value;
+        editor.dispatchEvent(new Event('input', {bubbles: true}));
+        editor.dispatchEvent(new Event('change', {bubbles: true}));
+        const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(textarea, value);
+        textarea.dispatchEvent(new Event('input', {bubbles: true}));
+        textarea.dispatchEvent(new Event('change', {bubbles: true}));
+    }""",
+        value,
     )
-    if field_name:
-        await page.locator(f'textarea[name="{field_name}"]').fill(value, force=True)
 
 
 async def _fill_price_input(page: Page, price: int) -> tuple[bool, str | None]:
@@ -585,7 +648,7 @@ async def _collect_visible_form_errors(page: Page) -> list[str]:
         if text.strip() and len(text.strip()) < 200
     ]
     body = (await page.inner_text("body")).lower()
-    if _connects_limit_exhausted(body) and not any(
+    if connects_limit_exhausted(body) and not any(
         is_kwork_connects_limit_error(error) for error in errors
     ):
         errors.append(KWORK_CONNECTS_LIMIT_ERROR)
@@ -831,13 +894,25 @@ async def _open_edit_offer_form(
 
 
 async def _click_submit_offer_button(page: Page) -> str | None:
+    description = page.locator('textarea[name="description"]')
+    if await description.count() != 1:
+        return None
+    form = description.locator('xpath=ancestor::form[1]')
+    if await form.count() != 1:
+        return None
+    candidates = []
     for label in ("Предложить", "Сохранить", "Сохранить изменения", "Отправить"):
-        button = page.get_by_role("button", name=label)
-        if await button.count() > 0:
-            await button.first.scroll_into_view_if_needed()
-            await button.first.click(force=True)
-            return label
-    return None
+        button = form.get_by_role("button", name=label, exact=True)
+        for index in range(await button.count()):
+            candidates.append((label, button.nth(index)))
+    if len(candidates) != 1:
+        return None
+    label, button = candidates[0]
+    if not await button.is_visible() or not await button.is_enabled():
+        return None
+    await button.scroll_into_view_if_needed()
+    await button.click()
+    return label
 
 
 async def _edit_existing_offer(
@@ -852,88 +927,10 @@ async def _edit_existing_offer(
     content_file: str | None,
     offer_price: int | None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
-    if not await _open_edit_offer_form(page, project_id, job_url, steps):
-        return False, (
-            "Отклик на Kwork уже существует, но форма редактирования недоступна. "
-            "Обновите текст вручную на странице заказа."
-        ), {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps + ["форма редактирования не найдена"],
-            "error_label": "edit_form_unavailable",
-            "offer_price": offer_price,
-        }
-
-    steps.append("заполнение формы редактирования")
-    try:
-        await _fill_offer_form(page, content, budget_min, budget_max)
-    except Exception as exc:
-        return await _fail_offer(
-            page,
-            "edit_form_fill_error",
-            f"Не удалось заполнить форму редактирования: {exc}",
-            url=page.url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-            offer_price=offer_price,
-        )
-
-    await _save_debug_screenshot(page, f"before_edit_submit_{project_id}")
-    steps.append("форма редактирования заполнена")
-
-    clicked = await _click_submit_offer_button(page)
-    if not clicked:
-        return await _fail_offer(
-            page,
-            "edit_submit_missing",
-            "Кнопка сохранения отклика не найдена на форме редактирования",
-            url=page.url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-            offer_price=offer_price,
-        )
-
-    steps.append(f"нажата кнопка «{clicked}»")
-    await page.wait_for_timeout(5000)
-    steps.append(f"ожидание ответа после редактирования, URL: {page.url}")
-
-    if await _verify_offer_on_project_page(page, project_id):
-        logger.info("Kwork offer updated on project page", project_id=project_id)
-        return True, None, {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps,
-            "offer_action": "updated",
-            "offer_price": offer_price,
-        }
-
-    errors = await _collect_visible_form_errors(page)
-    if errors:
-        return await _fail_offer(
-            page,
-            "edit_validation_error",
-            errors[0],
-            url=page.url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-            errors=errors,
-            offer_price=offer_price,
-        )
-
-    return await _fail_offer(
-        page,
-        "edit_unverified",
-        "Не удалось подтвердить обновление отклика на Kwork",
-        url=page.url,
-        job_url=job_url,
-        content=content,
-        steps=steps,
-        offer_price=offer_price,
+    return (
+        False,
+        "Редактирование требует отдельного approval flow",
+        {"error_label": "edit_requires_approval"},
     )
 
 
@@ -1027,9 +1024,7 @@ async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
     if info.get("blocked"):
         return False, "Аккаунт продавца заблокирован на Kwork"
 
-    is_active_seller = (
-        info.get("is_seller") == "1" or info.get("kwork_allow_status") == "allow"
-    )
+    is_active_seller = info.get("is_seller") == "1" or info.get("kwork_allow_status") == "allow"
     if is_active_seller:
         return True, None
 
@@ -1043,8 +1038,7 @@ async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
         return True, None
 
     onboarding_required = (
-        info.get("has_seller_onboarding_step") is True
-        or info.get("needs_onboarding_popup") is True
+        info.get("has_seller_onboarding_step") is True or info.get("needs_onboarding_popup") is True
     )
     if info.get("confirmed") is False and onboarding_required:
         logger.error(
@@ -1052,9 +1046,7 @@ async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
             username=info.get("username"),
             has_seller_onboarding_step=info.get("has_seller_onboarding_step"),
         )
-        return False, (
-            "Профиль продавца не подтверждён — пройдите онбординг на kwork.ru/seller"
-        )
+        return False, ("Профиль продавца не подтверждён — пройдите онбординг на kwork.ru/seller")
 
     if info.get("confirmed") is False:
         logger.warning(
@@ -1065,69 +1057,112 @@ async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
     return True, None
 
 
+def validate_approved_submission(
+    content: str, offer_price: int | None, duration_days: int | None
+) -> None:
+    if not 150 <= len(content) <= KWORK_MAX_OFFER_CHARS:
+        raise ValueError("Одобренный текст должен содержать от150 до2000 символов")
+    if type(offer_price) is not int or offer_price < 500:
+        raise ValueError("Не задана одобренная цена")
+    if type(duration_days) is not int or duration_days <= 0:
+        raise ValueError("Не задан одобренный срок")
+
+
+async def _verify_approved_form(
+    page: Page, content: str, offer_price: int, duration_days: int
+) -> None:
+    actual = await page.evaluate(
+        """({expectedContent, offerPrice}) => {
+        if (document.querySelector('[name="payment_type"], [name="paymentType"], [name="title"], [name="kwork_title"], input[name="name"], textarea[name="name"], .offer-payment-type__item, .trumbowyg-editor[placeholder*="название"]'))
+            return {error: 'unapproved_optional_control'};
+        const one = selector => {
+            const nodes = document.querySelectorAll(selector);
+            return nodes.length === 1 ? nodes[0] : null;
+        };
+        const description = one('textarea[name="description"]');
+        const editor = one('.trumbowyg-editor[placeholder*="решать задачу"]');
+        if (!description || !editor)
+            return {error: 'missing_or_ambiguous_control'};
+        if (!editor.isContentEditable || editor.getClientRects().length === 0)
+            return {error: 'editor_not_visible'};
+        let priceInputs = [...document.querySelectorAll('input[name="price"], input[name="kwork_price"]')];
+        if (!priceInputs.length)
+            priceInputs = [...document.querySelectorAll('input[placeholder*="000"], input[placeholder*="цена"], input[placeholder*="стоимость"]')];
+        const durationInput = one('input[placeholder="Срок выполнения"]');
+        if (priceInputs.length !== 1 || !durationInput)
+            return {error: 'missing_or_ambiguous_control'};
+        if (priceInputs[0].type === 'hidden' || !priceInputs[0].getClientRects().length || priceInputs[0].disabled || !durationInput.getClientRects().length || durationInput.disabled)
+            return {error: 'missing_or_ambiguous_control'};
+        const form = description.closest('form');
+        if (!form || editor.closest('form') !== form || priceInputs[0].closest('form') !== form || durationInput.closest('form') !== form || editor.closest('.trumbowyg-box') !== description.closest('.trumbowyg-box'))
+            return {error: 'different_forms'};
+        const select = durationInput.closest('.v-select');
+        const selected = select ? select.querySelectorAll('.vs__selected') : [];
+        if (selected.length !== 1)
+            return {error: 'ambiguous_duration'};
+        return {
+            content: description.value,
+            editor_content: editor.innerText,
+            price: priceInputs[0].value.replace(/\\s/g, ''),
+            duration: (selected[0].textContent || '').trim(),
+        };
+    }""",
+        {"expectedContent": content, "offerPrice": offer_price},
+    )
+    if isinstance(actual, dict) and actual.get("error"):
+        raise RuntimeError("Поля формы отсутствуют или неоднозначны: " + actual["error"])
+    if not isinstance(actual, dict) or actual.get("content") != content:
+        raise RuntimeError("Текст формы не совпадает с одобренным")
+    editor_text = (actual.get("editor_content") or "").replace("\r\n", "\n")
+    if editor_text != content.replace("\r\n", "\n"):
+        raise RuntimeError("Видимый текст формы не совпадает с одобренным")
+    if actual.get("price") != str(offer_price):
+        raise RuntimeError("Цена формы не совпадает с одобренной")
+    if not isinstance(actual.get("duration"), str) or not re.fullmatch(
+        rf"{duration_days}\s*(?:день|дня|дней|day|days)?", actual["duration"].strip(), re.IGNORECASE
+    ):
+        raise RuntimeError("Срок формы не совпадает с одобренным")
+
+
 async def _fill_offer_form(
     page: Page,
     content: str,
     budget_min: float | None,
     budget_max: float | None,
+    *,
+    offer_price: int | None = None,
+    duration_days: int | None = None,
+    offer_title: str | None = None,
 ) -> None:
-    if len(content.strip()) < 150:
-        content = f"{content.strip()}\n\nГотов приступить к задаче в ближайшее время."
+    validate_approved_submission(content, offer_price, duration_days)
 
     await dismiss_overlays(page)
+    if await page.locator(UNAPPROVED_OPTIONAL_CONTROLS).count():
+        raise RuntimeError("Форма содержит неподтверждённое название или способ оплаты")
     await _fill_trumbowyg(page, "решать задачу", content)
 
-    settings = get_settings()
-    price = competitive_offer_price(
-        budget_min,
-        budget_max,
-        discount_percent=settings.kwork_offer_discount_percent,
-    ) or 5000
-    logger.info(
-        "Kwork competitive offer price",
-        desired_budget=budget_min if budget_min is not None else budget_max,
-        allowable_cap=budget_max if budget_min is not None else None,
-        offer_price=price,
-        discount_percent=settings.kwork_offer_discount_percent,
-    )
+    price = offer_price
 
     filled, _method = await _fill_price_input(page, price)
     if not filled:
         raise RuntimeError("Поле стоимости не найдено на форме Kwork")
 
-    await _select_duration(page)
+    await _select_duration(page, duration_days)
 
-    payment_item = page.locator(".offer-payment-type__item").first
-    if await payment_item.count() > 0:
-        await payment_item.click()
-        await page.wait_for_timeout(500)
-
-    want_title = await page.evaluate(
-        """() => window.bus?.state?.want?.title || "Выполнение проекта" """
-    )
-    title_editor = page.locator('.trumbowyg-editor[placeholder*="название"]')
-    if await title_editor.count() > 0:
-        await _fill_trumbowyg(page, "Введите название заказа", want_title[:200])
-    elif await page.locator('.trumbowyg-editor[placeholder*="название заказа"]').count() > 0:
-        await _fill_trumbowyg(page, "название заказа", want_title[:200])
-
-
-async def _select_duration(page: Page) -> None:
+async def _select_duration(page: Page, duration_days: int) -> None:
     duration_input = page.locator('input[placeholder="Срок выполнения"]')
     if await duration_input.count() == 0:
-        return
-
+        raise RuntimeError("Поле срока не найдено")
     await duration_input.click(force=True)
     await page.wait_for_timeout(500)
-
-    preferred = page.locator('.vs__dropdown-option:has-text("7"), [role="option"]:has-text("7")')
-    if await preferred.count() > 0:
-        await preferred.first.click()
-        return
-
-    fallback = page.locator('.vs__dropdown-option, [role="option"]')
-    if await fallback.count() > 0:
-        await fallback.first.click()
+    options = page.locator('.vs__dropdown-option, [role="option"]')
+    for index in range(await options.count()):
+        option = options.nth(index)
+        label = (await option.inner_text()).strip()
+        if re.fullmatch(rf"{duration_days}\s*(?:день|дня|дней|day|days)?", label, re.IGNORECASE):
+            await option.click()
+            return
+    raise RuntimeError("Одобренный срок отсутствует в форме")
 
 
 async def _fail_offer(
@@ -1188,6 +1223,9 @@ async def submit_offer(
     content: str,
     budget_min: float | None = None,
     budget_max: float | None = None,
+    *,
+    offer_price: int | None = None,
+    duration_days: int | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     steps: list[str] = []
     project_id = _extract_project_id(job_url)
@@ -1200,21 +1238,25 @@ async def submit_offer(
             content_file=content_file,
             content_length=len(content),
         )
-        return False, "Не удалось определить ID проекта Kwork", {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": ["не удалось извлечь ID проекта из URL"],
-        }
+        return (
+            False,
+            "Не удалось определить ID проекта Kwork",
+            {
+                "job_url": job_url,
+                "content_length": len(content),
+                "content_file": content_file,
+                "steps": ["не удалось извлечь ID проекта из URL"],
+            },
+        )
 
-    settings = get_settings()
-    offer_price = competitive_offer_price(
-        budget_min,
-        budget_max,
-        discount_percent=settings.kwork_offer_discount_percent,
+    try:
+        validate_approved_submission(content, offer_price, duration_days)
+    except ValueError as exc:
+        return False, str(exc), {"error_label": "invalid_approved_payload"}
+
+    steps.append(
+        f"подготовка: текст {len(content)} симв. (рекомендуется ≤1200, лимит Kwork {KWORK_MAX_OFFER_CHARS})"
     )
-
-    steps.append(f"подготовка: текст {len(content)} симв. (рекомендуется ≤1200, лимит Kwork {KWORK_MAX_OFFER_CHARS})")
     if offer_price:
         steps.append(f"подготовка: цена отклика {offer_price} ₽")
 
@@ -1290,44 +1332,14 @@ async def submit_offer(
                 steps=steps,
                 reason=blocker,
             )
-        elif await _verify_offer_on_project_page(page, project_id):
-            logger.info(
-                "Kwork offer already exists, attempting update",
-                project_id=project_id,
+        elif await _verify_offer_on_project_page(
+            page, project_id
+        ) or await _verify_offer_in_my_offers(page, project_id):
+            return (
+                False,
+                "Существующий отклик требует отдельного одобрения редактирования",
+                {"error_label": "existing_offer_requires_approval"},
             )
-            updated, update_error, update_debug = await _edit_existing_offer(
-                page,
-                job_url,
-                content,
-                budget_min,
-                budget_max,
-                steps,
-                project_id,
-                content_file=content_file,
-                offer_price=offer_price,
-            )
-            if updated:
-                return True, None, update_debug
-            return updated, update_error, update_debug
-        elif await _verify_offer_in_my_offers(page, project_id):
-            logger.info(
-                "Kwork offer found in offers list, attempting update",
-                project_id=project_id,
-            )
-            updated, update_error, update_debug = await _edit_existing_offer(
-                page,
-                job_url,
-                content,
-                budget_min,
-                budget_max,
-                steps,
-                project_id,
-                content_file=content_file,
-                offer_price=offer_price,
-            )
-            if updated:
-                return True, None, update_debug
-            return updated, update_error, update_debug
         else:
             steps.append("диагностика блокировки на странице проекта")
             blocker = await _diagnose_offer_blocker(page, job_url)
@@ -1381,7 +1393,11 @@ async def submit_offer(
 
     textarea = page.locator('textarea[name="description"]')
     try:
-        await textarea.wait_for(state="visible", timeout=60000)
+        # Trumbowyg stores submitted text in a hidden textarea.
+        await textarea.wait_for(state="attached", timeout=60000)
+        await page.locator('.trumbowyg-editor[placeholder*="решать задачу"]').wait_for(
+            state="visible", timeout=60000
+        )
     except Exception:
         form_debug = {
             "title": await page.title(),
@@ -1401,8 +1417,23 @@ async def submit_offer(
         )
 
     steps.append("заполнение полей формы")
+    offer_title = None
+    for selector in ("h1", ".page-title", ".wants-card__header-title"):
+        heading = page.locator(selector).first
+        if await heading.count():
+            offer_title = ((await heading.text_content()) or "").strip()[:80] or None
+            if offer_title:
+                break
     try:
-        await _fill_offer_form(page, content, budget_min, budget_max)
+        await _fill_offer_form(
+            page,
+            content,
+            budget_min,
+            budget_max,
+            offer_price=offer_price,
+            duration_days=duration_days,
+            offer_title=offer_title,
+        )
     except Exception as exc:
         return await _fail_offer(
             page,
@@ -1417,6 +1448,10 @@ async def submit_offer(
     await _save_debug_screenshot(page, f"before_submit_{project_id}")
     steps.append("форма заполнена, скриншот before_submit сохранён")
 
+    try:
+        await _verify_approved_form(page, content, offer_price, duration_days)
+    except RuntimeError as exc:
+        return False, str(exc), {"error_label": "approved_form_mismatch"}
     clicked = await _click_submit_offer_button(page)
     if not clicked:
         return await _fail_offer(
@@ -1469,7 +1504,7 @@ async def submit_offer(
                 content=content,
                 steps=steps,
             )
-        if _connects_limit_exhausted(body):
+        if connects_limit_exhausted(body):
             return await _fail_offer(
                 page,
                 "connects_limit_exhausted",
@@ -1495,36 +1530,36 @@ async def submit_offer(
 
     if await _verify_offer_after_submit_redirect(page, project_id):
         logger.info("Kwork offer verified after submit redirect", project_id=project_id)
-        return True, None, {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps,
-            "offer_action": "created",
-            "offer_price": offer_price,
-        }
+        return await _offer_submit_success(
+            page,
+            job_url=job_url,
+            content=content,
+            content_file=content_file,
+            steps=steps,
+            offer_price=offer_price,
+        )
 
     if await _verify_offer_on_project_page(page, project_id):
         logger.info("Kwork offer verified on project page after submit", project_id=project_id)
-        return True, None, {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps,
-            "offer_action": "created",
-            "offer_price": offer_price,
-        }
+        return await _offer_submit_success(
+            page,
+            job_url=job_url,
+            content=content,
+            content_file=content_file,
+            steps=steps,
+            offer_price=offer_price,
+        )
 
     if await _verify_offer_in_my_offers(page, project_id):
         logger.info("Kwork offer verified in my offers", project_id=project_id)
-        return True, None, {
-            "job_url": job_url,
-            "content_length": len(content),
-            "content_file": content_file,
-            "steps": steps,
-            "offer_action": "created",
-            "offer_price": offer_price,
-        }
+        return await _offer_submit_success(
+            page,
+            job_url=job_url,
+            content=content,
+            content_file=content_file,
+            steps=steps,
+            offer_price=offer_price,
+        )
 
     body = (await page.inner_text("body")).lower()
     if any(
@@ -1536,7 +1571,14 @@ async def submit_offer(
         )
     ):
         logger.info("Kwork offer submitted", url=offer_url)
-        return True, None, None
+        return await _offer_submit_success(
+            page,
+            job_url=job_url,
+            content=content,
+            content_file=content_file,
+            steps=steps,
+            offer_price=offer_price,
+        )
 
     screenshot = await _save_debug_screenshot(page, f"unverified_submit_{project_id}")
     debug_file = await _save_debug_context(
@@ -1557,16 +1599,20 @@ async def submit_offer(
         debug_file=debug_file,
         content_file=content_file,
     )
-    return False, "Отклик не появился в «Мои отклики» — отправка не подтверждена", {
-        "job_url": job_url,
-        "content_length": len(content),
-        "content_file": content_file,
-        "steps": steps + ["отклик не найден в «Мои отклики»"],
-        "error_label": "unverified_submit",
-        "screenshot": screenshot,
-        "debug_file": debug_file,
-        "offer_price": offer_price,
-    }
+    return (
+        False,
+        "Отклик не появился в «Мои отклики» — отправка не подтверждена",
+        {
+            "job_url": job_url,
+            "content_length": len(content),
+            "content_file": content_file,
+            "steps": steps + ["отклик не найден в «Мои отклики»"],
+            "error_label": "unverified_submit",
+            "screenshot": screenshot,
+            "debug_file": debug_file,
+            "offer_price": offer_price,
+        },
+    )
 
 
 async def send_kwork_offer(
@@ -1574,9 +1620,23 @@ async def send_kwork_offer(
     content: str,
     budget_min: float | None = None,
     budget_max: float | None = None,
+    *,
+    offer_price: int | None = None,
+    duration_days: int | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     async with _kwork_send_lock:
-        return await _send_kwork_offer_locked(job_url, content, budget_min, budget_max)
+        try:
+            validate_approved_submission(content, offer_price, duration_days)
+        except ValueError as exc:
+            return False, str(exc), {"error_label": "invalid_approved_payload"}
+        return await _send_kwork_offer_locked(
+            job_url,
+            content,
+            budget_min,
+            budget_max,
+            offer_price=offer_price,
+            duration_days=duration_days,
+        )
 
 
 async def _send_kwork_offer_locked(
@@ -1584,6 +1644,9 @@ async def _send_kwork_offer_locked(
     content: str,
     budget_min: float | None = None,
     budget_max: float | None = None,
+    *,
+    offer_price: int | None = None,
+    duration_days: int | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     from app.utils.proxy import get_proxy_candidates, mark_proxy_failed, mask_proxy
 
@@ -1601,6 +1664,7 @@ async def _send_kwork_offer_locked(
     for proxy in candidates:
         playwright: Playwright | None = None
         browser: Browser | None = None
+        submit_started = False
         steps = ["запуск браузера"]
         label = mask_proxy(proxy) if proxy else "direct"
         steps.append(f"прокси: {label}")
@@ -1645,10 +1709,21 @@ async def _send_kwork_offer_locked(
                 proxy=label,
                 storage_state=settings.kwork_storage_state or None,
             )
+            submit_started = True
             success, error, debug = await submit_offer(
-                page, job_url, content, budget_min, budget_max
+                page,
+                job_url,
+                content,
+                budget_min,
+                budget_max,
+                offer_price=offer_price,
+                duration_days=duration_days,
             )
             if debug and "steps" in debug:
+                if not success and any(
+                    str(step).startswith("нажатие «") for step in debug["steps"]
+                ):
+                    debug["ambiguous"] = True
                 debug["steps"] = steps + debug["steps"]
             elif not success:
                 content_file = _save_submission_content(content, "submit_failed")
@@ -1658,11 +1733,12 @@ async def _send_kwork_offer_locked(
                     "content_file": content_file,
                     "steps": steps,
                     "error_label": "submit_failed",
+                    **(debug or {}),
                 }
             if success and settings.kwork_storage_state.strip():
                 output = Path(settings.kwork_storage_state)
                 try:
-                    await page.context.storage_state(path=str(output))
+                    await save_browser_storage_state(page.context, output)
                 except Exception as exc:
                     logger.warning("Kwork session refresh failed", error=str(exc))
             return success, error, debug
@@ -1697,6 +1773,9 @@ async def _send_kwork_offer_locked(
                     "debug_file": debug_file,
                 },
             )
+            if submit_started:
+                last_result[2]["ambiguous"] = True
+                return last_result
             if proxy:
                 mark_proxy_failed(settings, "openai", proxy)
         finally:
@@ -1757,21 +1836,23 @@ async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
         return {"error": "session_or_access", "limit_exhausted": False}
 
     page_text = await _visible_page_texts(page)
-    if _connects_limit_exhausted(page_text) or extract_connects_replenish_text(page_text):
-        return {
-            "limit_exhausted": True,
-            "confident": True,
-            "page_text": page_text,
-            "project_url": listing_url,
-        }
-    remaining = extract_connects_remaining(page_text)
-    if remaining is not None and remaining > 0:
+    fields = connects_balance_fields(page_text)
+    if fields.get("connects_remaining", 0) > 0:
         return {
             "limit_exhausted": False,
             "confident": True,
             "connects_available_confirmed": True,
             "page_text": page_text,
             "project_url": listing_url,
+            **fields,
+        }
+    if connects_limit_exhausted(page_text):
+        return {
+            "limit_exhausted": True,
+            "confident": True,
+            "page_text": page_text,
+            "project_url": listing_url,
+            **fields,
         }
 
     for connects_url in (
@@ -1783,12 +1864,23 @@ async def probe_kwork_connects_status(page: Page) -> dict[str, Any]:
         if "/login" in page.url or await _is_access_blocked(page):
             break
         page_text = await _visible_page_texts(page)
-        if _connects_limit_exhausted(page_text) or extract_connects_replenish_text(page_text):
+        fields = connects_balance_fields(page_text)
+        if fields.get("connects_remaining", 0) > 0:
+            return {
+                "limit_exhausted": False,
+                "confident": True,
+                "connects_available_confirmed": True,
+                "page_text": page_text,
+                "project_url": connects_url,
+                **fields,
+            }
+        if connects_limit_exhausted(page_text):
             return {
                 "limit_exhausted": True,
                 "confident": True,
                 "page_text": page_text,
                 "project_url": connects_url,
+                **fields,
             }
         if _connects_balance_available(page_text):
             return {
@@ -1931,4 +2023,3 @@ async def refresh_kwork_pause_from_kwork(*, force: bool = False) -> dict[str, An
                 await close_browser(playwright, browser)
 
     return {"skipped": True, "error": last_error}
-

@@ -53,7 +53,38 @@ def competitive_offer_price(
     if price >= desired_int:
         price = max(min_price, ((desired_int - 500) // 500) * 500)
 
+    if budget_max is not None:
+        cap = int(budget_max)
+        if price > cap:
+            price = max(min_price, (cap // 500) * 500)
+
     return price
+
+
+def resolve_kwork_offer_price(
+    budget_min: float | None,
+    budget_max: float | None,
+    assessment: dict | None,
+    discount_percent: float,
+    *,
+    min_price: int = 500,
+) -> int | None:
+    """Single bid used in Telegram review, proposal text and Kwork form."""
+    competitive = competitive_offer_price(
+        budget_min, budget_max, discount_percent, min_price
+    )
+    assessed: int | None = None
+    if assessment:
+        raw = assessment.get("minimum_price_rub")
+        if type(raw) is int and raw >= min_price:
+            assessed = raw
+    if competitive is None and assessed is None:
+        return None
+    if competitive is None:
+        return assessed
+    if assessed is None:
+        return competitive
+    return assessed
 
 
 def format_offer_price(
@@ -142,6 +173,51 @@ KWORK_GENERIC_PHRASES = (
     "лучшие цены",
 )
 
+_KWORK_PRICE_LINE_RE = re.compile(
+    r"^[ \t]*(?:моя цена за выполнение составит|стоимость|цена за выполнение)"
+    r"[ \t:]*\d[\d \t\u00a0]*[ \t]*(?:₽|руб\.?)[ \t.!?]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_KWORK_RUBLE_AMOUNT_RE = re.compile(
+    r"(?:(\d[\d \t\u00a0]*)[ \t]*(?:₽|руб\.?)|₽[ \t]*(\d[\d \t\u00a0]*))",
+    re.IGNORECASE,
+)
+
+
+def kwork_text_price_matches(text: str, offer_price: int | None) -> bool:
+    if type(offer_price) is not int or offer_price < 500:
+        return False
+    amounts = (int(re.sub(r"\s", "", match.group(1) or match.group(2))) for match in _KWORK_RUBLE_AMOUNT_RE.finditer(text))
+    return all(amount == offer_price for amount in amounts)
+
+
+def _format_offer_amount(offer_price: int, currency: str = "RUB") -> str:
+    symbol = {"RUB": "₽", "USD": "$", "EUR": "€"}.get(currency, currency)
+    return f"{offer_price:,}".replace(",", " ") + f" {symbol}"
+
+
+def _canonical_kwork_price_line(offer_price: int, currency: str = "RUB") -> str:
+    return f"Моя цена за выполнение составит {_format_offer_amount(offer_price, currency)}."
+
+
+def sync_kwork_proposal_price(
+    text: str,
+    offer_price: int,
+    *,
+    currency: str = "RUB",
+) -> str:
+    """Replace LLM-invented amounts with the approved offer price."""
+    if not text or offer_price < 500:
+        return text
+    line = _canonical_kwork_price_line(offer_price, currency)
+    base = _KWORK_PRICE_LINE_RE.sub(line, text)
+    amounts = [int(re.sub(r"\s", "", match.group(1) or match.group(2))) for match in _KWORK_RUBLE_AMOUNT_RE.finditer(base)]
+    if any(amount != offer_price for amount in amounts):
+        raise ValueError("Текст содержит цену, не совпадающую с оценкой")
+    if amounts:
+        return base
+    return f"{base.rstrip()}\n\n{line}"
+
 
 def kwork_greeting(client_name: str | None) -> str:
     name = (client_name or "").strip()
@@ -211,8 +287,8 @@ def finalize_kwork_proposal(
             )
 
     if offer_price:
-        symbol = {"RUB": "₽", "USD": "$", "EUR": "€"}.get(currency, currency)
-        formatted = f"{offer_price:,}".replace(",", " ") + f" {symbol}"
+        text = sync_kwork_proposal_price(text, offer_price, currency=currency)
+        formatted = _format_offer_amount(offer_price, currency)
         if formatted not in text and str(offer_price) not in text:
             text = f"{text.rstrip()}\n\nСтоимость: {formatted}."
 

@@ -16,7 +16,10 @@ from app.db.outcome_states import (
     validate_outcome_status,
 )
 from app.db.send_attempt_states import ATTEMPT_CONFIRMED_SENT
-from app.services.conversation_context_service import build_chat_agent_state
+from app.services.conversation_context_service import (
+    build_chat_agent_state,
+    finalize_chat_agent_state,
+)
 from app.services.reward_constants import REWARD_MAP
 
 logger = structlog.get_logger(__name__)
@@ -206,6 +209,8 @@ async def record_outcome_and_learn(
             proposal_id=proposal_id,
         )
         if state:
+            await session.rollback()
+            state = await finalize_chat_agent_state(state)
             agent = LearningAgent()
             await agent.run(state)
     return result

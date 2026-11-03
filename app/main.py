@@ -12,13 +12,16 @@ from app.api.auth import CHAT_MESSAGE_MAX_CHARS, clamp_api_limit, verify_api_tok
 from app.api.rate_limit import ApiRateLimitMiddleware
 from app.celery_app import celery_app  # noqa: F401 — init Celery before task imports
 from app.config import get_settings
+from app.logging_setup import configure_application_logging
 from app.db.models import Job, Outcome, Proposal
 from app.db.session import get_db
 from app.schemas.job import ChatRequest, ChatResponse, JobResponse, OutcomeRequest
+from app.services.job_task_enqueue import queue_process_single_job
 from app.services.reward_system import RewardSystem
-from app.tasks.scrape_tasks import process_single_job, reprocess_pending_jobs, run_all_scrapers
+from app.tasks.scrape_tasks import reprocess_pending_jobs, run_all_scrapers
 
 logger = structlog.get_logger(__name__)
+configure_application_logging()
 settings = get_settings()
 
 app = FastAPI(
@@ -82,8 +85,10 @@ async def trigger_job_processing(
     job_id: uuid.UUID,
     _: None = Depends(verify_api_token),
 ) -> dict:
-    task = process_single_job.delay(str(job_id))
-    return {"task_id": task.id, "job_id": str(job_id)}
+    task_id = queue_process_single_job(str(job_id))
+    if task_id is None:
+        return {"job_id": str(job_id), "queued": False, "reason": "already_pending"}
+    return {"task_id": task_id, "job_id": str(job_id), "queued": True}
 
 
 @app.post("/scrape/trigger")
@@ -111,7 +116,10 @@ async def handle_client_chat(
         raise HTTPException(status_code=404, detail="Job not found")
 
     from app.db.models import Interaction
-    from app.services.conversation_context_service import build_chat_agent_state
+    from app.services.conversation_context_service import (
+        build_chat_agent_state,
+        finalize_chat_agent_state,
+    )
 
     state = await build_chat_agent_state(
         db,
@@ -122,6 +130,9 @@ async def handle_client_chat(
     if not state:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    # All reads above are complete; release the transaction before network calls.
+    await db.rollback()
+    state = await finalize_chat_agent_state(state)
     agent = ChatAgent()
     result = await agent.run(state)
 

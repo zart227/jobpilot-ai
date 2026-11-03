@@ -1,0 +1,17 @@
+# Optional overlay for controlled C052 compose drill only.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.c052-drill.yml up -d celery-worker celery-beat api
+# Restore: docker compose up -d celery-worker celery-beat api
+services:
+  celery-worker:
+    environment:
+      JOB_PROCESSING_LEASE_SECONDS: "60"
+      JOBPILOT_C052_DRILL_HOLD_SECONDS: "120"
+      JOBPILOT_C052_COMPOSE_DRILL: "1"
+      DEBUG: "false"
+  celery-beat:
+    environment:
+      JOB_PROCESSING_LEASE_SECONDS: "60"
+  api:
+    environment:
+      JOB_PROCESSING_LEASE_SECONDS: "60"
+      DEBUG: "false"

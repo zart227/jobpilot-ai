@@ -11,6 +11,7 @@ import structlog
 from app.agents.chat_agent import format_conversation_history
 from app.db.models import Job
 from app.llm.provider import get_simple_llm_provider
+from app.services.pipeline_processing_errors import pipeline_error_from_exception
 
 logger = structlog.get_logger(__name__)
 
@@ -42,8 +43,7 @@ def _older_turns_fingerprint(turns: list[dict[str, str]]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-async def _save_summary_cache(
-    session,
+def _set_summary_cache(
     job: Job,
     *,
     older_turn_count: int,
@@ -58,7 +58,6 @@ async def _save_summary_cache(
         "updated_at": datetime.now(UTC).isoformat(),
     }
     job.raw_data = raw
-    await session.commit()
 
 
 def _format_turns_for_summary(turns: list[dict[str, str]]) -> str:
@@ -114,18 +113,26 @@ async def build_conversation_context(
     ):
         summary = str(cached["text"])
     else:
+        if session is not None:
+            # The caller owns this transaction; never run network or commit it here.
+            return format_conversation_history(turns, max_turns=6, max_chars=1200)
         try:
             summary = await summarize_turns(older)
-            if summary and session is not None:
-                await _save_summary_cache(
-                    session,
+            if summary:
+                _set_summary_cache(
                     job,
                     older_turn_count=len(older),
                     older_turn_fingerprint=older_fp,
                     text=summary,
                 )
         except Exception as exc:
-            logger.warning("Conversation summary failed, using truncated history", error=str(exc))
+            err = pipeline_error_from_exception(exc, stage="conversation_summary")
+            logger.warning(
+                "Conversation summary failed, using truncated history",
+                error=str(exc),
+                processing_error_kind=err.get("processing_error_kind"),
+                processing_retryable=err.get("processing_retryable"),
+            )
             return format_conversation_history(turns, max_turns=6, max_chars=1200)
 
     recent_block = format_conversation_history(recent, max_turns=RECENT_TURNS, max_chars=1500)

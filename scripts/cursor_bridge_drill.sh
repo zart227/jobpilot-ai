@@ -45,6 +45,9 @@ base_internal = f"http://127.0.0.1:{INTERNAL_PORT}"
 try:
     response = httpx.get(f"{base_internal}/", timeout=3.0)
     print(f"GET {base_internal}/ without auth → HTTP {response.status_code}")
+    if response.status_code == 200:
+        print("FAIL: unauthenticated bridge returned HTTP 200", file=sys.stderr)
+        sys.exit(1)
 except httpx.HTTPError as exc:
     print(f"GET {base_internal}/ without auth → error ({type(exc).__name__})")
 

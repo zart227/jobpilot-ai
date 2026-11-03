@@ -1,10 +1,23 @@
 {
-  "approved_by": "your-name",
-  "approved_at": "2026-10-14",
+  "schema_version": 2,
+  "mode": "live",
+  "approved_by": "FILL: human owner",
+  "approved_at": "2026-10-15T10:00:00+03:00",
+  "authorization_reference": "FILL: actual human message reference",
+  "verified_by": "FILL: human UI reviewer",
+  "verified_at": "2026-10-15T10:10:00+03:00",
   "kwork_order_id": "12345678",
-  "kwork_dialog_username": "test_buyer",
   "send_attempt_id": "00000000-0000-0000-0000-000000000001",
-  "snapshot_verified": true,
-  "ui_matches_db": true,
-  "notes": "Staging test order; single confirmed_sent; no duplicate send on second approve"
+  "snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "snapshot_verified": false,
+  "ui_matches_db": false,
+  "ui_evidence": {
+    "path": "acceptance-evidence/ui.png",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "attempt_evidence": {
+    "path": "acceptance-evidence/attempt.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "notes": "Incomplete example: do not mark as verified until actual authorized live review."
 }

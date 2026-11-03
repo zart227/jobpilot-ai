@@ -58,8 +58,16 @@ async def test_proposal_send_dry_run_records_confirmed_sent(platform_dry_run) ->
         )
         await session.commit()
 
+    from conftest import seed_test_kwork_eligibility, seed_test_proposal_approval
+
+    async with AsyncSessionLocal() as session:
+        await seed_test_kwork_eligibility(session, job_id)
+        await seed_test_proposal_approval(session, job_id, proposal_id)
+
     sender = ProposalSender()
-    ok, error, debug = await sender.send(str(job_id), str(proposal_id), "Тестовый отклик для dry-run.")
+    ok, error, debug = await sender.send(
+        str(job_id), str(proposal_id), "Тестовый отклик для dry-run."
+    )
     assert ok is True
     assert error is None
     assert debug and debug.get("dry_run") is True

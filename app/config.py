@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     app_name: str = Field(default="JobPilot AI", alias="APP_NAME")
     app_env: str = Field(default="development", alias="APP_ENV")
     debug: bool = Field(default=False, alias="DEBUG")
+    sqlalchemy_echo: bool = Field(
+        default=False,
+        alias="SQLALCHEMY_ECHO",
+        description="Log SQL statements (local debugging only; never enable in production)",
+    )
     platform_dry_run: bool = Field(
         default=False,
         alias="PLATFORM_DRY_RUN",
@@ -26,9 +31,13 @@ class Settings(BaseSettings):
     api_auth_token: str = Field(
         default="",
         alias="API_AUTH_TOKEN",
-        description="Bearer or X-API-Key token for HTTP API (required when API_AUTH_REQUIRED=true)",
+        description="Bearer or X-API-Key token; required for network access",
     )
-    api_auth_required: bool = Field(default=False, alias="API_AUTH_REQUIRED")
+    api_auth_required: bool = Field(default=True, alias="API_AUTH_REQUIRED")
+    api_allow_unauthenticated_local: bool = Field(
+        default=False, alias="API_ALLOW_UNAUTHENTICATED_LOCAL",
+        description="Opt-in dev-only bypass: literal loopback bind and loopback peer required",
+    )
     api_list_limit_max: int = Field(default=200, ge=1, le=1000, alias="API_LIST_LIMIT_MAX")
     api_rate_limit_enabled: bool = Field(default=True, alias="API_RATE_LIMIT_ENABLED")
     api_rate_limit_requests: int = Field(
@@ -45,7 +54,7 @@ class Settings(BaseSettings):
         alias="API_RATE_LIMIT_WINDOW_SECONDS",
     )
     api_rate_limit_fail_open: bool = Field(
-        default=True,
+        default=False,
         alias="API_RATE_LIMIT_FAIL_OPEN",
         description="If Redis is down, allow traffic (false = 503)",
     )
@@ -118,6 +127,38 @@ class Settings(BaseSettings):
     openrouter_timeout_seconds: float = Field(default=120.0, gt=0, alias="OPENROUTER_TIMEOUT_SECONDS")
     openrouter_fallback_to_ollama: bool = Field(default=True, alias="OPENROUTER_FALLBACK_TO_OLLAMA")
     openrouter_proxy_list: str = Field(default="", alias="OPENROUTER_PROXY_LIST")
+    openrouter_models_cache_seconds: int = Field(
+        default=300,
+        ge=30,
+        alias="OPENROUTER_MODELS_CACHE_SECONDS",
+        description="TTL for cached OpenRouter /models list used by auto selection",
+    )
+    openrouter_auto_prefer: str = Field(
+        default="",
+        alias="OPENROUTER_AUTO_PREFER",
+        description="Comma-separated model id prefixes preferred for auto free selection (main)",
+    )
+    openrouter_simple_auto_prefer: str = Field(
+        default="",
+        alias="OPENROUTER_SIMPLE_AUTO_PREFER",
+        description="Preferred prefixes for simple-task auto free selection",
+    )
+    ollama_models_cache_seconds: int = Field(
+        default=300,
+        ge=30,
+        alias="OLLAMA_MODELS_CACHE_SECONDS",
+        description="TTL for cached Ollama /api/tags list used by auto selection",
+    )
+    ollama_auto_prefer: str = Field(
+        default="",
+        alias="OLLAMA_AUTO_PREFER",
+        description="Comma-separated installed model names preferred for OLLAMA_MODEL=auto",
+    )
+    ollama_scoring_auto_prefer: str = Field(
+        default="",
+        alias="OLLAMA_SCORING_AUTO_PREFER",
+        description="Preferred installed models for OLLAMA_SCORING_MODEL=auto",
+    )
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_simple_model: str = Field(
@@ -233,6 +274,11 @@ class Settings(BaseSettings):
         alias="TELEGRAM_ADMIN_USER_ID",
         description="Telegram user id allowed to approve/send (recommended in production)",
     )
+    telegram_register_commands: bool = Field(
+        default=True,
+        alias="TELEGRAM_REGISTER_COMMANDS",
+        description="Set false if setMyCommands hangs behind proxy; bot still polls",
+    )
 
     developer_name: str = Field(default="Developer", alias="DEVELOPER_NAME")
     developer_skills: str = Field(
@@ -252,7 +298,7 @@ class Settings(BaseSettings):
     )
 
     review_first_mode: bool = Field(default=True, alias="REVIEW_FIRST_MODE")
-    review_max_hours: float = Field(default=8.0, gt=0, alias="REVIEW_MAX_HOURS")
+    review_max_hours: float = Field(default=3.0, gt=0, alias="REVIEW_MAX_HOURS")
     client_min_rating: float = Field(default=4.8, ge=0, le=5, alias="CLIENT_MIN_RATING")
     client_min_paid_orders: int = Field(default=1, ge=1, alias="CLIENT_MIN_PAID_ORDERS")
 
@@ -281,7 +327,7 @@ class Settings(BaseSettings):
     )
     kwork_storage_state: str = Field(default="", alias="KWORK_STORAGE_STATE")
     kwork_offer_discount_percent: float = Field(
-        default=15.0,
+        default=20.0,
         alias="KWORK_OFFER_DISCOUNT_PERCENT",
         description="Bid this % below buyer desired budget (competitive pricing)",
     )
@@ -326,10 +372,22 @@ class Settings(BaseSettings):
         ge=60,
         alias="JOB_PROCESSING_LEASE_SECONDS",
     )
+    job_processing_c052_drill_hold_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=600,
+        alias="JOBPILOT_C052_DRILL_HOLD_SECONDS",
+        description="When >0 and JOBPILOT_C052_COMPOSE_DRILL=1, fake-platform jobs sleep after claim (compose C052 drill only).",
+    )
     job_processing_backoff_seconds: int = Field(
         default=120,
         ge=10,
         alias="JOB_PROCESSING_BACKOFF_SECONDS",
+    )
+    job_processing_max_attempts: int = Field(
+        default=5,
+        ge=1,
+        alias="JOB_PROCESSING_MAX_ATTEMPTS",
     )
     kwork_pause_block_inbox_on_connects: bool = Field(
         default=False,
@@ -365,6 +423,11 @@ class Settings(BaseSettings):
         default=30,
         ge=1,
         alias="NOTIFICATION_OUTBOX_BASE_BACKOFF_SECONDS",
+    )
+    memory_index_lease_seconds: int = Field(
+        default=120,
+        ge=10,
+        alias="MEMORY_INDEX_LEASE_SECONDS",
     )
     kwork_inbox_state_file: str = Field(
         default="data/kwork_inbox_state.json",

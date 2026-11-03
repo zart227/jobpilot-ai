@@ -1,5 +1,6 @@
 import os
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,13 +15,14 @@ pytestmark_db = pytest.mark.skipif(
 def test_outbound_reply_visible_matches_freelancer_message() -> None:
     messages = [
         {"from_id": 2, "message": "Question?"},
-        {"from_id": 1, "message": "Our answer here"},
+        {"from_id": 1, "message": "Our answer here", "id": 10, "time": 1001},
     ]
     assert outbound_reply_visible_in_thread(
         messages,
         expected_text="Our answer here",
         my_user_id=1,
         my_username="seller",
+        sent_after=datetime.fromtimestamp(1000, UTC),
     )
 
 
@@ -31,6 +33,7 @@ def test_outbound_reply_ignores_client_copy() -> None:
         expected_text="Our answer here",
         my_user_id=1,
         my_username="seller",
+        sent_after=datetime.fromtimestamp(1000, UTC),
     )
 
 
@@ -177,3 +180,27 @@ async def test_commit_failure_marks_unknown_not_blind_retry() -> None:
     )
     assert claim.action == "blocked"
     assert claim.reason == "unknown_result"
+
+
+@pytest.mark.parametrize(
+    "problem", ["prefix", "old", "unknown_sender", "missing_id", "missing_boundary", "nan_time"]
+)
+def test_reply_reconcile_rejects_ambiguous_evidence(problem):
+    text = "a" * 40 + " exact complete reply"
+    message = {"from_id": 1, "message": text, "MID": "external-42", "time": 1001}
+    boundary = datetime.fromtimestamp(1000, UTC)
+    if problem == "prefix":
+        message["message"] = "a" * 40 + " other reply"
+    elif problem == "old":
+        message["time"] = 999
+    elif problem == "unknown_sender":
+        message.pop("from_id")
+    elif problem == "missing_id":
+        message.pop("MID")
+    elif problem == "missing_boundary":
+        boundary = None
+    else:
+        message["time"] = float("nan")
+    assert not outbound_reply_visible_in_thread(
+        [message], expected_text=text, my_user_id=1, my_username="seller", sent_after=boundary
+    )

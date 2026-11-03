@@ -73,3 +73,20 @@ async def test_find_kwork_job_ambiguous_by_username() -> None:
     assert match.needs_context
     assert len(match.candidate_jobs) == 2
     assert match.job is None
+
+
+@pytest.mark.asyncio
+async def test_conflicting_project_id_never_falls_back_to_username() -> None:
+    client = Client(id=uuid.uuid4(), name="buyer", external_id="/user/buyer")
+    job = Job(id=uuid.uuid4(), platform="kwork", external_id="kwork-1", status="sent",
+              title="Other project", description="d", client_id=client.id)
+    session = AsyncMock()
+    scalars = MagicMock()
+    scalars.all.return_value = [job]
+    result = MagicMock()
+    result.scalars.return_value = scalars
+    session.execute.return_value = result
+    session.get.return_value = client
+    match = await find_kwork_job_for_message(session, username="buyer", project_id="999")
+    assert match.needs_context and match.job is None and match.proposal is None
+    assert session.execute.await_count == 1

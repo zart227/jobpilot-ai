@@ -23,8 +23,8 @@ def validate_scoring_weights(raw: dict[str, Any]) -> dict[str, float]:
     normalized: dict[str, float] = {}
     for key in expected_weight_keys():
         value = raw[key]
-        if not isinstance(value, (int, float)):
-            raise TypeError(f"weight {key} must be numeric")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"weight {key} must be numeric")  # noqa: TRY004
         number = float(value)
         if not math.isfinite(number):
             raise ValueError(f"weight {key} must be finite")
@@ -33,7 +33,7 @@ def validate_scoring_weights(raw: dict[str, Any]) -> dict[str, float]:
         normalized[key] = number
 
     total = sum(normalized.values())
-    if total <= 0:
-        raise ValueError("weights must sum to a positive value")
+    if not math.isfinite(total) or total <= 0:
+        raise ValueError("weights must sum to a finite positive value")
 
     return {key: round(normalized[key] / total, 4) for key in expected_weight_keys()}

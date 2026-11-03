@@ -16,11 +16,14 @@ def freeze_kwork_local_today(monkeypatch: pytest.MonkeyPatch) -> None:
 from app.services.kwork_pause import (
     KworkPauseState,
     apply_connects_probe_result,
+    blocks_kwork_operator_send,
+    connects_limit_exhausted,
     extract_connects_replenish_text,
     format_kwork_pause_reason,
     is_kwork_paused,
     kwork_resume_on,
     load_pause_state,
+    parse_connects_quota,
     parse_replenish_date_ru,
     save_pause_state,
 )
@@ -44,6 +47,61 @@ def test_extract_connects_remaining() -> None:
     assert extract_connects_remaining("Осталось 0 из 30") == 0
     assert extract_connects_remaining("Осталось 5 из 30") == 5
     assert extract_connects_remaining("no connects here") is None
+
+
+def test_parse_connects_quota() -> None:
+    assert parse_connects_quota("Осталось 29 из 30") == (29, 30)
+
+
+def test_replenish_date_widget_does_not_exhaust_connects() -> None:
+    widget = "Коннекты\nОсталось 29 из 30\nДата пополнения\n10 ноября"
+    assert connects_limit_exhausted(widget) is False
+    assert parse_connects_quota(widget) == (29, 30)
+
+
+def test_zero_connects_with_replenish_date_is_exhausted() -> None:
+    listing = "Коннекты\nОсталось 0 из 30\nДата пополнения\n10 августа"
+    assert connects_limit_exhausted(listing) is True
+
+
+def test_probe_clears_pause_with_quota_page_text(tmp_path) -> None:
+    state_file = tmp_path / "pause.json"
+    settings = Settings(
+        _env_file=None,
+        KWORK_PAUSE_ENABLED=True,
+        KWORK_PAUSE_AUTO=True,
+        KWORK_PAUSE_UNTIL="",
+        KWORK_PAUSE_STATE_FILE=str(state_file),
+    )
+    save_pause_state(
+        KworkPauseState(paused=True, paused_until=date(2026, 11, 10)),
+        settings,
+    )
+    result = apply_connects_probe_result(
+        limit_exhausted=False,
+        page_text="Коннекты\nОсталось 29 из 30\nДата пополнения\n10 ноября",
+        connects_available_confirmed=True,
+        settings=settings,
+    )
+    assert result["paused"] is False
+    assert result["connects_remaining"] == 29
+    assert result["connects_total"] == 30
+    assert is_kwork_paused(settings) is False
+    state = load_pause_state(settings)
+    assert state is not None
+    assert state.paused is False
+    assert state.connects_remaining == 29
+
+
+def test_format_kwork_success_message_includes_connects() -> None:
+    from app.telegram.bot import format_kwork_success_message
+
+    msg = format_kwork_success_message(
+        {"connects_remaining": 28, "connects_total": 30},
+    )
+    assert "28" in msg
+    assert "30" in msg
+    assert "коннект" in msg.lower()
 
 
 def test_manual_pause_bootstrap_without_state_file(tmp_path) -> None:
@@ -111,7 +169,9 @@ def test_auto_pause_from_probe_and_resume(tmp_path) -> None:
         settings=settings,
     )
     assert is_kwork_paused(settings) is False
-    assert load_pause_state(settings) is None
+    state = load_pause_state(settings)
+    assert state is not None
+    assert state.paused is False
 
 
 def test_probe_clears_pause_when_connects_available(tmp_path) -> None:
@@ -133,7 +193,9 @@ def test_probe_clears_pause_when_connects_available(tmp_path) -> None:
         connects_available_confirmed=True,
         settings=settings,
     )
-    assert load_pause_state(settings) is None
+    state = load_pause_state(settings)
+    assert state is not None
+    assert state.paused is False
     assert is_kwork_paused(settings) is False
 
 
@@ -202,3 +264,15 @@ def test_kwork_pause_disabled(tmp_path) -> None:
         KWORK_PAUSE_STATE_FILE=str(tmp_path / "pause.json"),
     )
     assert is_kwork_paused(settings) is False
+
+
+def test_blocks_kwork_operator_send_allows_dry_run(tmp_path) -> None:
+    settings = Settings(
+        _env_file=None,
+        PLATFORM_DRY_RUN=True,
+        KWORK_PAUSE_ENABLED=True,
+        KWORK_PAUSE_UNTIL="2099-01-01",
+        KWORK_PAUSE_STATE_FILE=str(tmp_path / "pause.json"),
+    )
+    assert is_kwork_paused(settings) is True
+    assert blocks_kwork_operator_send(settings) is False

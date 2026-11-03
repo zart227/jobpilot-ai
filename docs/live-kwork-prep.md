@@ -1,6 +1,8 @@
 # Live Kwork — подготовка (единый чеклист)
 
-Remediation-чеклист: **115/115** (dry-run signoff уже есть). Этот документ — **перед первой реальной отправкой** в UI Kwork.
+> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+
+Remediation-чеклист: **44/115 подтверждено; 71 открыт** (dry-run signoff уже есть). Этот документ — **перед первой реальной отправкой** в UI Kwork.
 
 ## 1. Автоматические ворота
 
@@ -37,11 +39,11 @@ python scripts/validate_live_signoff.py
 ./scripts/record_live_kwork_acceptance.sh <order_id> <attempt_uuid> "live UI verified"
 ```
 
-Журнал опционален (чеклист уже закрыт); для аудита продакшена — рекомендуется.
+Журнал опционален (чеклист не закрыт); для аудита продакшена — рекомендуется.
 
 ## 5. Откат
 
 - Вернуть `PLATFORM_DRY_RUN=true`
 - Runbook: [runbook.md](runbook.md) § unknown_result, outbox
 
-Backlog: [remediation-progress.md](remediation-progress.md#остаток-работ-честная-сводка).
+Backlog: [remediation-progress.md](remediation-progress.md).

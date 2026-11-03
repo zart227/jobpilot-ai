@@ -44,8 +44,24 @@ async def test_selected_model_sent_to_ollama():
         close=AsyncMock(),
     )
     with patch.object(provider, '_client', return_value=client):
-        assert await provider._chat_once(None, [], 0.2) == 'ok'
+        assert await provider._chat_once(None, [], 0.2, model='gpt-oss:120b') == 'ok'
     assert client.chat.call_args.kwargs['model'] == 'gpt-oss:120b'
+    client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('text', 'reason'), [('', 'stop'), ('partial', 'length')])
+async def test_empty_or_truncated_response_is_retryable_error(text, reason):
+    from app.llm.errors import LLMServiceError
+
+    provider = get_scoring_llm_provider(settings())
+    client = SimpleNamespace(
+        chat=AsyncMock(return_value=SimpleNamespace(message=SimpleNamespace(content=text), done_reason=reason)),
+        close=AsyncMock(),
+    )
+    with patch.object(provider, '_client', return_value=client), pytest.raises(LLMServiceError) as exc:
+        await provider._chat_once(None, [], 0.2, model='test')
+    assert exc.value.retryable
     client.close.assert_awaited_once()
 
 

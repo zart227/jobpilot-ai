@@ -12,10 +12,13 @@ in the terminal to save cookies/localStorage to a Playwright storage state file.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 from playwright.async_api import async_playwright
+
+from app.utils.storage_state import save_browser_storage_state
 
 DEFAULT_OUTPUT = Path("data/kwork_session.json")
 LOGIN_URL = "https://kwork.ru/login"
@@ -25,6 +28,9 @@ SELLER_URL = "https://kwork.ru/seller"
 async def main() -> None:
     output = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_OUTPUT
     output.parent.mkdir(parents=True, exist_ok=True)
+    if not os.access(output.parent, os.W_OK | os.X_OK):
+        print(f"Ошибка: нет прав на запись в {output.parent.resolve()}")
+        sys.exit(1)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=False)
@@ -50,7 +56,7 @@ async def main() -> None:
             await browser.close()
             sys.exit(1)
 
-        await context.storage_state(path=str(output))
+        await save_browser_storage_state(context, output)
         await browser.close()
 
     print(f"Сессия сохранена: {output.resolve()}")

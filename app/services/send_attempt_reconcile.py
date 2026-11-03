@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 import structlog
@@ -18,9 +20,7 @@ from app.db.send_attempt_states import (
 )
 from app.db.session import AsyncSessionLocal
 from app.services.kwork_api import clean_kwork_message_text, create_kwork_api
-from app.services.kwork_conversation import is_from_client
-from app.services.send_attempt_service import content_fingerprint
-from app.utils.formatting import extract_site_order_id, sanitize_proposal_text
+from app.services.send_attempt_service import _lock_attempt
 
 logger = structlog.get_logger(__name__)
 
@@ -33,23 +33,36 @@ def outbound_reply_visible_in_thread(
     expected_text: str,
     my_user_id: int | None,
     my_username: str,
+    sent_after: datetime | None = None,
 ) -> bool:
-    """True when our snapshot text appears in a non-client (freelancer) message."""
-    needle = sanitize_proposal_text(expected_text).strip()
-    if not needle:
+    """Require complete text, positively identified sender and a temporal boundary."""
+    needle = clean_kwork_message_text(expected_text).strip()
+    if not needle or sent_after is None or sent_after.tzinfo is None:
         return False
-    needle_fp = content_fingerprint(needle)
     for message in messages:
-        if is_from_client(message, my_username, my_user_id):
+        sender_id = message.get("from_id") or message.get("user_from_id")
+        if sender_id is not None:
+            try:
+                ours = my_user_id is not None and int(sender_id) == my_user_id
+            except (ValueError, TypeError):
+                ours = False
+        else:
+            sender = str(message.get("from_username") or message.get("sender") or "")
+            ours = bool(my_username and sender.casefold() == my_username.casefold())
+        if not ours or not (message.get("id") or message.get("message_id") or message.get("MID")):
+            continue
+        try:
+            timestamp = float(message.get("time") or message.get("sent_timestamp") or 0)
+        except (TypeError, ValueError):
+            continue
+        # Platform second precision may yield a false negative in the start second;
+        # retain unknown_result rather than guessing success from an older identical reply.
+        if not math.isfinite(timestamp) or timestamp < sent_after.timestamp():
             continue
         text = clean_kwork_message_text(
             str(message.get("message", message.get("text", "")))
         ).strip()
-        if not text:
-            continue
-        if text == needle or content_fingerprint(text) == needle_fp:
-            return True
-        if len(needle) >= 40 and needle[:40] in text:
+        if text == needle:
             return True
     return False
 
@@ -63,7 +76,7 @@ async def _confirm_reconciled_send(
     from app.services.send_attempt_service import _apply_confirmed_send
 
     async with AsyncSessionLocal() as session:
-        attempt = await session.get(SendAttempt, attempt_id)
+        attempt = await _lock_attempt(session, attempt_id)
         if not attempt or attempt.status != ATTEMPT_UNKNOWN_RESULT:
             return False
         merged = dict(attempt.platform_response or {})
@@ -112,6 +125,7 @@ async def _reconcile_inbox_reply(attempt: SendAttempt, settings: Settings) -> Re
         expected_text=attempt.snapshot_content,
         my_user_id=my_user_id,
         my_username=my_username,
+        sent_after=attempt.started_at,
     ):
         ok = await _confirm_reconciled_send(
             attempt.id,
@@ -122,42 +136,19 @@ async def _reconcile_inbox_reply(attempt: SendAttempt, settings: Settings) -> Re
     return "not_found"
 
 
-async def _reconcile_kwork_proposal(attempt: SendAttempt, job: Job, settings: Settings) -> ReconcileOutcome:
+async def _reconcile_kwork_proposal(
+    attempt: SendAttempt, job: Job, settings: Settings
+) -> ReconcileOutcome:
     if settings.platform_dry_run:
         if (attempt.platform_response or {}).get("dry_run"):
             ok = await _confirm_reconciled_send(attempt.id, source="dry_run_metadata")
             return "confirmed" if ok else "inconclusive"
         return "inconclusive"
 
-    project_id = extract_site_order_id(
-        external_id=job.external_id,
-        url=job.url,
-        platform=job.platform,
-    )
-    if not project_id:
-        return "inconclusive"
-
-    from app.services.kwork_browser import verify_kwork_offer_submitted
-
-    try:
-        found = await verify_kwork_offer_submitted(job.url or f"https://kwork.ru/projects/{project_id}/view")
-    except Exception as exc:
-        logger.warning(
-            "Proposal reconcile browser check failed",
-            attempt_id=str(attempt.id),
-            project_id=project_id,
-            error=str(exc),
-        )
-        return "inconclusive"
-
-    if found:
-        ok = await _confirm_reconciled_send(
-            attempt.id,
-            source="kwork_project_page",
-            evidence={"project_id": project_id},
-        )
-        return "confirmed" if ok else "inconclusive"
-    return "not_found"
+    # A project-page "offer exists" check cannot prove this exact version/price.
+    # Until a payload-specific receipt is available, require owner review; never
+    # turn an old offer into confirmation of a newly edited/ambiguous submission.
+    return "inconclusive"
 
 
 async def reconcile_send_attempt(
@@ -185,7 +176,7 @@ async def reconcile_send_attempt(
 
 async def mark_inconclusive_needs_attention(attempt_id: uuid.UUID, reason: str) -> bool:
     async with AsyncSessionLocal() as session:
-        attempt = await session.get(SendAttempt, attempt_id)
+        attempt = await _lock_attempt(session, attempt_id)
         if not attempt or attempt.status != ATTEMPT_UNKNOWN_RESULT:
             return False
         attempt.status = ATTEMPT_NEEDS_ATTENTION

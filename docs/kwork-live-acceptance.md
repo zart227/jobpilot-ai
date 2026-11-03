@@ -1,8 +1,10 @@
 # Разрешённая проверка на Kwork (чеклист)
 
+> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+
 Использовать **только** после закрытия dry-run в CI и явного решения владельца проекта.
 
-[remediation-checklists.md](remediation-checklists.md) уже **115/115** (dry-run signoff). Пункты `- [ ]` ниже — **живая** проверка в UI; что ещё не сделано в коде/опсе: [remediation-progress.md § Остаток работ](remediation-progress.md#остаток-работ-честная-сводка).
+[remediation-checklists.md](remediation-checklists.md) **44/115 подтверждено; 71 открыт** (dry-run signoff). Пункты `- [ ]` ниже — **живая** проверка в UI; что ещё не сделано в коде/опсе: [remediation-progress.md § Остаток работ](remediation-progress.md).
 
 ## Перед стартом
 

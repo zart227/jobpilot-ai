@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+from typing import Any
+
 from aiogram.types import CallbackQuery, Message, Update
 
 from app.config import Settings, get_settings
@@ -40,8 +43,11 @@ def is_authorized_telegram(
 
     expected_user = _parse_admin_user_id(settings)
     if expected_user is None:
-        return True
-    return user_id is not None and user_id == expected_user
+        if settings.telegram_admin_user_id.strip():
+            return False  # Invalid explicit identity must not fall back to chat-only access.
+        # A positive private chat ID identifies its owner; a group ID does not.
+        expected_user = expected_chat if expected_chat > 0 else None
+    return expected_user is not None and expected_user > 0 and user_id == expected_user
 
 
 def is_admin_chat_message(message: Message, settings: Settings | None = None) -> bool:
@@ -70,4 +76,26 @@ def pending_matches_callback(
         return False
     if pending.chat_id != callback.message.chat.id:
         return False
-    return not (pending.message_id is not None and pending.message_id != callback.message.message_id)
+    return pending.message_id is not None and pending.message_id == callback.message.message_id
+
+
+def edit_preview_binding(message: Message, content: str) -> dict[str, Any]:
+    """Bind the FSM draft to the exact preview that the operator received."""
+    return {
+        "preview_chat_id": message.chat.id,
+        "preview_message_id": message.message_id,
+        "preview_content_hash": hashlib.sha256(content.encode()).hexdigest(),
+    }
+
+
+def edit_preview_matches_callback(
+    data: dict[str, Any], callback: CallbackQuery, pending_id: str, content: str
+) -> bool:
+    message = callback.message
+    return bool(
+        message is not None
+        and data.get("pending_id") == pending_id
+        and data.get("preview_chat_id") == message.chat.id
+        and data.get("preview_message_id") == message.message_id
+        and data.get("preview_content_hash") == hashlib.sha256(content.encode()).hexdigest()
+    )

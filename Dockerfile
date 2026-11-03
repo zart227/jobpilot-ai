@@ -24,10 +24,8 @@ RUN pip install playwright && playwright install --with-deps chromium
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN groupadd --system --gid 10001 jobpilot \
-    && useradd --system --uid 10001 --gid jobpilot --home-dir /app jobpilot \
-    && chown -R jobpilot:jobpilot /app /ms-playwright /entrypoint.sh
+RUN chown -R 1000:1000 /app /ms-playwright /entrypoint.sh
 
-USER jobpilot
+USER 1000:1000
 
 ENTRYPOINT ["/entrypoint.sh"]

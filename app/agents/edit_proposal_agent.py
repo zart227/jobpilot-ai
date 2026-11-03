@@ -1,3 +1,5 @@
+import asyncio
+
 import structlog
 
 from app.config import get_settings
@@ -6,10 +8,10 @@ from app.llm.provider import get_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
-    competitive_offer_price,
     finalize_kwork_proposal,
     format_budget,
     format_offer_price,
+    resolve_kwork_offer_price,
     sanitize_proposal_text,
 )
 
@@ -39,7 +41,7 @@ class EditProposalAgent:
     def __init__(self) -> None:
         self._settings = get_settings()
         self._llm = get_llm_provider()
-        self._memory = get_memory_store()
+        self._memory = None
 
     async def run(
         self,
@@ -50,7 +52,13 @@ class EditProposalAgent:
     ) -> str:
         is_kwork = job.get("platform") == "kwork"
         job_context = f"{job.get('title', '')} {job.get('description', '')[:400]}"
-        preferences = await self._memory.search_edit_preferences(job_context, limit=3)
+        try:
+            if self._memory is None:
+                self._memory = await asyncio.to_thread(get_memory_store)
+            preferences = await self._memory.search_edit_preferences(job_context, limit=3)
+        except Exception as exc:
+            logger.warning("EditProposalAgent memory retrieval skipped", error=str(exc))
+            preferences = []
 
         pref_block = ""
         if preferences:
@@ -67,11 +75,21 @@ class EditProposalAgent:
 
         offer_line = ""
         if is_kwork:
-            offer = format_offer_price(
+            offer_value = resolve_kwork_offer_price(
                 job.get("budget_min"),
                 job.get("budget_max"),
-                job.get("budget_currency", "RUB"),
+                job.get("opportunity_assessment") or {},
                 self._settings.kwork_offer_discount_percent,
+            )
+            offer = (
+                f"{offer_value:,}".replace(",", " ") + " ₽"
+                if type(offer_value) is int
+                else format_offer_price(
+                    job.get("budget_min"),
+                    job.get("budget_max"),
+                    job.get("budget_currency", "RUB"),
+                    self._settings.kwork_offer_discount_percent,
+                )
             )
             if offer:
                 offer_line = f"\nYOUR OFFER PRICE (keep exactly once if present): {offer}\n"
@@ -98,9 +116,10 @@ Return the full revised proposal text."""
             response = await self._llm.complete(system, user_prompt, temperature=0.5)
             edited = sanitize_proposal_text(response.strip())
             if is_kwork:
-                offer = competitive_offer_price(
+                offer = resolve_kwork_offer_price(
                     job.get("budget_min"),
                     job.get("budget_max"),
+                    job.get("opportunity_assessment") or {},
                     self._settings.kwork_offer_discount_percent,
                 )
                 edited = finalize_kwork_proposal(

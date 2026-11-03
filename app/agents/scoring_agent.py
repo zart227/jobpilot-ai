@@ -9,7 +9,7 @@ from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError
 from app.llm.provider import get_scoring_llm_provider
 from app.schemas.agent_state import JobPilotState
-from app.schemas.llm_outputs import is_validation_error, parse_scoring_output
+from app.schemas.llm_outputs import parse_scoring_output
 from app.services.opportunity_policy import REVIEW_WEIGHTS
 from app.services.pipeline_llm_ledger import append_stage_log
 
@@ -60,6 +60,7 @@ Description: {job.get('description', '')[:2000]}
 Budget: {job.get('budget_min')} - {job.get('budget_max')} {job.get('budget_currency', 'USD')}
 Skills required: {', '.join(job.get('skills', []))}
 Client: {job.get('client_name')} | Rating: {job.get('client_rating')} | Reviews: {job.get('client_reviews', 0)}
+Kwork buyer projects posted: {job.get('client_projects_posted')} | Hired: {job.get('client_hire_percent')}%
 Platform: {job.get('platform')}"""
 
         try:
@@ -77,20 +78,18 @@ Platform: {job.get('platform')}"""
             }
         except LLMServiceError as exc:
             logger.error("ScoringAgent LLM error", error=str(exc), kind=exc.kind.value)
+            from app.services.pipeline_processing_errors import pipeline_error_from_exception
+
             return {
-                "pipeline_processing_error": True,
-                "processing_retryable": exc.retryable,
-                "processing_stage": "scoring",
-                "error": str(exc),
+                **pipeline_error_from_exception(exc, stage="scoring"),
                 "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
             }
         except Exception as exc:
             logger.error("ScoringAgent failed", error=str(exc))
+            from app.services.pipeline_processing_errors import pipeline_error_from_exception
+
             return {
-                "pipeline_processing_error": True,
-                "processing_retryable": not is_validation_error(exc),
-                "processing_stage": "scoring",
-                "error": str(exc),
+                **pipeline_error_from_exception(exc, stage="scoring"),
                 "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
             }
 

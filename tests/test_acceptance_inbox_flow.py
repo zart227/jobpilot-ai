@@ -118,6 +118,12 @@ async def test_inbound_dedup_edit_and_dry_run_reply(platform_dry_run) -> None:
         assert pending.draft_reply == "Срок 5 дней."
         pending.draft_reply = "Срок 5 дней, можем начать завтра."
         pending.status = "edited"
+        from app.services.inbox_approval import record_inbox_approval
+
+        pending.message_id = 1
+        await record_inbox_approval(
+            session, pending, actor_user_id=1, chat_id=pending.chat_id, message_id=1, edited=True
+        )
         await session.commit()
         pid = pending.id
         interaction_id = pending.interaction_id

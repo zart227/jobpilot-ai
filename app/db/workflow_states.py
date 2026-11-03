@@ -64,4 +64,4 @@ def is_terminal_job_status(status: str | None) -> bool:
 def job_allows_pipeline_persist(status: str | None) -> bool:
     if not status:
         return True
-    return status not in JOB_PROTECTED_FROM_PIPELINE_OVERWRITE
+    return status not in JOB_PROTECTED_FROM_PIPELINE_OVERWRITE and status not in JOB_TERMINAL_STATUSES

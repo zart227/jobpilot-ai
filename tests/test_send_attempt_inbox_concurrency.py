@@ -61,10 +61,15 @@ async def test_inbox_reply_second_send_is_idempotent(monkeypatch: pytest.MonkeyP
                 client_message="?",
                 draft_reply="Answer",
                 chat_id=1,
-                status="pending",
+                status="approved",
             )
         )
         await session.commit()
+
+    from conftest import seed_test_inbox_approval
+
+    async with AsyncSessionLocal() as session:
+        await seed_test_inbox_approval(session, pending_id)
 
     settings = Settings(_env_file=None, PLATFORM_DRY_RUN=True)
     ok1, _ = await send_kwork_inbox_reply(

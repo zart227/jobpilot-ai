@@ -7,16 +7,23 @@ import math
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from app.services.scoring_weights_validation import validate_scoring_weights
 
 
 class FilterLLMOutput(BaseModel):
-    relevant: bool
-    reason: str = Field(min_length=1, max_length=2000)
-    estimated_hours: float | None = None
-    scope_clear: bool | None = None
+    model_config = ConfigDict(extra="forbid")
 
-    @field_validator("estimated_hours")
+    relevant: bool = Field(strict=True)
+    reason: str = Field(min_length=1, max_length=2000)
+    estimated_hours: float | None = Field(default=None, strict=True)
+    estimated_calendar_days: float | None = Field(default=None, strict=True)
+    scope_clear: bool | None = Field(default=None, strict=True)
+    minimum_price_rub: int | None = Field(default=None, strict=True, ge=500)
+    complexity: Literal["simple", "moderate", "complex"] | None = None
+
+    @field_validator("estimated_hours", "estimated_calendar_days")
     @classmethod
     def finite_hours(cls, value: float | None) -> float | None:
         if value is None:
@@ -39,11 +46,13 @@ class ScoringBreakdown(BaseModel):
         "complexity",
         "client_quality",
         "competition",
+        mode="before",
     )
     @classmethod
-    def criterion_range(cls, value: float) -> float:
+    def criterion_range(cls, value: Any) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise TypeError("criterion must be numeric")
+            # Pydantic turns ValueError into a ValidationError; TypeError escapes.
+            raise ValueError("criterion must be numeric")  # noqa: TRY004
         if not math.isfinite(float(value)):
             raise ValueError("criterion must be finite")
         numeric = float(value)
@@ -92,6 +101,8 @@ CHAT_INTENTS = (
 
 
 class ChatLLMOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     intent: Literal[
         "question",
         "negotiation",
@@ -109,9 +120,19 @@ def parse_chat_output(response: str) -> ChatLLMOutput:
 
 
 class LearningLLMOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     weights: dict[str, float]
     insights: list[str] = Field(default_factory=list)
     top_platforms: list[str] = Field(default_factory=list)
+
+    @field_validator("weights", mode="before")
+    @classmethod
+    def valid_raw_weights(cls, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("weights must be an object")  # noqa: TRY004
+        validate_scoring_weights(value)
+        return value
 
     @field_validator("insights", "top_platforms")
     @classmethod

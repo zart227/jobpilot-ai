@@ -81,7 +81,7 @@ async def test_build_conversation_context_uses_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_conversation_context_summarizes_and_saves() -> None:
+async def test_open_session_neither_summarizes_nor_commits() -> None:
     job = Job(
         id=uuid.uuid4(),
         platform="kwork",
@@ -103,15 +103,36 @@ async def test_build_conversation_context_summarizes_and_saves() -> None:
     with patch(
         "app.services.conversation_summary.summarize_turns",
         new=AsyncMock(return_value="Клиент уточнил срок, мы назвали 5 дней."),
-    ):
+    ) as summarize:
         context = await build_conversation_context(session, job, turns)
 
-    assert "Клиент уточнил срок" in context
     assert "Ок" in context
-    session.commit.assert_awaited_once()
-    cached = (job.raw_data or {}).get("inbox_conversation_summary", {})
-    assert cached.get("older_turn_count") == len(turns) - RECENT_TURNS
-    assert cached.get("text") == "Клиент уточнил срок, мы назвали 5 дней."
+    summarize.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    assert job.raw_data == {}
+
+
+@pytest.mark.asyncio
+async def test_detached_context_summarizes_and_caches_without_session() -> None:
+    job = Job(id=uuid.uuid4(), platform="kwork", external_id="1", title="Test", description="Desc", raw_data={})
+    turns = [{"role": "client", "text": str(i)} for i in range(4)]
+    with patch("app.services.conversation_summary.summarize_turns", new=AsyncMock(return_value="summary")):
+        context = await build_conversation_context(None, job, turns)
+    assert "summary" in context
+    assert job.raw_data["inbox_conversation_summary"]["older_turn_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_summary_failure_falls_back_without_cache() -> None:
+    job = Job(id=uuid.uuid4(), platform="kwork", external_id="1", title="Test", description="Desc", raw_data={})
+    turns = [{"role": "client", "text": str(i)} for i in range(6)]
+    with patch(
+        "app.services.conversation_summary.summarize_turns",
+        new=AsyncMock(side_effect=TimeoutError("llm timeout")),
+    ):
+        context = await build_conversation_context(None, job, turns)
+    assert "5" in context or "4" in context
+    assert job.raw_data.get("inbox_conversation_summary") is None
 
 
 @pytest.mark.asyncio

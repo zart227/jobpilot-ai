@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<title>Synthetic offline Kwork adapter contract, not a captured live page</title>
+<style>
+  .trumbowyg-editor { min-height: 80px; border: 1px solid #aaa; white-space: pre-wrap; }
+  .vs__dropdown-option { padding: 8px; cursor: pointer; }
+</style>
+<form id="offer">
+  <div class="trumbowyg-box">
+    <div class="trumbowyg-editor" placeholder="Как вы будете решать задачу?" contenteditable="true"></div>
+    <textarea name="description" hidden></textarea>
+  </div>
+  <input type="number" name="price" value="5000">
+  <div class="v-select">
+    <span class="vs__selected">1 день</span>
+    <input placeholder="Срок выполнения" type="search" value="">
+    <ul role="listbox">
+      <li role="option" class="vs__dropdown-option" data-days="17">17 дней</li>
+      <li role="option" class="vs__dropdown-option" data-days="7">7 дней</li>
+    </ul>
+  </div>
+  <button type="submit">Предложить</button>
+</form>
+<script>
+  window.submitCount = 0;
+  window.lastSubmitted = null;
+  window.publishedChanges = [];
+  for (const option of document.querySelectorAll('[data-days]')) {
+    option.addEventListener('click', () => {
+      document.querySelector('.vs__selected').textContent = option.textContent;
+      document.querySelector('input[placeholder="Срок выполнения"]').value = '';
+    });
+  }
+  document.querySelector('textarea').addEventListener('input', () => {
+    window.publishedChanges.push('input');
+  });
+  document.querySelector('textarea').addEventListener('change', () => {
+    window.publishedChanges.push('change');
+  });
+  document.querySelector('form').addEventListener('submit', event => {
+    event.preventDefault();
+    window.submitCount += 1;
+    window.lastSubmitted = {
+      content: document.querySelector('textarea[name="description"]').value,
+      price: document.querySelector('input[name="price"], input[name="kwork_price"]').value,
+      duration: document.querySelector('.vs__selected').textContent,
+    };
+  });
+</script>
+</html>

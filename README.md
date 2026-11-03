@@ -1,5 +1,7 @@
 # JobPilot AI
 
+> Статус30.10.2026: remediation не завершена (51/115 подтверждено, 64 открыто). См. [повторный аудит](docs/audit-2026-10-14.md) и [минимальный запуск](docs/remediation-plan.md#минимальный-запуск-в-работу-30102026). Dry-run signoff не означает live-приёмку.
+
 AI-powered freelance automation system for a single developer. JobPilot AI scrapes job boards, filters and scores opportunities with AI, generates personalized proposals, routes them through Telegram for human approval, sends approved proposals, handles client chat, and learns from outcomes.
 
 ## Architecture
@@ -126,6 +128,12 @@ curl -X POST http://localhost:8000/scrape/trigger
     - **EDIT** — send revised text, then auto-send
     - **SKIP** — ignore job, record reward = 0
 
+After the approval-path deployment, an admin can reply `/rereview` to an old approval
+card, or use `/rereview proposal <pending UUID>` / `/rereview inbox <pending UUID>`.
+This queues one fresh full-text review with a new confirmation step. Active,
+uncertain, confirmed, or protected delivery states block reissue. See the
+[operator recovery guide](docs/operator-review-reissue.md) for limits and rollout prerequisites.
+
 ### 5. Remote dev agent (Telegram → Cursor)
 
 Talk to a local Cursor agent from Telegram to debug, check status, or change the project remotely.
@@ -231,30 +239,34 @@ MIT
 ```dotenv
 OPENROUTER_API_KEY=ваш-ключ
 LLM_SIMPLE_PROVIDER=openrouter
-OPENROUTER_SIMPLE_MODEL=openrouter/free
+OPENROUTER_SIMPLE_MODEL=auto
 OPENROUTER_FALLBACK_TO_OLLAMA=true
 ```
 
-Ключ создаётся на https://openrouter.ai/settings/keys. `openrouter/free` выбирает
-доступную бесплатную модель; для стабильного поведения можно указать конкретный
-идентификатор с `:free` из актуального каталога OpenRouter. Не добавляйте `:free`
-к произвольной модели: бесплатный вариант должен существовать в каталоге.
+Ключ создаётся на https://openrouter.ai/settings/keys.
 
-Основные отклики, чаты и оценка заказов при таком выборе используют `LLM_PROVIDER`.
-Чтобы перевести их на OpenRouter, задайте `LLM_PROVIDER=openrouter` и
-`OPENROUTER_MODEL=openrouter/free`. Когда `LLM_SIMPLE_PROVIDER=ollama`, оценка
-по-прежнему использует `OLLAMA_SCORING_MODEL`, а резерв Ollama — OpenAI.
+**Режимы выбора модели**
 
-При HTTP 402/429, временном сбое сети/сервера, пустом или обрезанном ответе
-OpenRouter переключается на `OLLAMA_MODEL`, если резерв включён. В этой ветке
-переход Ollama на платный OpenAI отключён. Ошибки ключа не маскируются резервом.
-Для строгого режима без резерва задайте `OPENROUTER_FALLBACK_TO_OLLAMA=false`.
-Проверка JSON агентами сохраняется; некорректный JSON обрабатывается существующей
-валидацией. Бесплатные модели имеют квоты и могут быть недоступны при нагрузке.
+| Значение | Поведение |
+| -------- | --------- |
+| `auto` или `openrouter/free` | Сервис запрашивает `GET /api/v1/models`, выбирает модель с **нулевыми prompt и completion** в `pricing` (остальные поля pricing, если присутствуют, тоже должны быть 0) и достаточным text-контекстом. Список кэшируется (`OPENROUTER_MODELS_CACHE_SECONDS`). |
+| Явный id (`vendor/model:free`) | Модель передаётся в API как есть; авто-проверка цены не выполняется — ответственность оператора. |
+
+Суффикс `:free` **не** считается доказательством бесплатности в автоматическом режиме.
+
+**Ollama:** `OLLAMA_MODEL=auto` и `OLLAMA_SCORING_MODEL=auto` сверяют `/api/tags` и `/api/show` (completion и контекст). Для `https://ollama.com` дополнительно читается список free usage аккаунта в settings через `OLLAMA_SESSION_COOKIE` и `OLLAMA_AID`; API-ключ и сессия должны принадлежать одному аккаунту. Требуются квота меньше 100%, нулевой pay-as-you-go balance и отключённый auto-reload; модели с предупреждением retirement исключаются. При недоступной сессии, изменении разметки или неоднозначных данных выбор блокируется; кэш до 5 минут, платный OpenAI fallback в auto отключён. Это не серверная гарантия отсутствия списаний при параллельных изменениях аккаунта или израсходовании квоты. Изменения рабочего `.env` и перезапуск для применения выполняются отдельно.
+
+**Fallback:** при 402/429/сетевых сбоях OpenRouter может перейти на Ollama (`OPENROUTER_FALLBACK_TO_OLLAMA=true`), без скрытого перехода на платный OpenAI в этой ветке. При `OPENROUTER_FALLBACK_TO_OLLAMA=false` или пустом списке подходящих бесплатных моделей ошибка возвращается явно. Ollama при `OLLAMA_AUTO_FALLBACK` может перейти на платный `OPENAI_*` — отключайте, если нужен строго бесплатный контур.
+
+Основные отклики и чаты используют `LLM_PROVIDER`; для OpenRouter задайте `LLM_PROVIDER=openrouter` и `OPENROUTER_MODEL=auto` или явный id.
 
 OpenRouter использует общий `PROXY`, если задан, или отдельный
 `OPENROUTER_PROXY_LIST`; список OpenAI автоматически не наследуется.
-Учёт баланса OpenAI не включает OpenRouter. Журнал этапов показывает настроенную
-модель, а не фактическую модель бесплатного маршрутизатора или резерва.
+Учёт баланса OpenAI не включает OpenRouter. Журнал этапов показывает настроенное
+имя (`auto(catalog)` для автоматического режима), а не каждый резервный вызов.
 Эмбеддинги остаются на OpenAI и требуют отдельного `OPENAI_API_KEY`.
 После изменения `.env` перезапустите приложение и Celery workers.
+
+### Access and acceptance changes (2026-10-15)
+
+Network API data/control routes require API_AUTH_TOKEN even with the legacy API_AUTH_REQUIRED=false setting; without a configured token they return503. Telegram groups require TELEGRAM_ADMIN_USER_ID. Simulation evidence cannot close live criteria. See [Block A implementation and configuration](docs/block-a-access-and-evidence.md).

@@ -1,0 +1,833 @@
+{
+  "date": "2026-10-14",
+  "source_commit": "4b3c400",
+  "status_definitions": {
+    "done": "проверенное исходное исправление",
+    "partial": "есть реализация, но критерий полностью не выполнен",
+    "rework": "критерий нарушен; требуется переделка",
+    "unverified": "нет достаточного доказательства"
+  },
+  "verification": {
+    "baseline_unit": "159 passed, 17 skipped, 14.39 s",
+    "baseline_isolated_integration": "176 passed, 13.97 s",
+    "ruff": "passed",
+    "pip_check": "passed",
+    "fresh_alembic": "0004 passed",
+    "runtime_db_revision": "20261013_0004",
+    "runtime_unauthenticated_jobs_http": 200,
+    "runtime_auth_required": false,
+    "runtime_api_token_set": false,
+    "runtime_telegram_admin_user_set": false,
+    "runtime_platform_dry_run": false,
+    "runtime_confirmed_dry_run_proposals": 12,
+    "external_send_performed": false,
+    "working_db_mutated": false,
+    "final_unit": "159 passed, 17 skipped, 15.91 s",
+    "final_isolated_integration": "176 passed, 13.51 s",
+    "release_gate": "exit 1: 71 open; expected blocked",
+    "audit_test_database_removed": true,
+    "reaudit_20261030": {
+      "unit_pytest_no_integration": "366 passed, 198 skipped, ~30 s",
+      "checklist_confirmed": 51,
+      "checklist_open": 64,
+      "working_db_mutated": false,
+      "live_external_calls": false,
+      "full_isolated_pg_redis_chromium": "not rerun this session",
+      "llm_model_auto_selection": "app/llm/model_catalog.py + 8 unit tests; live OpenRouter/Ollama catalog not called"
+    },
+    "reaudit_20261030_continued": {
+      "integration_pytest": "537 passed, 27 skipped, ~61 s (jobpilot_ai_test)",
+      "browser_dom_pytest": "27 passed with JOBPILOT_BROWSER_TESTS=1",
+      "alembic_head_test_db": "20261015_0007",
+      "alembic_head_working_db": "20261015_0007 (via api container migrate on start)",
+      "readiness_smoke": "200 ready=true",
+      "openrouter_live": "420 models, 19 zero prompt+completion, auto cohere/north-mini-code:free, one complete OK",
+      "ollama_live": "23 installed on ollama.com",
+      "staging_drills": "automated script OK; cursor-bridge skipped (telegram-bot down)"
+    }
+  },
+  "probes": {
+    "unapproved_draft_different_content_claim": "proceed",
+    "parallel_retry_claim_actions": [
+      "proceed",
+      "proceed"
+    ],
+    "stale_worker_can_clear_new_claim": true,
+    "hired_rewards_different_keys": 100,
+    "outbox_after_proposal_commit": 0,
+    "outbox_finalize_requires_token": false,
+    "outbox_status_after_unfenced_finalize": "sent",
+    "reconcile_accepts_prefix_only": true,
+    "scoring_boolean_coerced": 1.0,
+    "filter_string_boolean_coerced": true,
+    "learning_schema_accepts_unknown_negative_weights": {
+      "oops": -1.0
+    },
+    "embedding_write_silently_returns_success_shape": true,
+    "different_embedding_dimensions_share_collection": true,
+    "valid_bearer_random_secondary_header_changes_rate_bucket": true
+  },
+  "findings": [
+    {
+      "num": 1,
+      "priority": "P1",
+      "title": "Без защиты API и открытые порты",
+      "status": "partial",
+      "notes": "15.10: fail-closed API guard исправлен; runtime GET без токена503. Verified identity rate quota/Lua исправлены. Runtime token configuration, bridge и полная deployment-проверка остаются; см. блок A.",
+      "evidence": [
+        "app/api/auth.py:24",
+        "app/api/rate_limit.py:23"
+      ]
+    },
+    {
+      "num": 2,
+      "priority": "P1",
+      "title": "Telegram approval и inbox без проверки администратора",
+      "status": "partial",
+      "notes": "15.10: groups требуют user+chat; private chat проверяет owner ID, invalid identity отклоняется. Middleware regression test проходит. Запущенный bot не перезапускался; version approval — блок B.",
+      "evidence": [
+        "app/telegram/access.py:40",
+        "app/telegram/bot.py:722"
+      ]
+    },
+    {
+      "num": 3,
+      "priority": "P1",
+      "title": "Новые входящие могут потеряться при сбое",
+      "status": "partial",
+      "notes": "30.10: ON CONFLICT предотвращает падение конкурентных inserts с одинаковым message ID; fallback без ID нестабилен между процессами. LLM вызывается до durable insert, retry не гарантирован. R06, R08.",
+      "evidence": [
+        "app/services/kwork_inbox.py:366"
+      ]
+    },
+    {
+      "num": 4,
+      "priority": "P1",
+      "title": "Повторная отправка ответа клиенту",
+      "status": "partial",
+      "notes": "30.10: business claims/fencing, immutable approvals и full-text review; inbox send exceptions после начала запроса считаются ambiguous. Остаток: callback/FSM, outbox/history, operator unknown resolution. R03–R05.",
+      "evidence": [
+        "app/services/send_attempt_service.py:70"
+      ]
+    },
+    {
+      "num": 5,
+      "priority": "P1",
+      "title": "Гонки при отправке откликов",
+      "status": "partial",
+      "notes": "30.10: no proxy retry после submit exception; browser success без точной receipt и post-click failure → unknown_result. Live form params/receipt, operator resolution и resubmit остаются открытыми. R03–R05.",
+      "evidence": [
+        "app/services/send_attempt_service.py:299"
+      ]
+    },
+    {
+      "num": 6,
+      "priority": "P1",
+      "title": "Свежая БД не получает UNIQUE и CHECK из schema.sql",
+      "status": "partial",
+      "notes": "Fresh upgrade и текущая БД на 0004 с UNIQUE/CHECK подтверждены. Legacy migration/immutable revisions и параллельный DDL не закрыты. R12.",
+      "evidence": [
+        "alembic/versions/20261013_0001_jobpilot_schema.py:61",
+        "docker/entrypoint.sh:25"
+      ]
+    },
+    {
+      "num": 7,
+      "priority": "P1",
+      "title": "Одновременные pipeline создают дубли и конфликтующие статусы",
+      "status": "rework",
+      "notes": "Persist/recovery fencing добавлен, 30.10 отдельные ошибки scrape/jobs изолированы и C061 закрыт. Queue/backoff, heartbeat и concurrent upsert незавершены. R07.",
+      "evidence": [
+        "app/services/job_pipeline.py:146",
+        "app/services/job_processing.py:123"
+      ]
+    },
+    {
+      "num": 8,
+      "priority": "P1",
+      "title": "Ошибка LLM превращается в обычную фильтрацию",
+      "status": "partial",
+      "notes": "Filter/scoring ошибки отделены от filtered, но next_attempt не записывается и queue не гарантирует retry; proposal errors не унифицированы. R07.",
+      "evidence": [
+        "app/tasks/scrape_tasks.py:52",
+        "app/services/job_pipeline.py:168"
+      ]
+    },
+    {
+      "num": 9,
+      "priority": "P1",
+      "title": "Чужой заказ может попасть в контекст ответа",
+      "status": "partial",
+      "notes": "30.10: несовпавший явный project ID и unbound refresh больше не переходят на username fallback. Selector, thread isolation и проверка старых связей остаются. R09.",
+      "evidence": [
+        "app/services/kwork_job_match.py:84"
+      ]
+    },
+    {
+      "num": 10,
+      "priority": "P1",
+      "title": "Уведомления об откликах не восстанавливаются автоматически",
+      "status": "rework",
+      "notes": "30.10: outbox fencing и partial-delivery guard реализованы; proposal/outbox ещё не в одной TX, recovery отсутствующих событий и poller conflicts не закрыты. R06.",
+      "evidence": [
+        "app/services/job_pipeline.py:243",
+        "app/telegram/bot.py:399"
+      ]
+    },
+    {
+      "num": 11,
+      "priority": "P2",
+      "title": "Пауза Kwork останавливает все площадки и переписку",
+      "status": "done",
+      "notes": "Введены is_kwork_offers_paused/is_kwork_inbox_paused и per-platform обработка. Проверены unit policy; реальная политика коннектов не проверялась.",
+      "evidence": [
+        "app/tasks/scrape_tasks.py:138"
+      ]
+    },
+    {
+      "num": 12,
+      "priority": "P2",
+      "title": "Ошибка Qdrant прерывает бизнес-процесс",
+      "status": "rework",
+      "notes": "QdrantClient sync и eager constructor остались; constructor ProposalAgent/LearningAgent может оборвать workflow до try. R08.",
+      "evidence": [
+        "app/memory/qdrant_store.py:32",
+        "app/agents/proposal_agent.py:100"
+      ]
+    },
+    {
+      "num": 13,
+      "priority": "P2",
+      "title": "Hash-векторы не обеспечивают семантическую память",
+      "status": "partial",
+      "notes": "Hash fallback удалён; provider выделен. Dimension/provider/version не включены в collection identity, silent skip теряет индексирование. R08.",
+      "evidence": [
+        "app/memory/qdrant_store.py:43"
+      ]
+    },
+    {
+      "num": 14,
+      "priority": "P2",
+      "title": "API /chat не использует сохранённую переписку",
+      "status": "partial",
+      "notes": "30.10: общий service использует confirmed snapshot и исключает явно помеченный dry-run. Thread isolation и достоверность исторических confirmed статусов остаются открыты. R09.",
+      "evidence": [
+        "app/services/kwork_conversation.py:104"
+      ]
+    },
+    {
+      "num": 15,
+      "priority": "P2",
+      "title": "Успешные отклики не попадают в обучение через outcomes API",
+      "status": "partial",
+      "notes": "Learning получает proposal context после outcome; нет durable learning event/retry, fallback допускает draft. R10.",
+      "evidence": [
+        "app/services/outcome_service.py:199"
+      ]
+    },
+    {
+      "num": 16,
+      "priority": "P2",
+      "title": "Исходы и rewards можно записать многократно",
+      "status": "rework",
+      "notes": "Одинаковый event key идемпотентен; разные keys начисляют hired повторно. Transition helper не вызывается. R10.",
+      "evidence": [
+        "app/services/outcome_service.py:110"
+      ]
+    },
+    {
+      "num": 17,
+      "priority": "P2",
+      "title": "Learning меняет веса без валидированной статистики",
+      "status": "partial",
+      "notes": "Валидация и min count/rollback есть; качество не оценивается, одна активная версия не защищена от гонки. R10.",
+      "evidence": [
+        "app/agents/learning_agent.py:128"
+      ]
+    },
+    {
+      "num": 18,
+      "priority": "P2",
+      "title": "Некорректный scoring JSON получает 50 баллов",
+      "status": "partial",
+      "notes": "30.10: scoring/filter/chat/learning валидируются строго, лишние поля и невалидные веса отклоняются; C056/C057 закрыты. Retry classification остаётся R11.",
+      "evidence": [
+        "app/schemas/llm_outputs.py:35"
+      ]
+    },
+    {
+      "num": 19,
+      "priority": "P2",
+      "title": "Связь с клиентом без external_id может объединить разных людей",
+      "status": "done",
+      "notes": "NULL external_id больше не используется для поиска существующего клиента. Unit tests проходят. Конкурентный insert с известным ID — отдельный остаток R07.",
+      "evidence": [
+        "app/services/job_pipeline.py:64"
+      ]
+    },
+    {
+      "num": 20,
+      "priority": "P2",
+      "title": "Generic scraper теряет относительные ссылки",
+      "status": "done",
+      "notes": "urljoin, URL-based identity и optional count исправлены; tests проходят, stubs документированы. URL stability зависит от площадки.",
+      "evidence": [
+        "app/scrapers/generic.py:92"
+      ]
+    },
+    {
+      "num": 21,
+      "priority": "P2",
+      "title": "Проверки не покрывают критические сценарии",
+      "status": "partial",
+      "notes": "176 существующих тестов проходят на отдельной БД, но воспроизводимые критические дефекты не покрыты; многие тесты проверяют helper/галочки. R15.",
+      "evidence": [
+        "tests/test_send_attempt_inbox_concurrency.py:1"
+      ]
+    },
+    {
+      "num": 22,
+      "priority": "P3",
+      "title": "Долговечность эксплуатации и воспроизводимость сборки",
+      "status": "rework",
+      "notes": "30.10 smoke отклоняет 503, restore create-only, rollout проверяет backup digest/формат. Изолированный restore и provenance не подтверждены; Docker не использует lock, mounts сливаются. R13–R16.",
+      "evidence": [
+        "Dockerfile:23",
+        "docker-compose.prod.yml:10"
+      ]
+    },
+    {
+      "num": 23,
+      "priority": "P3",
+      "title": "Дубли функций и замечания линтера",
+      "status": "done",
+      "notes": "Повтор greeting убран; Ruff чистый. Текущая конфигурация в основном E/F: отсутствие более широких правил не доказывает их соблюдение.",
+      "evidence": [
+        "app/utils/formatting.py:230"
+      ]
+    }
+  ],
+  "new_findings": [
+    {
+      "id": "R01",
+      "priority": "P1",
+      "title": "Работающий API открыт; Telegram identity не обязательна",
+      "source": "app/api/auth.py:24; app/config.py:31; app/telegram/access.py:58",
+      "problem": "Действующий API: API_AUTH_REQUIRED=false, token пуст, /jobs без credentials → HTTP 200. Порт 8000 опубликован на 0.0.0.0 и IPv6. Admin user ID пуст: проверка пропускает любого участника разрешённого group chat. Для приватного admin-чата это не доказывает обход посторонним; групповой режим небезопасен.",
+      "fix": "Fail-closed auth для сетевого режима, обязательный user_id для групп и /dev. Проверить реальную runtime-конфигурацию после отдельного согласованного запуска. Не ограничиваться unit tests с другими settings.",
+      "implementation_20261015": {
+        "status": "code_fixed_deployment_partial",
+        "evidence": "docs/block-a-access-and-evidence.md"
+      }
+    },
+    {
+      "id": "R02",
+      "priority": "P2",
+      "title": "Rate limit можно менять неиспользуемым заголовком",
+      "source": "app/api/rate_limit.py:23; app/api/auth.py:68",
+      "problem": "Auth выбирает корректный Bearer, но rate key выбирает X-API-Key. Один и тот же пользователь с валидным Bearer и разным посторонним X-API-Key получает разные buckets; probe подтвердил. INCR+EXPIRE также не атомарны.",
+      "fix": "Ключ квоты от проверенной identity, отдельная квота IP для неавторизованных запросов; атомарный Redis script и ограничение очереди затратных задач.",
+      "implementation_20261015": {
+        "status": "fixed",
+        "evidence": "docs/block-a-access-and-evidence.md"
+      }
+    },
+    {
+      "id": "R03",
+      "priority": "P1",
+      "title": "Send claim по-прежнему неатомарен",
+      "source": "app/services/send_attempt_service.py:70; tests/test_send_attempt_inbox_concurrency.py:1",
+      "problem": "SELECT и UPDATE без row-lock/CAS; два reader для existing known_failed оба вернули proceed. На initial insert UNIQUE предотвращает дубликат строки, но один caller получает IntegrityError вместо штатного blocked. Разный content hash создаёт другую попытку того же pending.",
+      "fix": "Claim по бизнес-объекту с row lock/CAS и безопасным conflict handling, а не только ключу содержимого; одновременные connections/processes, включая retry/edit/resubmit.",
+      "implementation_block_b1": {
+        "status": "fixed_claims",
+        "evidence": "docs/block-b-send-claims.md"
+      }
+    },
+    {
+      "id": "R04",
+      "priority": "P1",
+      "title": "Отправка не проверяет одобрение конкретного текста",
+      "source": "app/services/send_attempt_service.py:299; app/services/send_attempt_service.py:340; app/telegram/bot.py:693",
+      "problem": "prepare_proposal_send для draft и другого никогда не одобренного текста вернул proceed. Inbox допускает pending и произвольный reply_text. TelegramPending не фиксирует approved version/hash; старая карточка может одобрить regenerated content.",
+      "fix": "Approval record/snapshot версии, content hash, цены и длительности; sender обязан требовать его. Regenerate/Edit блокируются на sending/unknown либо создают новую версию с новым approval; все пути и скрипты проходят guard.",
+      "implementation_block_b1": {
+        "status": "partial",
+        "evidence": "docs/block-b-send-claims.md"
+      },
+      "implementation_20261016": {
+        "status": "partial",
+        "done": "Immutable approval events, sender exact matching, full-text review, conservative DOM guard;333 unified tests passed",
+        "remaining": "all callbacks/operator re-review, real DOM/staging and remaining form params, explicit resubmit",
+        "evidence": "docs/block-b-browser-contract.md"
+      },
+      "implementation_block_b2_10": {
+        "status": "partial",
+        "done": "Safe explicit rereview without automatic approval/send;376 full+10 final targeted passed",
+        "remaining": "All callback/form/override acceptance",
+        "evidence": "docs/operator-review-reissue.md"
+      },
+      "implementation_block_b2_11": {
+        "status": "partial",
+        "done": "Removed automatic payment selection and page-derived title; known optional controls block fill and submit readback",
+        "remaining": "Actual DOM, explicit approval of title/payment and other fields, external payload receipt",
+        "evidence": "docs/block-b-browser-contract.md"
+      }
+    },
+    {
+      "id": "R05",
+      "priority": "P1",
+      "title": "Reconcile способен ложно подтвердить отправку",
+      "source": "app/services/send_attempt_reconcile.py:52; app/services/send_attempt_reconcile.py:143; app/services/send_attempt_service.py:185",
+      "problem": "Inbox сверка принимает первые 40 символов, без времени и message ID: probe подтвердил чужую продолженную реплику как новую отправку. Proposal сверяется по наличию offer на проекте без сравнения snapshot/версии. Reconcile из claim выполняется при открытой DB TX; обработка expired attempt может конфликтовать с состоянием отдельной сессии. mark_unknown допускает null token и может перезаписать уже завершённый статус.",
+      "fix": "Сверка exact normalized content + sender + message ID/time boundary; proposal — snapshot версии/параметров. Неоднозначность → needs_attention. Статусы менять CAS по разрешённому состоянию/token; закрывать TX до внешней сверки.",
+      "implementation_block_b1": {
+        "status": "partial",
+        "evidence": "docs/block-b-send-claims.md"
+      },
+      "implementation_20261030": {
+        "status": "partial",
+        "done": "No browser proxy retry after submit exception; post-click errors and generic success without payload receipt remain unknown; inbox send exceptions are ambiguous",
+        "remaining": "Payload-specific receipt, operator resolution, full crash/stage end-to-end acceptance",
+        "evidence": "docs/remediation-progress.md"
+      }
+    },
+    {
+      "id": "R06",
+      "priority": "P1",
+      "title": "Outbox не закрывает окно потери approval; finalize без fencing",
+      "source": "app/services/job_pipeline.py:243; app/telegram/bot.py:399; app/services/notification_outbox.py:128",
+      "problem": "Persist proposal committed отдельно; controlled probe сразу после него обнаружил 0 outbox для job. notify создаёт отдельный pending с уникальным UUID каждый раз, поэтому его повтор не идемпотентен по proposal version. Outbox success/failure не требуют token: probe завершил чужой активный claim.",
+      "fix": "Proposal + pending + outbox в одной TX, стабильный business key версии, recovery отсутствующих events. Success/failure CAS с token; polling dedup через ON CONFLICT. Разделить durable inbound capture и обработку LLM.",
+      "implementation_20261030": {
+        "status": "partial",
+        "done": "Outbox token/state fencing, partial delivery forbids automatic retry; known-ID insert conflicts handled; new inbox confirmation/reconciliation atomically persists outbound history",
+        "remaining": "Legacy outbound history gaps, concurrent LLM before inbound capture, summary LLM may hold a DB transaction, unstable fallback identity, proposal/outbox atomicity, external reconciliation",
+        "evidence": "docs/remediation-progress.md"
+      }
+    },
+    {
+      "id": "R07",
+      "priority": "P1",
+      "title": "Pipeline не защищён от старого worker и не имеет полноценного retry",
+      "source": "app/services/job_pipeline.py:146; app/services/job_processing.py:92; app/tasks/scrape_tasks.py:52",
+      "problem": "persist_pipeline_results не принимает claim token и может очистить чужой новый claim — probe подтверждён. stale recovery без CAS. record_processing_error не вызывается, error branch не задаёт next_attempt, queue не явно выбирает retryable_error и ставит terminal jobs с is_relevant=NULL; job_allows_pipeline_persist не исключает filtered/permanent_error. ProposalAgent возвращает обычный error без processing flag.",
+      "fix": "Token-aware persist/recovery, heartbeat/lease, отдельный due retry selector с лимитом попыток и backoff, terminal exclusions. Единый error protocol всех агентов; concurrent save_normalized_job — upsert/retry на UNIQUE conflict.",
+      "implementation_20261030_d4": {
+        "status": "partial",
+        "done": "Isolate scraper and per-job failures, diagnostic counts; fix task module import cycle; C061 confirmed",
+        "remaining": "Durable retry, heartbeat/lease and concurrent upsert",
+        "evidence": "docs/remediation-progress.md"
+      }
+    },
+    {
+      "id": "R08",
+      "priority": "P2",
+      "title": "Qdrant и embeddings исправлены только частично",
+      "source": "app/memory/qdrant_store.py:32; app/memory/qdrant_store.py:43; app/memory/qdrant_store.py:126; app/tasks/embedding_tasks.py:22",
+      "problem": "Sync client и eager get_collections в constructor остаются. ProposalAgent/LearningAgent создают память до try. EmbeddingUnavailableError при записи глотается: вызов возвращает None и считается успешным, pending может сброситься. Collections не учитывают provider/dimension/version; одинаковые model и разные dims дают одно имя. Reindex выбирает только последние 500 jobs, старые могут голодать; successful proposals не восстанавливаются.",
+      "fix": "Async/lazy Qdrant; явный результат indexed/deferred; durable embedding queue для jobs/success/edit, фильтрация pending в SQL; collection signature provider+model+dim+version и staged reindex."
+    },
+    {
+      "id": "R09",
+      "priority": "P2",
+      "title": "Контекст не изолирован по thread; needs_context нельзя разрешить",
+      "source": "app/services/kwork_job_match.py:84; app/services/kwork_conversation.py:104; app/services/conversation_context_service.py:25",
+      "problem": "После несовпавшего явного project ID есть fallback username. needs_context только выводится как текст, выбора job в handlers нет. DB history фильтруется по job/channel, не thread; весь Kwork thread может смешать проекты/будущие сообщения при обработке старого inbound. Proposal content читается из mutable Proposal, не confirmed attempt.",
+      "fix": "Точные thread/project связи и запрет fallback при конфликтующем явном ID; selector и повторная генерация с явным context. Snapshot отправки, message-id cutoff, изоляция history/cache.",
+      "implementation_20261030_d5": {
+        "status": "partial",
+        "done": "Conflicting explicit project ID and unbound refresh no longer fall back to username; input project ID recorded",
+        "remaining": "Manual selector, legacy links review, thread isolation and cutoff",
+        "evidence": "docs/remediation-progress.md"
+      },
+      "implementation_20261030_d6": {
+        "status": "partial",
+        "done": "Chat context uses exact confirmed proposal snapshot and excludes explicit dry-run; rejects mismatched proposal",
+        "remaining": "Historic confirmation evidence, thread isolation and receipt validity",
+        "evidence": "docs/remediation-progress.md"
+      }
+    },
+    {
+      "id": "R10",
+      "priority": "P2",
+      "title": "Rewards, transitions и обучение остаются ненадёжными",
+      "source": "app/services/outcome_service.py:110; app/services/outcome_service.py:199; app/agents/learning_agent.py:128",
+      "problem": "Два hired с разными event keys дали +100. allows_transition определён, но не вызывается. Outcome committed до синхронного learning; падение после commit не повторяет learning, потому что duplicate.created=False. Существующий draft может попасть в sent_proposal_for_learning fallback. Нет DB unique active weights и оценки качества помимо минимального count.",
+      "fix": "Дедупликация business milestone независимо от transport key; transitions/corrections, durable learning event + retry и snapshot confirmed send. Активная версия весов под DB guard и измеримая оценка перед активацией."
+    },
+    {
+      "id": "R11",
+      "priority": "P2",
+      "title": "Pydantic-схемы не обеспечивают заявленную strict-валидацию",
+      "source": "app/schemas/llm_outputs.py:15; app/schemas/llm_outputs.py:35; app/schemas/llm_outputs.py:142",
+      "problem": "Scoring True приводится к 1.0 до field validator; Filter \"true\" принимается как bool. Learning schema принимает неизвестный negative weight; последующая activation validation есть, но parsed payload не строгий. Тесты проверяют missing/range/NaN, не coercion.",
+      "fix": "Strict types/pre-validators для числа и bool, exact keys learning; ошибки различать по этапу и типу. Добавить adversarial JSON tests без дефолтного прохода.",
+      "implementation_20261030": {
+        "status": "partial",
+        "done": "Scoring criteria and filter/chat/learning output types and keys strictly validated; C056/C057 confirmed",
+        "remaining": "Retry classification and scheduling",
+        "evidence": "docs/remediation-progress.md"
+      }
+    },
+    {
+      "id": "R12",
+      "priority": "P2",
+      "title": "Миграции зависят от текущих моделей; DDL стартует из всех сервисов",
+      "source": "alembic/versions/20261013_0001_jobpilot_schema.py:65; docker/entrypoint.sh:25",
+      "problem": "Baseline использует текущий Base.metadata.create_all и на чистой БД создаёт таблицы будущих ревизий. Следующие миграции условные; fresh/legacy схемы могут различаться. Каждый app entrypoint выполняет upgrade head. Существующая рабочая БД на0004 проверена read-only, но копия legacy не прогнана в этом аудите.",
+      "fix": "Frozen explicit migrations, отдельный migration service/single runner с DDL coordination. Fresh/legacy schema diff, upgrade/downgrade и preservation fixtures; не применять переписанные старые revisions вслепую к production."
+    },
+    {
+      "id": "R13",
+      "priority": "P2",
+      "title": "Production config не воспроизводит lock и image-only режим",
+      "source": "Dockerfile:23; docker-compose.prod.yml:10; scripts/verify_lockfile.sh:15",
+      "problem": "Docker устанавливает pip install . и playwright без requirements-lock. Compose merge оставляет /app/app, scripts, alembic mounts; нет healthcheck apps. Verify lock не подтверждает соответствие pyproject зависимостям и не фиксирует build tooling.",
+      "fix": "Frozen install в image и CI consistency check; отдельный production file/!reset mounts с совместимой Compose-версией, healthcheck/readiness и права volume. Проверять rendered config."
+    },
+    {
+      "id": "R14",
+      "priority": "P2",
+      "title": "Метрики ошибочно считают отправки и не содержат стоимость",
+      "source": "app/services/ops_metrics.py:24; app/services/ops_metrics.py:61; app/services/proposal_sender.py:189",
+      "problem": "Outbox metrics используют claimed, тогда как workflow — sending. Jobs processing считается по отсутствующему рабочему status вместо claim. Confirmed send считает inbox и dry-run как внешнюю отправку. Рабочая БД содержит 12 confirmed dry-run proposal attempts. Нет per-call tokens/USD/connect costs и полных этапов воронки.",
+      "fix": "Отдельный simulation scope, exclusion dry-run и attempt.kind, метрики claim/stage, last_success/queue age; billing ledger с provider usage и milestone attribution без двойного учёта."
+    },
+    {
+      "id": "R15",
+      "priority": "P1",
+      "title": "Приёмка и аудит формально закрывались без доказательств",
+      "source": "scripts/generate_acceptance_signoff.py:83; scripts/validate_live_signoff.py:40; tests/test_remediation_checklist_inventory.py:8",
+      "problem": "Generator dry-run пишет ui_matches_db=True и сам назначает approved_by. Validator проверяет непустые поля, не источник/mode/DB/UI. Existing checklist был115/115 с явными partial/unrun оговорками; tests заставляли сохранять ноль open. Матрица hard-coded addressed проверяла лишь наличие файлов.",
+      "fix": "Разделить simulated/live signoff и человеческое разрешение; dry-run не закрывает live criteria. Evidence ledger с environment/command/result/scope, честные открытые галочки. Release gate обязан краснеть при открытых blockers; report gate проверяет формат, не готовность.",
+      "implementation_20261015": {
+        "status": "code_fixed_live_unverified",
+        "evidence": "docs/block-a-access-and-evidence.md"
+      }
+    },
+    {
+      "id": "R16",
+      "priority": "P1",
+      "title": "Restore drill может удалить рабочую БД; rollout smoke допускает 503",
+      "source": "scripts/restore_postgres_drill.sh:12; scripts/readiness_smoke.sh:17; scripts/production_rollout.sh:15",
+      "problem": "DRILL_DB берётся из env без allowlist/сравнения с working DB и подставляется в DROP DATABASE и SQL. Не запускался destructive probe: риск виден в коде. readiness_smoke возвращает 0 на503; rollout только печатает напоминание о backup и не проверяет его.",
+      "fix": "Жёсткий isolated DB guard, безопасный quoting, запрет рабочего имени/host, explicit подтверждение. Rollout требует проверенный backup и ready=true; 503 допускается только в failure drill, где ожидание задано отдельно.",
+      "implementation_20261030_f1": {
+        "status": "partial",
+        "done": "Create-only validated drill DB name and gzip, readiness 503 failure, rollout backup digest/format and smoke guards",
+        "remaining": "Separate server and trusted dump required; real isolated restore and backup provenance verification unproven",
+        "evidence": "docs/remediation-progress.md"
+      }
+    }
+  ],
+  "checklist": {
+    "total": 115,
+    "closed": 51,
+    "open": 64,
+    "closed_ids": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005",
+      "C007",
+      "C008",
+      "C009",
+      "C011",
+      "C013",
+      "C014",
+      "C017",
+      "C019",
+      "C020",
+      "C021",
+      "C022",
+      "C033",
+      "C034",
+      "C037",
+      "C038",
+      "C039",
+      "C042",
+      "C044",
+      "C046",
+      "C048",
+      "C049",
+      "C055",
+      "C056",
+      "C057",
+      "C061",
+      "C062",
+      "C063",
+      "C064",
+      "C070",
+      "C072",
+      "C073",
+      "C074",
+      "C075",
+      "C076",
+      "C077",
+      "C078",
+      "C081",
+      "C084",
+      "C087",
+      "C088",
+      "C091",
+      "C095",
+      "C099",
+      "C107",
+      "C108",
+      "C113"
+    ]
+  },
+  "checklist_at_audit_20261014": {
+    "total": 115,
+    "closed": 44,
+    "open": 71,
+    "closed_ids": [
+      "C001",
+      "C002",
+      "C003",
+      "C004",
+      "C005",
+      "C008",
+      "C011",
+      "C013",
+      "C014",
+      "C017",
+      "C019",
+      "C020",
+      "C021",
+      "C022",
+      "C026",
+      "C028",
+      "C033",
+      "C034",
+      "C039",
+      "C044",
+      "C046",
+      "C048",
+      "C055",
+      "C062",
+      "C063",
+      "C064",
+      "C070",
+      "C072",
+      "C073",
+      "C074",
+      "C075",
+      "C076",
+      "C077",
+      "C078",
+      "C081",
+      "C084",
+      "C087",
+      "C088",
+      "C091",
+      "C095",
+      "C099",
+      "C107",
+      "C108",
+      "C113"
+    ]
+  },
+  "implementation_progress": {
+    "date": "2026-10-30",
+    "block_c3_d6": {
+      "scope": "Atomic outbound interaction on inbox confirmation/reconciliation and confirmed proposal snapshots in chat context",
+      "closed_criteria": [],
+      "reopened_criteria": [
+        "C043"
+      ],
+      "remaining": "Existing confirmed attempts with missing history, historic receipt validity, summary LLM DB transactions, process-crash acceptance",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/remediation-progress.md"
+    },
+    "block_c2_d4_f1": {
+      "scope": "Concurrent inbound insert, explicit project context guard, per-source/job error isolation, task import cycle and rollout/restore guards",
+      "tests": "525 passed, 0 skipped on disposable PostgreSQL/Redis and offline Chrome; 3 additional isolated DB inbox tests; 5 checklist tests; Ruff, shell syntax and diff checks",
+      "closed_criteria": [
+        "C061"
+      ],
+      "reopened_criteria": [
+        "C026"
+      ],
+      "remaining": "Fallback inbound hash is process-dependent; LLM before durable capture; actual isolated restore and backup provenance unverified",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/remediation-progress.md"
+    },
+    "block_c1_d3_b3": {
+      "scope": "Outbox fencing/partial delivery, strict LLM schemas, uncertain Kwork submission handling",
+      "tests": "489 passed, 0 skipped on disposable PostgreSQL/Redis and offline Chrome; 5 checklist tests; Ruff, pip check, diff check passed",
+      "closed_criteria": [
+        "C057"
+      ],
+      "reopened_criteria": [
+        "C028"
+      ],
+      "remaining": "Inbound poller conflicts, durable late receipt/operator recovery, payload-specific external confirmation, live form acceptance",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/remediation-progress.md"
+    },
+    "scope": "Block A access, rate identity and acceptance evidence; runtime token/config unchanged",
+    "tests": "212 passed, isolated PostgreSQL + Redis,17.26s",
+    "regressions_before_fix": "3 failed (API auth flag, group user identity, rate header bypass)",
+    "runtime_unauthenticated_jobs_http": 503,
+    "closed_criteria": [
+      "C007",
+      "C009"
+    ],
+    "telegram_restart_performed": false,
+    "live_acceptance_performed": false,
+    "details": "docs/block-a-access-and-evidence.md",
+    "block_b1": {
+      "date": "2026-10-15",
+      "scope": "atomic business claims, explicit status/content guards, send fencing and conservative reconciliation",
+      "before": "7 regression tests failed",
+      "tests": "232 passed, isolated PostgreSQL/Redis,24.66s",
+      "closed_criteria": [
+        "C037",
+        "C038",
+        "C043",
+        "C049"
+      ],
+      "details": "docs/block-b-send-claims.md",
+      "working_db_modified": false,
+      "deployment_performed": false
+    },
+    "block_b2_1": {
+      "date": "2026-10-15",
+      "scope": "FSM preview message/chat/content binding, inbox card transfer, proposal edit original version guard",
+      "tests": "239 passed, isolated PostgreSQL/Redis,31.88s;28 targeted passed",
+      "closed_criteria": [],
+      "remaining": "Durable approval snapshot, ordinary approval version binding, frozen price/duration/payload, in-flight edit/regenerate guard",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_2": {
+      "date": "2026-10-15",
+      "scope": "Telegram edit delivery guards and regeneration preflight/locked commit/version fencing",
+      "tests": "249 passed, isolated PostgreSQL/Redis,30.75s",
+      "initial_test_failure": "4 failures: fake run still constructed live Qdrant client; fixture now disables constructor; initial local requests returned500",
+      "closed_criteria": [],
+      "remaining": "durable approval snapshot, frozen payload and parameters, ordinary approval version binding, other pipeline/script write paths",
+      "working_postgresql_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_d1": {
+      "date": "2026-10-15",
+      "scope": "Token-fenced pipeline persist, token propagation, locked release/error, skip-locked recovery",
+      "tests": "256 passed full isolated PostgreSQL/Redis,42.54s;10 targeted passed after final protected-error change,7.23s",
+      "closed_criteria": [],
+      "remaining": "C053 lease/heartbeat, terminal filtered/permanent and freshness/error paths; B durable approval remains open",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/remediation-progress.md"
+    },
+    "block_b2_3": {
+      "date": "2026-10-15",
+      "scope": "Inbox maintenance refresh CAS and supersede/new approval card/outbox atomic transaction",
+      "tests": "268 full isolated tests,33.63s;11 targeted after final changes,8.19s",
+      "closed_criteria": [],
+      "remaining": "Durable approval snapshot, ordinary approval version binding, frozen price/duration/exact payload; outbox fencing separate",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_4": {
+      "date": "2026-10-15",
+      "scope": "Immutable presented proposal card payload; ordinary approval/edit stale guard; migration0005",
+      "tests": "276 full isolated tests,34.20s;6 targeted tests,0.70s;fresh0005 and0004→0005",
+      "closed_criteria": [],
+      "remaining": "Human approval event/actor and sender actual-payload enforcement; edit/inbox/resubmit binding",
+      "migration_required_before_deployment": "20261015_0005",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_5": {
+      "date": "2026-10-15",
+      "scope": "Immutable proposal human approval event and mandatory sender exact-payload matching; ordinary and edited callbacks",
+      "tests": "284 full isolated tests,32.14s;10 targeted,8.84s;fresh0006 and0005→0006",
+      "closed_criteria": [],
+      "remaining": "Frozen actual browser text/price/duration, durable inbox approval, resubmit policy, full callback flow acceptance",
+      "migration_required_before_deployment": "20261015_0006 (includes0005)",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_6": {
+      "date": "2026-10-15",
+      "scope": "Frozen proposal text/price/duration propagation, pre-submit DOM readback, fail-closed existing-offer edit",
+      "tests": "295 full isolated tests,39.65s;13 targeted,4.84s",
+      "closed_criteria": [],
+      "remaining": "HTML fixture/staging verification, other form parameters, separate edit-existing approval, durable inbox approval",
+      "migration_required_before_deployment": "20261015_0006 (includes0005)",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_7": {
+      "date": "2026-10-15",
+      "scope": "Immutable inbox presentation/human approval, exact sender/API payload enforcement, real DB callback verification",
+      "tests": "308 full isolated tests,33.13s;11 targeted,10.07s;fresh0007 and0006→0007",
+      "closed_criteria": [
+        "C042"
+      ],
+      "remaining": "Full-text UI review/all callbacks, exact thread/context selector, HTML/staging form, resubmit/edit-existing, operator legacy re-review",
+      "migration_required_before_deployment": "20261015_0007",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_8": {
+      "date": "2026-10-16",
+      "scope": "Full exact Telegram text review, UTF-16 multipart with final controls, legacy format invalidation, stale Skip guard",
+      "tests": "316 full isolated tests,51.17s;11 targeted after final blank-header change,7.69s",
+      "closed_criteria": [],
+      "remaining": "All callback/FSM acceptance, operator legacy re-review, browser HTML/staging, thread context selector, edit-existing/resubmit",
+      "migration_required_before_deployment": "20261015_0007 (unchanged head)",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-send-claims.md"
+    },
+    "block_b2_9": {
+      "date": "2026-10-16",
+      "scope": "Real Chromium synthetic offline DOM contract, exact editor/textarea synchronization, unique same-form controls, selected duration, production pre-submit mismatch guard",
+      "before": "6 failed,6 passed,12.48s",
+      "tests": "333 passed,42.89s,unified isolated PostgreSQL/Redis+Chromium,0 skips;30 targeted passed,19.85s;5 checklist tests passed",
+      "closed_criteria": [],
+      "remaining": "Current live DOM/staging, other form params/title/payment, payload-specific receipt, operator legacy re-review, full callback/context acceptance",
+      "ci": "browser-form-contract configured; YAML parsed; remote run not performed",
+      "migration_required_before_deployment": "20261015_0007 (unchanged)",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/block-b-browser-contract.md",
+      "initial_intermediate_tests": "316 passed,15 DOM opt-in skips,27.80s before final production path cases;superseded by combined333 run"
+    },
+    "block_b2_10": {
+      "date": "2026-10-16",
+      "scope": "Explicit admin rereview reply/UUID, atomic/idempotent pending/presentation/outbox, sender race/delivery guards, scoped FSM cleanup",
+      "tests": "376 unified tests,61.48s,0 skips;10 final command tests after FSM/response changes,4.51s;36 new DB/service cases in full run",
+      "closed_criteria": [],
+      "remaining": "Full operator queue/manual unknown resolution/immutable override journal, all callback/FSM, remaining form params/staging/receipt, edit-existing",
+      "migration_required_before_deployment": "20261015_0007 (unchanged)",
+      "working_db_modified": false,
+      "deployment_performed": false,
+      "details": "docs/operator-review-reissue.md"
+    },
+    "reaudit_20261030": {
+      "date": "2026-10-30",
+      "scope": "Independent doc/code re-audit; OpenRouter/Ollama model auto-selection",
+      "tests": "366 passed, 198 skipped (unit-only); 18 passed model_catalog+openrouter subset",
+      "checklist": "51/115 confirmed, 64 open",
+      "working_db_modified": false,
+      "live_external_calls": false,
+      "details": "docs/remediation-progress.md, docs/remediation-plan.md#минимальный-запуск-в-работу-30102026"
+    }
+  }
+}

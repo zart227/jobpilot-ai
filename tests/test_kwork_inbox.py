@@ -71,6 +71,13 @@ def test_format_client_message_alert_needs_context() -> None:
     assert "Нужен выбор заказа" in text
 
 
+def test_unknown_project_does_not_claim_two_matching_jobs() -> None:
+    msg = ClientInboxMessage(user_id=1, username="buyer", message_id="42", text="Вопрос",
+                             timestamp=0, dialog={}, raw={})
+    text = format_client_message_alert(msg, needs_context=True, candidate_job_count=0)
+    assert "найдено 2" not in text
+
+
 def test_format_client_message_alert() -> None:
     msg = ClientInboxMessage(
         user_id=1,
@@ -163,3 +170,17 @@ def test_conversation_from_interactions_excludes_latest_client() -> None:
     history = conversation_from_interactions(rows, exclude_last_client_text="Какой срок?")
     assert len(history) == 2
     assert history[-1]["role"] == "freelancer"
+
+
+def test_conversation_excludes_explicit_simulated_outbound_message() -> None:
+    from app.db.models import Interaction
+
+    rows = [
+        Interaction(direction="inbound", message="Вопрос", channel="kwork"),
+        Interaction(direction="outbound", message="Не отправлено", channel="kwork",
+                    metadata_={"dry_run": True}),
+        Interaction(direction="outbound", message="Реальный ответ", channel="kwork",
+                    metadata_={"dry_run": False}),
+    ]
+    history = conversation_from_interactions(rows)
+    assert [turn["text"] for turn in history] == ["Вопрос", "Реальный ответ"]

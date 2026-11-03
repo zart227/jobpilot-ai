@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import html
 import json
 import re
 import uuid
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import structlog
-from aiogram.enums import ParseMode
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert
 
 from app.agents.chat_agent import ChatAgent
 from app.config import Settings, get_settings
@@ -21,11 +24,16 @@ from app.db.models import (
     InboundMessage,
     Interaction,
     Job,
+    NotificationOutbox,
     Proposal,
     TelegramInboxPending,
 )
 from app.db.session import AsyncSessionLocal
-from app.services.conversation_context_service import build_chat_agent_state
+from app.services.conversation_context_service import (
+    build_chat_agent_state,
+    finalize_chat_agent_state,
+)
+from app.services.inbox_approval import capture_inbox_presentation
 from app.services.kwork_api import (
     KworkApiError,
     KworkAuthError,
@@ -37,10 +45,12 @@ from app.services.kwork_conversation import (
 )
 from app.services.kwork_job_match import find_kwork_job_for_message
 from app.services.notification_outbox import deliver_notification_outbox, enqueue_notification
-from app.services.send_attempt_service import finalize_send_attempt, prepare_inbox_reply_send
-from app.telegram.keyboards import inbox_reply_keyboard
+from app.services.send_attempt_service import (
+    delivery_blocks_mutation,
+    finalize_send_attempt,
+    prepare_inbox_reply_send,
+)
 from app.utils.formatting import extract_site_order_id, sanitize_proposal_text
-from app.utils.proxy import create_telegram_bot
 
 logger = structlog.get_logger(__name__)
 
@@ -52,6 +62,7 @@ class InboxState:
     seen_keys: list[str]
     my_username: str = ""
     last_check_at: float = 0.0
+    identity_ambiguities: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> InboxState:
@@ -110,12 +121,35 @@ def _message_key(user_id: int | str, message: dict[str, Any]) -> str:
     msg_id = message.get("MID") or message.get("id") or message.get("message_id")
     if msg_id:
         return f"{user_id}:{msg_id}"
-    ts = message.get("time") or message.get("sent_timestamp") or 0
-    text = clean_kwork_message_text(str(message.get("message", message.get("text", ""))))[:80]
-    return f"{user_id}:{ts}:{hash(text)}"
+    try:
+        ts = int(message.get("time") or message.get("sent_timestamp") or 0)
+    except (TypeError, ValueError, OverflowError):
+        ts = 0
+    text = clean_kwork_message_text(str(message.get("message", message.get("text", ""))))
+    if ts <= 0 or not text.strip():
+        raise ValueError("message without platform ID requires timestamp and text")
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return f"{user_id}:v2:{ts}:{digest}"
 
 
-async def _fetch_kwork_thread(username: str, settings: Settings | None = None) -> list[dict[str, Any]]:
+def _legacy_fallback_keys(state: InboxState, user_id: int | str, timestamp: int) -> list[str]:
+    pattern = re.compile(rf"^{re.escape(str(user_id))}:{timestamp}:-?\d+$")
+    return [key for key in state.seen_keys if pattern.fullmatch(key)]
+
+
+async def _legacy_inbound_exists(session, user_id: int, timestamp: int, body: str) -> bool:
+    rows = await session.scalars(select(InboundMessage.message_key).where(
+        InboundMessage.platform == "kwork", InboundMessage.kwork_user_id == user_id,
+        InboundMessage.message_key.like(f"{user_id}:{timestamp}:%"),
+        InboundMessage.body == body,
+    ))
+    pattern = re.compile(rf"^{user_id}:{timestamp}:-?\d+$")
+    return any(pattern.fullmatch(key) for key in rows)
+
+
+async def _fetch_kwork_thread(
+    username: str, settings: Settings | None = None
+) -> list[dict[str, Any]]:
     settings = settings or get_settings()
     api = None
     try:
@@ -161,10 +195,10 @@ async def _generate_inbox_reply(
     my_username: str = "",
     my_user_id: int | None = None,
 ) -> tuple[str, str]:
+    thread = thread_messages
+    if not thread and username:
+        thread = await _fetch_kwork_thread(username)
     async with AsyncSessionLocal() as session:
-        thread = thread_messages
-        if not thread and username:
-            thread = await _fetch_kwork_thread(username)
         agent_state = await build_chat_agent_state(
             session,
             job.id,
@@ -176,8 +210,13 @@ async def _generate_inbox_reply(
             proposal=proposal,
         )
 
+    agent_state = await finalize_chat_agent_state(agent_state)
     chat_agent = ChatAgent()
     result = await chat_agent.run(agent_state)
+    if result.get("pipeline_processing_error") or not str(result.get("chat_reply", "")).strip():
+        kind = result.get("processing_error_kind", "unknown")
+        detail = result.get("error") or "empty draft"
+        raise RuntimeError(f"inbox reply generation failed ({kind}): {detail}")
     return str(result.get("chat_intent", "")), str(result.get("chat_reply", ""))
 
 
@@ -219,9 +258,13 @@ def format_client_message_alert(
     lines.append(f"<b>Сообщение:</b>\n{text}")
 
     if needs_context:
-        count = candidate_job_count or 2
+        reason = (
+            f"найдено {candidate_job_count} подходящих заказов. "
+            if candidate_job_count > 1
+            else "связанный заказ не определён. "
+        )
         lines.append(
-            f"\n⚠️ <b>Нужен выбор заказа</b>: найдено {count} подходящих заказов. "
+            f"\n⚠️ <b>Нужен выбор заказа</b>: {reason}"
             "Черновик не привязан к конкретному заказу — уточните проект вручную."
         )
 
@@ -234,7 +277,9 @@ def format_client_message_alert(
             reply = reply[:1197] + "..."
         lines.append(f"\n<b>Черновик ответа:</b>\n{reply}")
     elif not chat_reply.strip():
-        lines.append("\n<i>Черновик не сгенерирован — нажмите EDIT и напишите ответ или инструкцию.</i>")
+        lines.append(
+            "\n<i>Черновик не сгенерирован — нажмите EDIT и напишите ответ или инструкцию.</i>"
+        )
 
     body = "\n".join(lines)
     return body[:4096]
@@ -256,6 +301,7 @@ async def send_kwork_inbox_reply(
         pending_id=pending_id,
         reply_text=reply_text,
         expected_user_id=user_id,
+        expected_username=username,
     )
     if claim.action == "already_sent":
         return True, None
@@ -264,9 +310,14 @@ async def send_kwork_inbox_reply(
     if claim.action != "proceed" or not claim.attempt_id or not claim.claim_token:
         return False, claim.reason or "send_blocked"
 
+    approved = claim.approved_payload
+    if not approved:
+        return False, "durable_approval_required"
+    user_id, username, reply_text = approved["user_id"], approved["username"], approved["content"]
     api = None
     error: str | None = None
     success = False
+    send_started = False
     if settings.platform_dry_run:
         logger.info(
             "Platform dry-run: skipping Kwork inbox reply API",
@@ -277,12 +328,13 @@ async def send_kwork_inbox_reply(
     try:
         if not success:
             api = await create_kwork_api(settings)
+            send_started = True
             await api.send_message(user_id, reply_text)
+            success = True
             try:
                 await api.mark_read(username)
-            except KworkApiError as exc:
+            except Exception as exc:
                 logger.warning("Kwork mark_read failed", username=username, error=str(exc))
-            success = True
     except KworkApiError as exc:
         error = str(exc)
         logger.error("Kwork inbox reply failed", username=username, error=error)
@@ -291,38 +343,23 @@ async def send_kwork_inbox_reply(
         logger.error("Kwork inbox reply unexpected error", username=username, error=error)
     finally:
         if api is not None:
-            await api.close()
+            try:
+                await api.close()
+            except Exception as exc:
+                logger.warning("Kwork inbox API close failed", error=str(exc))
 
     finalized = await finalize_send_attempt(
         claim.attempt_id,
         claim.claim_token,
         success=success,
         error=error,
-        platform_response={"username": username, "user_id": user_id},
+        platform_response={"username": username, "user_id": user_id, "dry_run": settings.platform_dry_run},
+        ambiguous=send_started and not success,
     )
     if not finalized:
         return False, "Устаревший claim отправки"
 
     if success:
-        async with AsyncSessionLocal() as session:
-            session.add(
-                Interaction(
-                    job_id=job_id,
-                    proposal_id=proposal_id,
-                    direction="outbound",
-                    channel="kwork",
-                    message=reply_text,
-                    intent="reply_sent",
-                    metadata_={
-                        "username": username,
-                        "user_id": user_id,
-                        "pending_id": str(pending_id),
-                        "interaction_id": str(interaction_id) if interaction_id else None,
-                        "send_attempt_id": str(claim.attempt_id),
-                    },
-                )
-            )
-            await session.commit()
         logger.info("Kwork inbox reply sent", username=username, user_id=user_id)
         return True, None
     return False, error
@@ -338,12 +375,20 @@ async def _inbound_already_recorded(session, platform: str, message_key: str) ->
     return result.scalar_one_or_none() is not None
 
 
+async def _inbound_or_legacy_recorded(session, msg: ClientInboxMessage, key: str) -> bool:
+    if await _inbound_already_recorded(session, "kwork", key):
+        return True
+    if not (msg.raw.get("MID") or msg.raw.get("id") or msg.raw.get("message_id")):
+        return await _legacy_inbound_exists(session, msg.user_id, msg.timestamp, msg.text)
+    return False
+
+
 async def _seed_inbound_message(msg: ClientInboxMessage) -> None:
     message_key = _message_key(msg.user_id, msg.raw)
     async with AsyncSessionLocal() as session:
-        if await _inbound_already_recorded(session, "kwork", message_key):
+        if await _inbound_or_legacy_recorded(session, msg, message_key):
             return
-        inbound = InboundMessage(
+        statement = insert(InboundMessage).values(
             platform="kwork",
             message_key=message_key,
             thread_key=str(msg.user_id),
@@ -353,8 +398,261 @@ async def _seed_inbound_message(msg: ClientInboxMessage) -> None:
             raw_metadata={"seeded": True, "timestamp": msg.timestamp},
             status="seeded",
         )
-        session.add(inbound)
+        await session.execute(statement.on_conflict_do_nothing(
+            constraint="uq_inbound_platform_message_key"
+        ))
         await session.commit()
+
+
+def _inbox_match_revision(match) -> tuple:
+    job = match.job if not match.needs_context else None
+    proposal = match.proposal if not match.needs_context else None
+    return (
+        match.needs_context,
+        tuple(sorted(str(candidate.id) for candidate in match.candidate_jobs)),
+        (job.id, job.platform, job.external_id, job.title, job.description, job.status, job.client_id,
+         job.url, job.deadline, job.budget_min, job.budget_max, job.budget_currency,
+         tuple(job.skills or ()))
+        if job else None,
+        (proposal.id, proposal.updated_at, proposal.version, proposal.content, proposal.status)
+        if proposal else None,
+    )
+
+
+async def _eager_capture_platform_messages(
+    dialog: dict[str, Any],
+    client_messages: list[dict[str, Any]],
+    *,
+    user_id: int,
+    username: str,
+    thread: list[dict[str, Any]],
+) -> None:
+    """Commit rows with platform message IDs immediately after get_messages (C027)."""
+    for message in client_messages:
+        if not (message.get("MID") or message.get("id") or message.get("message_id")):
+            continue
+        try:
+            _message_key(user_id, message)
+        except ValueError:
+            continue
+        text = clean_kwork_message_text(str(message.get("message", message.get("text", ""))))
+        if not text.strip():
+            continue
+        platform_id = message.get("MID") or message.get("id") or message.get("message_id")
+        await _capture_inbound(
+            ClientInboxMessage(
+                user_id=int(user_id),
+                username=username,
+                message_id=str(platform_id),
+                text=text,
+                timestamp=int(message.get("time") or message.get("sent_timestamp") or 0),
+                dialog=dialog,
+                raw=message,
+                thread=list(thread),
+            )
+        )
+
+
+async def _capture_inbound(msg: ClientInboxMessage) -> None:
+    """Commit the incoming message before any generation or external work."""
+    message_key = _message_key(msg.user_id, msg.raw)
+    project_id = _extract_project_id(msg.raw, msg.dialog)
+    platform_id = msg.raw.get("MID") or msg.raw.get("id") or msg.raw.get("message_id")
+    async with AsyncSessionLocal() as session:
+        if (not platform_id
+                and await _legacy_inbound_exists(session, msg.user_id, msg.timestamp, msg.text)):
+            return
+        statement = insert(InboundMessage).values(
+            platform="kwork", message_key=message_key, thread_key=str(msg.user_id),
+            kwork_user_id=msg.user_id, kwork_username=msg.username, body=msg.text,
+            raw_metadata={"timestamp": msg.timestamp, "project_id": project_id,
+                          "platform_message_id": str(platform_id) if platform_id else None},
+            status="received",
+        ).on_conflict_do_nothing(constraint="uq_inbound_platform_message_key")
+        await session.execute(statement)
+        await session.commit()
+
+
+INBOUND_GENERATION_LEASE_SECONDS = 900
+INBOUND_GENERATION_MAX_ATTEMPTS = 5
+
+
+async def _enqueue_generation_exhausted_operator_alert(
+    session,
+    inbound: InboundMessage,
+    *,
+    target_chat: int,
+) -> None:
+    metadata = dict(inbound.raw_metadata or {})
+    if metadata.get("generation_exhausted_notified_at"):
+        return
+    attempts = int(metadata.get("generation_attempts") or INBOUND_GENERATION_MAX_ATTEMPTS)
+    user_line = html.escape(inbound.kwork_username or "")
+    body_preview = html.escape((inbound.body or "")[:200])
+    alert_text = (
+        "⚠️ Kwork inbound: исчерпаны попытки генерации ответа.\n"
+        f"Пользователь: {inbound.kwork_user_id} ({user_line})\n"
+        f"message_key: {html.escape(inbound.message_key)}\n"
+        f"inbound_id: {inbound.id}\n"
+        f"попыток: {attempts}\n"
+        f"Текст (начало): {body_preview}\n"
+        f"Requeue: ops_inbound_recovery.py --id {inbound.id} --apply"
+    )
+    await enqueue_notification(
+        kind="ops_alert",
+        idempotency_key=f"inbound_generation_exhausted:{inbound.id}",
+        chat_id=target_chat,
+        payload={"alert_text": alert_text},
+        reference_type="inbound_message",
+        reference_id=inbound.id,
+        session=session,
+    )
+    metadata["generation_exhausted_notified_at"] = datetime.now(UTC).isoformat()
+    inbound.raw_metadata = metadata
+
+
+async def _maybe_notify_generation_exhausted(
+    session,
+    inbound: InboundMessage,
+    *,
+    target_chat: int | None = None,
+) -> None:
+    if inbound.status != "needs_attention" or inbound.inbox_pending_id is not None:
+        return
+    chat = target_chat
+    if chat is None:
+        admin = get_settings().telegram_admin_chat_id
+        if not admin:
+            return
+        chat = int(admin)
+    await _enqueue_generation_exhausted_operator_alert(session, inbound, target_chat=chat)
+
+
+async def _claim_inbound_generation(msg: ClientInboxMessage, project_id: str | None) -> str | None:
+    """Claim a received message without holding a transaction during LLM work."""
+    key = _message_key(msg.user_id, msg.raw)
+    async with AsyncSessionLocal() as session:
+        inbound = await session.scalar(select(InboundMessage).where(
+            InboundMessage.platform == "kwork", InboundMessage.message_key == key,
+        ).with_for_update())
+        if (inbound is None or inbound.status != "received"
+                or inbound.kwork_user_id != msg.user_id or inbound.body != msg.text
+                or inbound.kwork_username != msg.username
+                or (inbound.raw_metadata or {}).get("project_id") != project_id):
+            return None
+        now = datetime.now(UTC)
+        metadata = dict(inbound.raw_metadata or {})
+        if metadata.get("generation_retry_after", "") > now.isoformat():
+            return None
+        if metadata.get("generation_claim_until", "") > now.isoformat():
+            return None
+        attempts = int(metadata.get("generation_attempts") or 0)
+        if attempts >= INBOUND_GENERATION_MAX_ATTEMPTS:
+            inbound.status = "needs_attention"
+            metadata.pop("generation_claim_token", None)
+            metadata.pop("generation_claim_until", None)
+            inbound.raw_metadata = metadata
+            await _maybe_notify_generation_exhausted(session, inbound)
+            await session.commit()
+            return None
+        token = str(uuid.uuid4())
+        metadata["generation_attempts"] = attempts + 1
+        metadata["generation_claim_token"] = token
+        metadata["generation_claim_until"] = (
+            now + timedelta(seconds=INBOUND_GENERATION_LEASE_SECONDS)
+        ).isoformat()
+        metadata.pop("generation_retry_after", None)
+        inbound.raw_metadata = metadata
+        await session.commit()
+        return token
+
+
+def _claim_is_current(inbound: InboundMessage, token: str) -> bool:
+    metadata = inbound.raw_metadata or {}
+    return (inbound.status == "received" and metadata.get("generation_claim_token") == token
+            and metadata.get("generation_claim_until", "") > datetime.now(UTC).isoformat())
+
+
+async def _renew_inbound_claim(message_key: str, token: str) -> bool:
+    async with AsyncSessionLocal() as session:
+        inbound = await session.scalar(select(InboundMessage).where(
+            InboundMessage.platform == "kwork", InboundMessage.message_key == message_key,
+        ).with_for_update())
+        if inbound is None or not _claim_is_current(inbound, token):
+            return False
+        metadata = dict(inbound.raw_metadata or {})
+        metadata["generation_claim_until"] = (
+            datetime.now(UTC) + timedelta(seconds=INBOUND_GENERATION_LEASE_SECONDS)
+        ).isoformat()
+        inbound.raw_metadata = metadata
+        await session.commit()
+        return True
+
+
+async def _inbound_claim_heartbeat(message_key: str, token: str) -> None:
+    while True:
+        await asyncio.sleep(max(0.05, INBOUND_GENERATION_LEASE_SECONDS / 3))
+        if not await _renew_inbound_claim(message_key, token):
+            raise RuntimeError("inbound generation claim lost")
+
+
+async def _generate_with_inbound_claim(message_key: str, token: str, **kwargs) -> tuple[str, str]:
+    generation = asyncio.create_task(_generate_inbox_reply(**kwargs))
+    heartbeat = asyncio.create_task(_inbound_claim_heartbeat(message_key, token))
+    try:
+        done, _ = await asyncio.wait((generation, heartbeat), return_when=asyncio.FIRST_COMPLETED)
+        if heartbeat in done:
+            # A failed renewal may mean another worker owns the message; discard this result.
+            await heartbeat
+            raise RuntimeError("inbound generation heartbeat stopped")
+        return await generation
+    finally:
+        for task in (generation, heartbeat):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(generation, heartbeat, return_exceptions=True)
+
+
+def _release_inbound_claim(inbound: InboundMessage, *, failed: bool) -> None:
+    metadata = dict(inbound.raw_metadata or {})
+    metadata.pop("generation_claim_token", None)
+    metadata.pop("generation_claim_until", None)
+    attempts = int(metadata.get("generation_attempts") or 0)
+    if attempts >= INBOUND_GENERATION_MAX_ATTEMPTS:
+        inbound.status = "needs_attention"
+    elif failed:
+        delay = min(3600, 60 * (2 ** min(max(0, attempts - 1), 6)))
+        metadata["generation_retry_after"] = (datetime.now(UTC) + timedelta(seconds=delay)).isoformat()
+    inbound.raw_metadata = metadata
+
+
+async def _defer_inbound_retry(message_key: str, token: str, *, target_chat: int | None = None) -> None:
+    async with AsyncSessionLocal() as session:
+        inbound = await session.scalar(select(InboundMessage).where(
+            InboundMessage.platform == "kwork", InboundMessage.message_key == message_key,
+        ).with_for_update())
+        if inbound is None or not _claim_is_current(inbound, token):
+            return
+        _release_inbound_claim(inbound, failed=True)
+        await _maybe_notify_generation_exhausted(session, inbound, target_chat=target_chat)
+        await session.commit()
+
+
+async def requeue_inbound_for_review(session, inbound_id: uuid.UUID) -> bool:
+    """Requeue a failed inbound explicitly; never alter already-created reviews."""
+    inbound = await session.get(InboundMessage, inbound_id, with_for_update=True)
+    if (inbound is None or inbound.platform != "kwork" or inbound.status != "needs_attention"
+            or inbound.interaction_id is not None or inbound.inbox_pending_id is not None):
+        return False
+    metadata = dict(inbound.raw_metadata or {})
+    for key in ("generation_attempts", "generation_claim_token", "generation_claim_until",
+                "generation_retry_after"):
+        metadata.pop(key, None)
+    metadata["operator_requeued_at"] = datetime.now(UTC).isoformat()
+    inbound.raw_metadata = metadata
+    inbound.status = "received"
+    await session.flush()
+    return True
 
 
 async def _persist_inbound_bundle(
@@ -368,16 +666,13 @@ async def _persist_inbound_bundle(
     """Persist inbound + draft + outbox in one transaction. Returns pending_id or None if duplicate."""
     message_key = _message_key(msg.user_id, msg.raw)
 
+    project_id = _extract_project_id(msg.raw, msg.dialog)
+    await _capture_inbound(msg)
+
+    claim_token = await _claim_inbound_generation(msg, project_id)
+    if claim_token is None:
+        return None
     async with AsyncSessionLocal() as session:
-        if await _inbound_already_recorded(session, "kwork", message_key):
-            return None
-
-        job: Job | None = None
-        proposal: Proposal | None = None
-        chat_intent = ""
-        chat_reply = ""
-
-        project_id = _extract_project_id(msg.raw, msg.dialog)
         match = await find_kwork_job_for_message(
             session,
             username=msg.username,
@@ -386,38 +681,51 @@ async def _persist_inbound_bundle(
         needs_context = match.needs_context
         job = match.job if not needs_context else None
         proposal = match.proposal if not needs_context else None
+        revision = _inbox_match_revision(match)
 
-        if job:
-            try:
-                chat_intent, chat_reply = await _generate_inbox_reply(
-                    job,
-                    proposal,
-                    msg.text,
-                    username=msg.username,
-                    thread_messages=msg.thread,
-                    my_username=my_username,
-                    my_user_id=my_user_id,
-                )
-            except Exception as exc:
-                logger.warning("ChatAgent failed for inbox message", error=str(exc))
+    chat_intent = ""
+    chat_reply = ""
+    if job:
+        try:
+            if not await _renew_inbound_claim(message_key, claim_token):
+                logger.warning("Inbox claim expired before generation", user_id=msg.user_id)
+                return None
+            chat_intent, chat_reply = await _generate_with_inbound_claim(
+                message_key, claim_token,
+                job=job,
+                proposal=proposal,
+                client_message=msg.text,
+                username=msg.username,
+                thread_messages=msg.thread,
+                my_username=my_username,
+                my_user_id=my_user_id,
+            )
+        except Exception as exc:
+            logger.warning("ChatAgent failed for inbox message", error=str(exc))
+            await _defer_inbound_retry(message_key, claim_token, target_chat=target_chat)
+            return None
 
-        inbound = InboundMessage(
-            platform="kwork",
-            message_key=message_key,
-            thread_key=str(msg.user_id),
-            kwork_user_id=msg.user_id,
-            kwork_username=msg.username,
-            body=msg.text,
-            raw_metadata={
-                "username": msg.username,
-                "user_id": msg.user_id,
-                "timestamp": msg.timestamp,
-            },
-            status="received",
+    async with AsyncSessionLocal() as session:
+        inbound = await session.scalar(select(InboundMessage).where(
+            InboundMessage.platform == "kwork", InboundMessage.message_key == message_key,
+        ).with_for_update())
+        if inbound is None or not _claim_is_current(inbound, claim_token):
+            return None
+        match = await find_kwork_job_for_message(
+            session, username=msg.username, project_id=project_id,
         )
-        session.add(inbound)
-        await session.flush()
-
+        needs_context = match.needs_context
+        job = match.job if not needs_context else None
+        proposal = match.proposal if not needs_context else None
+        if job:
+            await session.refresh(job, with_for_update=True)
+        if proposal:
+            await session.refresh(proposal, with_for_update=True)
+        if _inbox_match_revision(match) != revision:
+            logger.warning("Inbox context changed during generation", user_id=msg.user_id)
+            _release_inbound_claim(inbound, failed=True)
+            await session.commit()
+            return None
         interaction = Interaction(
             job_id=job.id if job else None,
             proposal_id=proposal.id if proposal else None,
@@ -431,6 +739,7 @@ async def _persist_inbound_bundle(
                 "message_key": message_key,
                 "timestamp": msg.timestamp,
                 "inbound_id": str(inbound.id),
+                "project_id": project_id,
                 "needs_context": needs_context,
                 "candidate_job_ids": [str(j.id) for j in match.candidate_jobs],
             },
@@ -453,8 +762,10 @@ async def _persist_inbound_bundle(
         session.add(pending)
         await session.flush()
 
+        await capture_inbox_presentation(session, pending)
         inbound.interaction_id = interaction.id
         inbound.inbox_pending_id = pending.id
+        _release_inbound_claim(inbound, failed=False)
         inbound.status = "processed"
         inbound.processed_at = datetime.now(UTC)
 
@@ -471,7 +782,13 @@ async def _persist_inbound_bundle(
             kind="inbox_alert",
             idempotency_key=f"inbox_alert:{pending_id}",
             chat_id=target_chat,
-            payload={"pending_id": pending_id, "alert_text": alert_text},
+            payload={
+                "pending_id": pending_id,
+                "alert_text": alert_text,
+                "review_format": "full_text_v1",
+                "review_content": pending.draft_reply,
+                "review_heading": f"Ответ клиенту {pending.kwork_username[:150]} (user {pending.kwork_user_id}).\nЗаказ: {pending.job_id or 'не определён'}\n{job.title[:300] if job else ''}\nВходящее сообщение:\n{pending.client_message}",
+            },
             reference_type="telegram_inbox_pending",
             reference_id=pending.id,
             session=session,
@@ -486,34 +803,57 @@ async def _collect_new_messages(
     *,
     my_username: str,
     my_user_id: int | None,
+    capture_mode: str | None = None,
 ) -> list[ClientInboxMessage]:
+    if capture_mode not in (None, "received", "seeded"):
+        raise ValueError("invalid inbox capture mode")
     dialogs = await api.get_dialogs()
-    unread = [
-        d
-        for d in dialogs
-        if int(d.get("unread_count") or 0) > 0 or d.get("unread")
-    ]
+    unread = [d for d in dialogs if int(d.get("unread_count") or 0) > 0 or d.get("unread")]
     if not unread:
         return []
 
     collected: list[ClientInboxMessage] = []
-    async with AsyncSessionLocal() as session:
-        for dialog in unread:
-            username = str(dialog.get("username") or "")
-            user_id = dialog.get("user_id")
-            if not username or not user_id:
-                continue
+    for dialog in unread:
+        username = str(dialog.get("username") or "")
+        user_id = dialog.get("user_id")
+        if not username or not user_id:
+            continue
 
-            try:
-                messages = await api.get_messages(username)
-            except KworkApiError as exc:
-                logger.warning("Kwork inbox messages failed", username=username, error=str(exc))
-                continue
+        try:
+            messages = await api.get_messages(username)
+        except KworkApiError as exc:
+            logger.warning("Kwork inbox messages failed", username=username, error=str(exc))
+            continue
 
-            for message in messages or []:
-                if not _is_from_client(message, my_username, my_user_id):
+
+        client_messages = [m for m in messages or [] if _is_from_client(m, my_username, my_user_id)]
+        if capture_mode == "received":
+            await _eager_capture_platform_messages(
+                dialog,
+                client_messages,
+                user_id=int(user_id),
+                username=username,
+                thread=list(messages or []),
+            )
+        fallback_keys = []
+        for message in client_messages:
+            if not (message.get("MID") or message.get("id") or message.get("message_id")):
+                try:
+                    fallback_keys.append(_message_key(user_id, message))
+                except ValueError:
+                    pass
+        duplicate_fallbacks = {key for key, count in Counter(fallback_keys).items() if count > 1}
+        async with AsyncSessionLocal() as session:
+            for message in client_messages:
+                try:
+                    key = _message_key(user_id, message)
+                except ValueError:
+                    state.identity_ambiguities.append({"user_id": str(user_id), "reason": "missing_timestamp_or_text"})
                     continue
-                key = _message_key(user_id, message)
+                if key in duplicate_fallbacks:
+                    timestamp = int(message.get("time") or message.get("sent_timestamp"))
+                    state.identity_ambiguities.append({"user_id": str(user_id), "timestamp": timestamp, "reason": "identical_messages_without_id"})
+                    continue
                 if state.is_seen(key):
                     continue
                 if await _inbound_already_recorded(session, "kwork", key):
@@ -523,6 +863,15 @@ async def _collect_new_messages(
                 text = clean_kwork_message_text(
                     str(message.get("message", message.get("text", "")))
                 )
+                no_id = not (message.get("MID") or message.get("id") or message.get("message_id"))
+                if no_id:
+                    timestamp = int(message.get("time") or message.get("sent_timestamp"))
+                    if await _legacy_inbound_exists(session, int(user_id), timestamp, text):
+                        state.mark_seen(key)
+                        continue
+                    if _legacy_fallback_keys(state, user_id, timestamp):
+                        state.identity_ambiguities.append({"user_id": str(user_id), "timestamp": timestamp, "reason": "legacy_state_unmatched"})
+                        continue
                 collected.append(
                     ClientInboxMessage(
                         user_id=int(user_id),
@@ -535,6 +884,13 @@ async def _collect_new_messages(
                         thread=list(messages or []),
                     )
                 )
+                if capture_mode == "received":
+                    await _capture_inbound(collected[-1])
+                elif capture_mode == "seeded":
+                    await _seed_inbound_message(collected[-1])
+
+        # Per-message capture above shrinks the window after get_messages; the next
+        # dialog fetch cannot discard messages already parsed from this thread.
 
     collected.sort(key=lambda item: item.timestamp)
     return collected
@@ -556,6 +912,8 @@ async def _process_and_notify(
 
     target_chat = int(settings.telegram_admin_chat_id)
     persisted = 0
+    for msg in messages:
+        await _capture_inbound(msg)
     for msg in messages:
         pending_id = await _persist_inbound_bundle(
             settings,
@@ -580,6 +938,41 @@ async def _process_and_notify(
 
     delivery = await deliver_notification_outbox(settings, bot=bot)
     return int(delivery.get("delivered", 0))
+
+
+async def _retry_received_inbound(
+    settings: Settings, *, bot=None, my_username: str = "", my_user_id: int | None = None,
+) -> int:
+    """Retry captured messages after errors or process restarts, even if no longer unread."""
+    if not settings.telegram_admin_chat_id:
+        return 0
+    async with AsyncSessionLocal() as session:
+        rows = (await session.scalars(select(InboundMessage).where(
+            InboundMessage.platform == "kwork", InboundMessage.status == "received",
+            or_(InboundMessage.raw_metadata["generation_retry_after"].astext.is_(None),
+                InboundMessage.raw_metadata["generation_retry_after"].astext <= datetime.now(UTC).isoformat()),
+            or_(InboundMessage.raw_metadata["generation_claim_until"].astext.is_(None),
+                InboundMessage.raw_metadata["generation_claim_until"].astext <= datetime.now(UTC).isoformat()),
+        ).order_by(InboundMessage.received_at).limit(50))).all()
+        messages = []
+        for row in rows:
+            metadata = row.raw_metadata or {}
+            timestamp = int(metadata.get("timestamp") or 0)
+            suffix = row.message_key.split(":", 1)[-1]
+            raw = {"time": timestamp, "message": row.body}
+            platform_id = metadata.get("platform_message_id")
+            if platform_id is not None:
+                raw["MID"] = platform_id
+            elif not suffix.startswith("v2:"):
+                raw["MID"] = suffix
+            messages.append(ClientInboxMessage(
+                user_id=row.kwork_user_id, username=row.kwork_username or "",
+                message_id=suffix, text=row.body, timestamp=timestamp,
+                dialog={"project_id": metadata.get("project_id")}, raw=raw,
+            ))
+    return await _process_and_notify(
+        settings, messages, bot=bot, my_username=my_username, my_user_id=my_user_id,
+    )
 
 
 async def _find_last_client_message(
@@ -625,7 +1018,9 @@ async def _find_last_client_message(
             ClientInboxMessage(
                 user_id=int(dialog_user_id),
                 username=dialog_username,
-                message_id=str(message.get("MID") or message.get("id") or message.get("message_id") or ""),
+                message_id=str(
+                    message.get("MID") or message.get("id") or message.get("message_id") or ""
+                ),
                 text=text,
                 timestamp=int(message.get("time") or message.get("sent_timestamp") or 0),
                 dialog=dialog,
@@ -711,122 +1106,187 @@ async def _get_kwork_actor(settings: Settings | None = None) -> tuple[str, int |
             await api.close()
 
 
+def _inbox_draft_revision(row: TelegramInboxPending) -> tuple:
+    return (
+        row.status,
+        row.draft_reply,
+        row.chat_intent,
+        row.chat_id,
+        row.message_id,
+        row.job_id,
+        row.proposal_id,
+        row.kwork_user_id,
+        row.kwork_username,
+        row.client_message,
+        row.interaction_id,
+    )
+
+
+async def _refresh_pending_inbox_draft(
+    pending_id: uuid.UUID,
+    settings: Settings,
+    *,
+    my_username: str,
+    my_user_id: int | None,
+) -> dict[str, Any] | None:
+    """Generate outside the TX, then supersede the old approval atomically."""
+    async with AsyncSessionLocal() as session:
+        row = await session.get(TelegramInboxPending, pending_id)
+        if not row or row.status != "pending":
+            return None
+        if await delivery_blocks_mutation(session, inbox_pending_id=row.id, include_confirmed=True):
+            return None
+        revision = _inbox_draft_revision(row)
+        job = await session.get(Job, row.job_id) if row.job_id else None
+        proposal = await session.get(Proposal, row.proposal_id) if row.proposal_id else None
+        if not job:
+            # A username alone cannot reconstruct or override the original thread context.
+            return None
+
+    # Detached input: no database transaction spans the thread fetch or generation.
+    try:
+        thread = await _fetch_kwork_thread(row.kwork_username, settings)
+        chat_intent, chat_reply = await _generate_inbox_reply(
+            job,
+            proposal,
+            row.client_message,
+            username=row.kwork_username,
+            thread_messages=thread or None,
+            my_username=my_username,
+            my_user_id=my_user_id,
+        )
+    except Exception as exc:
+        logger.warning("Inbox draft refresh failed", pending_id=str(pending_id), error=str(exc))
+        return None
+    if not chat_reply.strip():
+        return None
+
+    async with AsyncSessionLocal() as session:
+        current = await session.scalar(
+            select(TelegramInboxPending)
+            .where(TelegramInboxPending.id == pending_id)
+            .with_for_update()
+        )
+        if not current or _inbox_draft_revision(current) != revision:
+            return None
+        if await delivery_blocks_mutation(
+            session, inbox_pending_id=pending_id, include_confirmed=True
+        ):
+            return None
+        replacement = TelegramInboxPending(
+            interaction_id=current.interaction_id,
+            job_id=job.id,
+            proposal_id=proposal.id if proposal else None,
+            kwork_user_id=current.kwork_user_id,
+            kwork_username=current.kwork_username,
+            client_message=current.client_message,
+            draft_reply=chat_reply,
+            chat_intent=chat_intent or None,
+            chat_id=int(settings.telegram_admin_chat_id),
+            status="pending",
+        )
+        current.status = "superseded"
+        session.add(replacement)
+        await session.flush()
+        await capture_inbox_presentation(session, replacement)
+        msg = ClientInboxMessage(
+            user_id=current.kwork_user_id,
+            username=current.kwork_username,
+            message_id="",
+            text=current.client_message,
+            timestamp=0,
+            dialog={},
+            raw={},
+        )
+        alert = format_client_message_alert(
+            msg, job=job, chat_intent=chat_intent, chat_reply=chat_reply
+        )
+        await enqueue_notification(
+            kind="inbox_alert",
+            idempotency_key=f"inbox_alert:{replacement.id}",
+            chat_id=replacement.chat_id,
+            payload={
+                "pending_id": str(replacement.id),
+                "alert_text": alert,
+                "review_format": "full_text_v1",
+                "review_content": replacement.draft_reply,
+                "review_heading": f"Ответ клиенту {replacement.kwork_username[:150]} (user {replacement.kwork_user_id}).\nЗаказ: {replacement.job_id}\n{job.title[:300]}\nВходящее сообщение:\n{replacement.client_message}",
+            },
+            reference_type="telegram_inbox_pending",
+            reference_id=replacement.id,
+            session=session,
+        )
+        await session.commit()
+        return {
+            "pending_id": str(replacement.id),
+            "superseded_pending_id": str(pending_id),
+            "username": replacement.kwork_username,
+            "draft_preview": chat_reply[:120],
+        }
+
+
+async def _refresh_inbox_notifications(settings, *, bot=None, limit=0, usernames=None):
+    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
+        return {"skipped": True, "reason": "no_telegram"}
+    my_username, my_user_id = await _get_kwork_actor(settings)
+    async with AsyncSessionLocal() as session:
+        query = (
+            select(TelegramInboxPending.id)
+            .where(TelegramInboxPending.status == "pending")
+            .order_by(TelegramInboxPending.created_at.desc())
+        )
+        if usernames:
+            query = query.where(TelegramInboxPending.kwork_username.in_(usernames))
+        if limit > 0:
+            query = query.limit(limit)
+        ids = list((await session.scalars(query)).all())
+    items = []
+    for pending_id in ids:
+        item = await _refresh_pending_inbox_draft(
+            pending_id, settings, my_username=my_username, my_user_id=my_user_id
+        )
+        if item:
+            items.append(item)
+    delivery = (
+        await deliver_notification_outbox(settings, bot=bot, limit=max(len(items), 1))
+        if items
+        else {"delivered": 0}
+    )
+    # The global outbox batch can deliver older events; report only our new cards.
+    sent_count = 0
+    if items:
+        async with AsyncSessionLocal() as session:
+            delivered_ids = set(
+                (
+                    await session.scalars(
+                        select(NotificationOutbox.reference_id).where(
+                            NotificationOutbox.reference_type == "telegram_inbox_pending",
+                            NotificationOutbox.reference_id.in_(
+                                [uuid.UUID(item["pending_id"]) for item in items]
+                            ),
+                            NotificationOutbox.status == "sent",
+                        )
+                    )
+                ).all()
+            )
+            sent_count = len(delivered_ids)
+    return {
+        "updated": len(items),
+        "queued": len(items),
+        "sent": sent_count,
+        "items": items,
+        "delivery": delivery,
+    }
+
+
 async def regenerate_pending_inbox_drafts(
     settings: Settings | None = None,
     *,
     bot=None,
     pending_only: bool = True,
 ) -> dict[str, Any]:
-    """Regenerate draft replies for inbox pending rows and refresh Telegram messages."""
-    settings = settings or get_settings()
-    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
-        return {"skipped": True, "reason": "no_telegram"}
-
-    owns_bot = bot is None
-    if owns_bot:
-        bot = create_telegram_bot(settings.telegram_bot_token, settings)
-
-    updated = 0
-    my_username, my_user_id = await _get_kwork_actor(settings)
-    try:
-        async with AsyncSessionLocal() as session:
-            query = select(TelegramInboxPending).order_by(TelegramInboxPending.created_at.desc())
-            if pending_only:
-                query = query.where(TelegramInboxPending.status == "pending")
-            rows = list((await session.execute(query)).scalars().all())
-
-        for pending in rows:
-            async with AsyncSessionLocal() as session:
-                row = await session.get(TelegramInboxPending, pending.id)
-                if not row:
-                    continue
-                job = await session.get(Job, row.job_id) if row.job_id else None
-                proposal = (
-                    await session.get(Proposal, row.proposal_id) if row.proposal_id else None
-                )
-                if not job:
-                    match = await find_kwork_job_for_message(
-                        session,
-                        username=row.kwork_username,
-                        project_id=None,
-                    )
-                    if match.needs_context:
-                        continue
-                    job = match.job
-                    proposal = match.proposal
-                    if job:
-                        row.job_id = job.id
-                        row.proposal_id = proposal.id if proposal else None
-
-                if not job:
-                    continue
-
-                try:
-                    thread = await _fetch_kwork_thread(row.kwork_username, settings)
-                    chat_intent, chat_reply = await _generate_inbox_reply(
-                        job,
-                        proposal,
-                        row.client_message,
-                        username=row.kwork_username,
-                        thread_messages=thread or None,
-                        my_username=my_username,
-                        my_user_id=my_user_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Inbox draft regeneration failed",
-                        pending_id=str(row.id),
-                        error=str(exc),
-                    )
-                    continue
-
-                row.draft_reply = chat_reply
-                row.chat_intent = chat_intent or None
-                if proposal and not row.proposal_id:
-                    row.proposal_id = proposal.id
-                await session.commit()
-
-            if row.message_id and row.chat_id:
-                msg = ClientInboxMessage(
-                    user_id=row.kwork_user_id,
-                    username=row.kwork_username,
-                    message_id="",
-                    text=row.client_message,
-                    timestamp=0,
-                    dialog={},
-                    raw={},
-                )
-                text = format_client_message_alert(
-                    msg,
-                    job=job,
-                    chat_intent=chat_intent,
-                    chat_reply=chat_reply,
-                )
-                try:
-                    from aiogram.enums import ParseMode
-
-                    from app.telegram.keyboards import inbox_reply_keyboard
-
-                    await bot.edit_message_text(
-                        text,
-                        chat_id=row.chat_id,
-                        message_id=row.message_id,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=False,
-                        reply_markup=inbox_reply_keyboard(str(row.id)),
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to refresh inbox Telegram message",
-                        pending_id=str(row.id),
-                        error=str(exc),
-                    )
-            updated += 1
-
-        return {"updated": updated}
-    finally:
-        if owns_bot and bot is not None:
-            await bot.session.close()
+    """Replace only pending drafts; pending_only=False never reopens processed rows."""
+    return await _refresh_inbox_notifications(settings or get_settings(), bot=bot)
 
 
 async def resend_inbox_pending_notifications(
@@ -836,135 +1296,10 @@ async def resend_inbox_pending_notifications(
     usernames: list[str] | None = None,
     bot=None,
 ) -> dict[str, Any]:
-    """Regenerate drafts and send fresh Telegram notifications for pending inbox rows."""
-    settings = settings or get_settings()
-    if not settings.telegram_bot_token or not settings.telegram_admin_chat_id:
-        return {"skipped": True, "reason": "no_telegram"}
-
-    owns_bot = bot is None
-    if owns_bot:
-        bot = create_telegram_bot(settings.telegram_bot_token, settings)
-
-    target_chat = int(settings.telegram_admin_chat_id)
-    sent: list[dict[str, Any]] = []
-    my_username, my_user_id = await _get_kwork_actor(settings)
-
-    try:
-        async with AsyncSessionLocal() as session:
-            query = (
-                select(TelegramInboxPending)
-                .where(TelegramInboxPending.status == "pending")
-                .order_by(TelegramInboxPending.created_at.desc())
-            )
-            if usernames:
-                query = query.where(TelegramInboxPending.kwork_username.in_(usernames))
-            if limit > 0:
-                query = query.limit(limit)
-            rows = list((await session.execute(query)).scalars().all())
-
-        for pending in rows:
-            async with AsyncSessionLocal() as session:
-                row = await session.get(TelegramInboxPending, pending.id)
-                if not row or row.status != "pending":
-                    continue
-
-                job = await session.get(Job, row.job_id) if row.job_id else None
-                proposal = (
-                    await session.get(Proposal, row.proposal_id) if row.proposal_id else None
-                )
-                if not job:
-                    match = await find_kwork_job_for_message(
-                        session,
-                        username=row.kwork_username,
-                        project_id=None,
-                    )
-                    if match.needs_context:
-                        continue
-                    job = match.job
-                    proposal = match.proposal
-                    if job:
-                        row.job_id = job.id
-                        row.proposal_id = proposal.id if proposal else None
-
-                chat_intent = row.chat_intent or ""
-                chat_reply = row.draft_reply or ""
-                if job:
-                    try:
-                        thread = await _fetch_kwork_thread(row.kwork_username, settings)
-                        chat_intent, chat_reply = await _generate_inbox_reply(
-                            job,
-                            proposal,
-                            row.client_message,
-                            username=row.kwork_username,
-                            thread_messages=thread or None,
-                            my_username=my_username,
-                            my_user_id=my_user_id,
-                        )
-                        row.draft_reply = chat_reply
-                        row.chat_intent = chat_intent or None
-                        if proposal and not row.proposal_id:
-                            row.proposal_id = proposal.id
-                    except Exception as exc:
-                        logger.warning(
-                            "Inbox resend draft generation failed",
-                            pending_id=str(row.id),
-                            error=str(exc),
-                        )
-
-                row.chat_id = target_chat
-                await session.commit()
-                pending_id = str(row.id)
-                client_message = row.client_message
-                username = row.kwork_username
-                user_id = row.kwork_user_id
-
-            msg = ClientInboxMessage(
-                user_id=user_id,
-                username=username,
-                message_id="",
-                text=client_message,
-                timestamp=0,
-                dialog={},
-                raw={},
-            )
-            text = format_client_message_alert(
-                msg,
-                job=job,
-                chat_intent=chat_intent,
-                chat_reply=chat_reply,
-            )
-            message = await bot.send_message(
-                target_chat,
-                text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=False,
-                reply_markup=inbox_reply_keyboard(pending_id),
-            )
-            async with AsyncSessionLocal() as session:
-                row = await session.get(TelegramInboxPending, uuid.UUID(pending_id))
-                if row:
-                    row.message_id = message.message_id
-                    await session.commit()
-
-            sent.append(
-                {
-                    "pending_id": pending_id,
-                    "username": username,
-                    "message_id": message.message_id,
-                    "draft_preview": chat_reply[:120],
-                }
-            )
-            logger.info(
-                "Inbox pending notification resent",
-                username=username,
-                pending_id=pending_id,
-                message_id=message.message_id,
-            )
-
-        return {"sent": len(sent), "items": sent}
-    finally:
-        if owns_bot and bot is not None:
-            await bot.session.close()
+    """Queue fresh approval cards without changing text behind old buttons."""
+    return await _refresh_inbox_notifications(
+        settings or get_settings(), bot=bot, limit=limit, usernames=usernames
+    )
 
 
 async def check_kwork_inbox(
@@ -991,13 +1326,20 @@ async def check_kwork_inbox(
         my_username = str(actor.get("username") or state.my_username or "")
         my_user_id = actor.get("id")
         state.my_username = my_username
+        await _retry_received_inbound(
+            settings, bot=bot, my_username=my_username,
+            my_user_id=int(my_user_id) if my_user_id else None,
+        )
 
         new_messages = await _collect_new_messages(
             api,
             state,
             my_username=my_username,
             my_user_id=int(my_user_id) if my_user_id else None,
+            capture_mode="seeded" if first_run else "received",
         )
+        if state.identity_ambiguities:
+            logger.warning("Kwork inbox identity requires manual review", count=len(state.identity_ambiguities))
 
         if first_run and new_messages:
             for msg in new_messages:
@@ -1014,6 +1356,7 @@ async def check_kwork_inbox(
                 "initialized": True,
                 "seeded": len(new_messages),
                 "notified": 0,
+                "identity_ambiguities": state.identity_ambiguities,
             }
 
         notified = await _process_and_notify(
@@ -1031,6 +1374,7 @@ async def check_kwork_inbox(
             "unread_dialogs": len(new_messages),
             "persisted": len(new_messages),
             "notified": notified,
+            "identity_ambiguities": state.identity_ambiguities,
         }
     except KworkAuthError as exc:
         logger.warning("Kwork inbox check auth failed", error=str(exc))

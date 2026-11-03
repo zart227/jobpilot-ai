@@ -1,7 +1,34 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from app.schemas.llm_outputs import parse_filter_output, parse_scoring_output
+
+CRITERIA = ("skill_match", "budget", "complexity", "client_quality", "competition")
+
+
+@pytest.mark.parametrize("criterion", CRITERIA)
+@pytest.mark.parametrize("bad_value", ["50", True, False, None, float("nan"), float("inf"), float("-inf"), -1, 101])
+def test_each_scoring_criterion_rejects_invalid_raw_values(criterion, bad_value):
+    breakdown = dict.fromkeys(CRITERIA, 50)
+    breakdown[criterion] = bad_value
+    with pytest.raises((ValidationError, ValueError)):
+        parse_scoring_output(json.dumps({"breakdown": breakdown}), CRITERIA)
+
+
+@pytest.mark.parametrize("criterion", CRITERIA)
+def test_each_scoring_criterion_is_required(criterion):
+    breakdown = dict.fromkeys(CRITERIA, 50)
+    del breakdown[criterion]
+    with pytest.raises((ValidationError, ValueError)):
+        parse_scoring_output(json.dumps({"breakdown": breakdown}), CRITERIA)
+
+
+def test_scoring_accepts_integer_and_float_boundaries():
+    breakdown = dict(zip(CRITERIA, (0, 100, 0.5, 99.5, 50)))
+    result = parse_scoring_output(json.dumps({"breakdown": breakdown}), CRITERIA)
+    assert result.breakdown.model_dump() == breakdown
 
 
 def test_parse_filter_output() -> None:

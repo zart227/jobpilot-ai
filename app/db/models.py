@@ -50,7 +50,9 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         UniqueConstraint("platform", "external_id", name="uq_jobs_platform_external_id"),
-        CheckConstraint("score IS NULL OR (score >= 0 AND score <= 100)", name="ck_jobs_score_range"),
+        CheckConstraint(
+            "score IS NULL OR (score >= 0 AND score <= 100)", name="ck_jobs_score_range"
+        ),
         Index("idx_jobs_status", "status"),
         Index("idx_jobs_platform", "platform"),
         Index("idx_jobs_processing_next_attempt", "processing_next_attempt_at"),
@@ -67,7 +69,9 @@ class Job(Base):
     skills: Mapped[list[str]] = mapped_column(JSONB, default=list)
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     url: Mapped[str | None] = mapped_column(String(1024))
-    client_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("clients.id", ondelete="SET NULL"))
+    client_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("clients.id", ondelete="SET NULL")
+    )
     raw_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     is_relevant: Mapped[bool | None] = mapped_column(Boolean)
     relevance_reason: Mapped[str | None] = mapped_column(Text)
@@ -178,7 +182,9 @@ class Outcome(Base):
     reward: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str | None] = mapped_column(Text)
     event_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
     job: Mapped[Job] = relationship(back_populates="outcomes")
     proposal: Mapped[Proposal | None] = relationship(back_populates="outcomes")
@@ -340,3 +346,56 @@ class TelegramInboxPending(Base):
 
     job: Mapped["Job | None"] = relationship(foreign_keys=[job_id])
     proposal: Mapped["Proposal | None"] = relationship(foreign_keys=[proposal_id])
+
+
+class ProposalApprovalSnapshot(Base):
+    """Immutable payload shown by one proposal approval card; not itself an approval."""
+
+    __tablename__ = "proposal_approval_snapshots"
+    pending_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProposalApprovalEvent(Base):
+    __tablename__ = "proposal_approval_events"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pending_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    proposal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    actor_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    approval_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class InboxApprovalRecord(Base):
+    """Immutable presentation or approval of an exact inbox payload."""
+
+    __tablename__ = "inbox_approval_records"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pending_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    record_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    message_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MemoryIndexPending(Base):
+    """Deferred vector memory writes when Qdrant or embeddings are temporarily unavailable."""
+
+    __table_args__ = (Index("ix_memory_index_pending_created_at", "created_at"),)
+    __tablename__ = "memory_index_pending"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    dedupe_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claim_owner: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

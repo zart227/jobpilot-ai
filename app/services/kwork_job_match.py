@@ -78,6 +78,8 @@ async def find_kwork_job_for_message(
             return KworkJobMatchResult(job=matches[0], proposal=proposal)
         if len(matches) > 1:
             return KworkJobMatchResult(needs_context=True, candidate_jobs=matches)
+        # An explicit, unmatched project is stronger evidence than a username match.
+        return KworkJobMatchResult(needs_context=True)
 
     if username:
         result = await session.execute(

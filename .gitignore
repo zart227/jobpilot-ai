@@ -33,3 +33,8 @@ test-results/
 postgres_data/
 qdrant_data/
 temp/
+
+# Acceptance artifacts and browser-session backups contain private data.
+data/simulation_signoff.json
+data/acceptance-evidence/
+data/kwork_session.json.bak.*

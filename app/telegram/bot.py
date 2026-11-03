@@ -17,9 +17,18 @@ from sqlalchemy import select
 from app.agents.edit_proposal_agent import EditProposalAgent
 from app.agents.graph import compile_jobpilot_graph
 from app.config import get_settings
-from app.db.models import Job, Proposal, TelegramPending
+from app.logging_setup import configure_application_logging
+
+configure_application_logging()
+from app.db.models import Job, NotificationOutbox, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
+from app.services.approval_snapshot import (
+    capture_proposal_card,
+    proposal_card_is_current,
+    proposal_card_payload,
+    record_proposal_approval,
+)
 from app.services.dev_agent_service import (
     DevAgentConfigurationError,
     DevAgentService,
@@ -30,24 +39,35 @@ from app.services.edit_preference_service import EditPreferenceService
 from app.services.job_pipeline import JobPipelineService
 from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
 from app.services.kwork_pause import (
+    blocks_kwork_operator_send,
+    format_connects_balance_line,
     format_kwork_pause_reason,
+    get_kwork_connects_status_summary,
     get_kwork_pause_reason,
     is_kwork_paused,
 )
 from app.services.notification_outbox import deliver_notification_outbox, enqueue_notification
 from app.services.proposal_sender import ProposalSender
 from app.services.reward_system import RewardSystem
-from app.telegram.access import pending_matches_callback
+from app.services.send_attempt_service import delivery_blocks_mutation
+from app.telegram.access import (
+    edit_preview_binding,
+    edit_preview_matches_callback,
+    pending_matches_callback,
+)
 from app.telegram.admin_middleware import TelegramAdminMiddleware
 from app.telegram.commands import register_command_menu
 from app.telegram.dev_agent_handlers import register_dev_agent_handlers
+from app.telegram.full_review import send_full_review
 from app.telegram.inbox_handlers import register_inbox_handlers
 from app.telegram.keyboards import edit_preview_keyboard
+from app.telegram.review_handlers import register_review_handlers
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
     extract_site_order_id,
     format_budget,
     format_offer_price,
+    resolve_kwork_offer_price,
     sanitize_proposal_text,
 )
 from app.utils.proxy import create_telegram_bot
@@ -97,9 +117,25 @@ def format_kwork_success_message(
         base = "✅ JobPilot AI: отклик отправлен на Kwork."
 
     order_id = _resolve_order_id(job=job, send_debug=send_debug)
+    lines = [base]
     if order_id:
-        return f"{base}\n№ заказа: {order_id}"
-    return base
+        lines.append(f"\n№ заказа: {order_id}")
+
+    remaining = (send_debug or {}).get("connects_remaining")
+    total = (send_debug or {}).get("connects_total")
+    if remaining is None and total is None:
+        summary = get_kwork_connects_status_summary()
+        if summary:
+            lines.append(f"\n{summary}.")
+    else:
+        balance = format_connects_balance_line(
+            int(remaining) if remaining is not None else None,
+            int(total) if total is not None else None,
+        )
+        if balance:
+            lines.append(f"\n{balance}.")
+
+    return "".join(lines)
 
 
 def _order_id_plain_suffix(order_id: str | None) -> str:
@@ -109,9 +145,7 @@ def _order_id_plain_suffix(order_id: str | None) -> str:
 
 
 def format_edit_preview(content: str, instruction: str, order_id: str | None = None) -> str:
-    preview = sanitize_proposal_text(content)
-    if len(preview) > 3500:
-        preview = preview[:3497] + "..."
+    preview = content
     order_line = ""
     if order_id:
         order_line = f"<b>№ заказа:</b> {html.escape(order_id)}\n"
@@ -129,17 +163,13 @@ def format_job_description_messages(job: Job) -> list[str]:
     if order_id_line:
         header_lines.append(order_id_line)
     if job.url:
-        header_lines.append(
-            f'<a href="{job.url}">Открыть на {html.escape(job.platform)}</a>'
-        )
+        header_lines.append(f'<a href="{job.url}">Открыть на {html.escape(job.platform)}</a>')
     header = "\n".join(header_lines) + "\n\n<b>Описание:</b>\n\n"
 
     desc = html.escape(sanitize_proposal_text(job.description))
     skills = ""
     if job.skills:
-        skills = "\n\n<b>Навыки:</b> " + ", ".join(
-            html.escape(skill) for skill in job.skills[:15]
-        )
+        skills = "\n\n<b>Навыки:</b> " + ", ".join(html.escape(skill) for skill in job.skills[:15])
 
     full = header + desc + skills
     if len(full) <= 4096:
@@ -173,11 +203,22 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
 
     offer_line = ""
     if job.platform == "kwork":
-        offer = format_offer_price(
+        assessment = (job.raw_data or {}).get("opportunity_assessment") or {}
+        offer_value = resolve_kwork_offer_price(
             float(job.budget_min) if job.budget_min else None,
             float(job.budget_max) if job.budget_max else None,
-            job.budget_currency or "RUB",
+            assessment,
             settings.kwork_offer_discount_percent,
+        )
+        offer = (
+            f"{offer_value:,}".replace(",", " ") + " ₽"
+            if type(offer_value) is int
+            else format_offer_price(
+                float(job.budget_min) if job.budget_min else None,
+                float(job.budget_max) if job.budget_max else None,
+                job.budget_currency or "RUB",
+                settings.kwork_offer_discount_percent,
+            )
         )
         if offer:
             offer_line = f"<b>Предлагаем:</b> {html.escape(offer)}\n"
@@ -199,14 +240,23 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
                 parts.append(f"рейтинг {rating}")
             if paid is not None:
                 parts.append(f"оплаченных заказов (источник: профиль Kwork): {paid}")
+            projects = (client.metadata_ or {}).get("projects_posted")
+            hire_percent = (client.metadata_ or {}).get("hire_percent")
+            if projects is not None:
+                parts.append(f"размещено проектов: {projects}")
+            if hire_percent is not None:
+                parts.append(f"нанято: {hire_percent}%")
             if parts:
                 buyer_line = f"<b>Заказчик:</b> {html.escape(', '.join(parts))}\n"
 
     breakdown_line = ""
+    assessment = (job.raw_data or {}).get("opportunity_assessment") or {}
+    if assessment.get("estimated_hours") is not None:
+        breakdown_line += f"<b>Оценка времени ИИ:</b> {html.escape(str(assessment['estimated_hours']))} ч; сложность: {html.escape(str(assessment.get('complexity') or 'не указана'))}\n"
     breakdown = job.score_breakdown or {}
     if isinstance(breakdown, dict) and breakdown:
         items = ", ".join(f"{html.escape(str(k))}={v}" for k, v in breakdown.items())
-        breakdown_line = f"<b>Оценка по критериям:</b> {items}\n"
+        breakdown_line += f"<b>Оценка по критериям:</b> {items}\n"
 
     return (
         f"<b>JobPilot AI Alert</b>\n\n"
@@ -286,18 +336,12 @@ def format_kwork_connects_limit_message(
         "\n\n<b>Что это значит:</b> на Бирже Kwork 1 отклик = 1 коннект. "
         "Когда месячный лимит закончился, новые отклики не отправляются."
     )
-    parts.append(
-        "\n<b>Когда снова можно:</b> коннекты пополняются автоматически каждые 30 дней."
-    )
+    parts.append("\n<b>Когда снова можно:</b> коннекты пополняются автоматически каждые 30 дней.")
     if reason and "до " in reason.lower():
         parts.append(f" {html.escape(reason.split('до ', 1)[1])}.")
     else:
-        parts.append(
-            " Точную дату смотрите в личном кабинете Kwork → раздел «Коннекты»."
-        )
-    parts.append(
-        "\n\nОтклик остаётся в статусе «одобрен» — его можно отправить после пополнения."
-    )
+        parts.append(" Точную дату смотрите в личном кабинете Kwork → раздел «Коннекты».")
+    parts.append("\n\nОтклик остаётся в статусе «одобрен» — его можно отправить после пополнения.")
     return "".join(parts)
 
 
@@ -358,9 +402,7 @@ def format_kwork_failure_message(
             parts.append(f"\n<b>Цена в отклике:</b> {offer_price} ₽")
         content_file = debug.get("content_file")
         if content_file:
-            parts.append(
-                f"\n\n<b>Текст отклика:</b> <code>{html.escape(str(content_file))}</code>"
-            )
+            parts.append(f"\n\n<b>Текст отклика:</b> <code>{html.escape(str(content_file))}</code>")
         steps = debug.get("steps")
         if steps:
             step_lines = "\n".join(
@@ -391,6 +433,48 @@ def format_kwork_failure_message(
     return text
 
 
+async def queue_proposal_review(session, job: Job, proposal: Proposal, target_chat: int) -> uuid.UUID:
+    """Persist one review request inside the caller's business transaction."""
+    if not target_chat or proposal.job_id != job.id:
+        raise ValueError("A valid review destination and matching proposal are required")
+    key = f"proposal_approval:{proposal.id}:v{proposal.version}"
+    existing = await session.scalar(select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key))
+    if existing:
+        return existing.reference_id
+    # Legacy presentations may already have been delivered; never silently replace them.
+    legacy_pending = await session.scalar(
+        select(TelegramPending.id).where(TelegramPending.proposal_id == proposal.id).limit(1)
+    )
+    if legacy_pending:
+        return legacy_pending
+    await session.refresh(job, attribute_names=["client"])
+    text = format_job_alert(job, proposal, job.score)
+    if len(text) > 3800:
+        text = text[:3797] + "..."
+    pending = TelegramPending(job_id=job.id, proposal_id=proposal.id, chat_id=target_chat, status="pending")
+    session.add(pending)
+    await session.flush()
+    snapshot = await capture_proposal_card(session, pending.id, job, proposal)
+    if job.platform == "kwork":
+        price = snapshot.payload["offer_price"]
+        text += f"\n\nПараметры карточки: цена {price if price is not None else 'не определена'} RUB; срок {snapshot.payload['duration_days']} дн."
+    await enqueue_notification(
+        kind="proposal_approval", idempotency_key=key, chat_id=target_chat,
+        payload={
+            "pending_id": str(pending.id), "job_id": str(job.id), "proposal_id": str(proposal.id),
+            "alert_text": text, "review_format": "full_text_v1",
+            "review_content": snapshot.payload["content"],
+            "review_heading": (
+                f"Отклик: {job.title[:300]}\n{job.url or ''}\n"
+                f"Версия: {proposal.version}; оценка: {job.score}\n"
+                f"Цена: {snapshot.payload['offer_price']} {snapshot.payload['currency']}; "
+                f"срок: {snapshot.payload['duration_days']} дней"
+            ),
+        }, reference_type="telegram_pending", reference_id=pending.id, session=session,
+    )
+    return pending.id
+
+
 async def notify_new_proposal(
     bot: Bot,
     job_id: uuid.UUID,
@@ -399,51 +483,19 @@ async def notify_new_proposal(
 ) -> int | None:
     settings = get_settings()
     target_chat = chat_id or int(settings.telegram_admin_chat_id)
-
     from sqlalchemy.orm import selectinload
 
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id, options=[selectinload(Job.client)])
-        proposal = await session.get(Proposal, proposal_id)
-        if not job or not proposal:
+        if job:
+            await session.refresh(job, with_for_update=True)
+        proposal = await session.scalar(select(Proposal).where(Proposal.id == proposal_id).with_for_update())
+        if not job or not proposal or proposal.job_id != job.id:
             return None
-
         if job.platform == "kwork" and is_kwork_paused():
-            logger.info(
-                "JobPilot AI skip new proposal notification while Kwork paused",
-                job_id=str(job_id),
-                reason=get_kwork_pause_reason(),
-            )
+            logger.info("JobPilot AI skip new proposal notification while Kwork paused", job_id=str(job_id))
             return None
-
-        text = format_job_alert(job, proposal, job.score)
-        if len(text) > 4000:
-            text = text[:3997] + "..."
-
-        pending = TelegramPending(
-            job_id=job_id,
-            proposal_id=proposal_id,
-            chat_id=target_chat,
-            status="pending",
-        )
-        session.add(pending)
-        await session.flush()
-
-        pending_id = str(pending.id)
-        await enqueue_notification(
-            kind="proposal_approval",
-            idempotency_key=f"proposal_approval:{pending_id}",
-            chat_id=target_chat,
-            payload={
-                "pending_id": pending_id,
-                "job_id": str(job_id),
-                "proposal_id": str(proposal_id),
-                "alert_text": text,
-            },
-            reference_type="telegram_pending",
-            reference_id=pending.id,
-            session=session,
-        )
+        await queue_proposal_review(session, job, proposal, target_chat)
         await session.commit()
 
     delivery = await deliver_notification_outbox(settings, bot=bot, limit=5)
@@ -469,6 +521,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
     storage = RedisStorage(redis=redis)
     dp = Dispatcher(storage=storage)
     dp.update.middleware(TelegramAdminMiddleware())
+    register_review_handlers(dp)
     bot = create_telegram_bot(settings.telegram_bot_token, settings)
 
     dev_router = Router()
@@ -504,9 +557,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
         rewards = RewardSystem()
         total = await rewards.get_total_rewards()
         await message.answer(
-            f"<b>JobPilot AI Status</b>\n\n"
-            f"Pending approvals: {count}\n"
-            f"Total rewards: {total}",
+            f"<b>JobPilot AI Status</b>\n\nPending approvals: {count}\nTotal rewards: {total}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -559,9 +610,13 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             if not proposal:
                 await callback.answer("Proposal not found", show_alert=True)
                 return
+            if not await proposal_card_is_current(session, pending.id, job, proposal):
+                await callback.answer("Карточка устарела — запросите новую", show_alert=True)
+                return
             job_id = str(pending.job_id)
             proposal_id = str(pending.proposal_id)
             original_content = proposal.content
+            review_parameters = proposal_card_payload(job, proposal)
             order_id = _resolve_order_id(job=job)
 
         await state.set_state(EditProposalState.waiting_for_instruction)
@@ -570,6 +625,8 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             proposal_id=proposal_id,
             pending_id=pending_id,
             original_content=original_content,
+            original_version=proposal.version,
+            review_parameters=review_parameters,
             draft_content=original_content,
             edit_steps=[],
             order_id=order_id or "",
@@ -594,6 +651,10 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             return
 
         data = await state.get_data()
+        review_parameters = data.get("review_parameters")
+        if not isinstance(review_parameters, dict):
+            await message.answer("Сессия устарела — откройте редактирование из новой карточки.")
+            return
         job_id = data["job_id"]
         data["proposal_id"]
         pending_id = data["pending_id"]
@@ -610,9 +671,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 platform=job.get("platform"),
             )
 
-        await message.answer(
-            f"⏳ Применяю правки через LLM...{_order_id_plain_suffix(order_id)}"
-        )
+        await message.answer(f"⏳ Применяю правки через LLM...{_order_id_plain_suffix(order_id)}")
         try:
             editor = EditProposalAgent()
             after = await editor.run(
@@ -641,25 +700,37 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             return
 
         edit_steps = list(data.get("edit_steps") or [])
-        edit_steps.append(
-            {"instruction": instruction, "before": before, "after": after}
+        edit_steps.append({"instruction": instruction, "before": before, "after": after})
+        await state.update_data(
+            draft_content=after,
+            edit_steps=edit_steps,
+            order_id=order_id or "",
+            preview_message_id=None,
         )
-        await state.update_data(draft_content=after, edit_steps=edit_steps, order_id=order_id or "")
         await state.set_state(EditProposalState.reviewing)
 
-        await message.answer(
-            format_edit_preview(after, instruction, order_id),
-            parse_mode=ParseMode.HTML,
-            reply_markup=edit_preview_keyboard(pending_id),
+        preview_message = await send_full_review(
+            message.answer,
+            content=after,
+            reference=pending_id,
+            heading=f"Отредактированный отклик • заказ {order_id or job_id}.\n"
+            f"Цена: {review_parameters['offer_price']} {review_parameters['currency']}; "
+            f"срок: {review_parameters['duration_days']} дней.\n{review_parameters['url'] or ''}\n"
+            f"Правка: {instruction[:1000]}",
+            markup=edit_preview_keyboard(pending_id),
         )
+        await state.update_data(**edit_preview_binding(preview_message, after))
 
     @dp.callback_query(F.data.startswith("edit_more:"))
     async def handle_edit_more(callback: CallbackQuery, state: FSMContext) -> None:
         pending_id = callback.data.split(":", 1)[1]
         data = await state.get_data()
-        if data.get("pending_id") != pending_id:
+        if not edit_preview_matches_callback(
+            data, callback, pending_id, data.get("draft_content") or ""
+        ):
             await callback.answer("Сессия устарела", show_alert=True)
             return
+        await state.update_data(preview_message_id=None)
         await state.set_state(EditProposalState.waiting_for_instruction)
         order_id = data.get("order_id") or None
         await callback.message.answer(
@@ -671,22 +742,24 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
     async def handle_edit_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         pending_id = callback.data.split(":", 1)[1]
         data = await state.get_data()
-        if data.get("pending_id") != pending_id:
+        if not edit_preview_matches_callback(
+            data, callback, pending_id, data.get("draft_content") or ""
+        ):
             await callback.answer("Сессия устарела", show_alert=True)
             return
         await state.clear()
         await callback.message.edit_reply_markup(reply_markup=None)
         order_id = data.get("order_id") or None
-        await callback.message.answer(
-            f"Редактирование отменено.{_order_id_plain_suffix(order_id)}"
-        )
+        await callback.message.answer(f"Редактирование отменено.{_order_id_plain_suffix(order_id)}")
         await callback.answer()
 
     @dp.callback_query(F.data.startswith("edit_send:"))
     async def handle_edit_send(callback: CallbackQuery, state: FSMContext) -> None:
         pending_id = callback.data.split(":", 1)[1]
         data = await state.get_data()
-        if data.get("pending_id") != pending_id:
+        if not edit_preview_matches_callback(
+            data, callback, pending_id, data.get("draft_content") or ""
+        ):
             await callback.answer("Сессия устарела", show_alert=True)
             return
 
@@ -700,16 +773,52 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             return
 
         async with AsyncSessionLocal() as session:
-            pending = await session.get(TelegramPending, uuid.UUID(pending_id))
+            job = await session.scalar(
+                select(Job).where(Job.id == uuid.UUID(job_id)).with_for_update()
+            )
+            proposal = await session.scalar(
+                select(Proposal).where(Proposal.id == uuid.UUID(proposal_id)).with_for_update()
+            )
+            pending = await session.scalar(
+                select(TelegramPending)
+                .where(TelegramPending.id == uuid.UUID(pending_id))
+                .with_for_update()
+            )
             if not pending or pending.status != "pending":
                 await callback.answer("Already processed", show_alert=True)
                 return
-            job = await session.get(Job, pending.job_id)
-            proposal = await session.get(Proposal, uuid.UUID(proposal_id))
+            if (
+                not job
+                or not proposal
+                or pending.job_id != job.id
+                or pending.proposal_id != proposal.id
+                or proposal.job_id != job.id
+                or proposal.version != data.get("original_version")
+                or proposal.content != data.get("original_content")
+                or pending.chat_id != callback.message.chat.id
+            ):
+                await callback.answer("Карточка устарела", show_alert=True)
+                return
+            if await delivery_blocks_mutation(session, job_id=job.id):
+                await callback.answer("Отправка выполняется или требует сверки", show_alert=True)
+                return
+            if not await proposal_card_is_current(session, pending.id, job, proposal):
+                await callback.answer("Карточка устарела — запросите новую", show_alert=True)
+                return
             if proposal:
                 proposal.content = new_content
                 proposal.version += 1
                 proposal.status = "edited"
+            await record_proposal_approval(
+                session,
+                pending.id,
+                job,
+                proposal,
+                actor_user_id=callback.from_user.id,
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+                approval_kind="edited_preview",
+            )
             pending.status = "edited"
             await session.commit()
             platform = job.platform if job else "unknown"
@@ -776,9 +885,29 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 return
             job_id = str(pending.job_id)
             proposal_id = str(pending.proposal_id)
-            job = await session.get(Job, pending.job_id)
+            job = await session.scalar(
+                select(Job).where(Job.id == pending.job_id).with_for_update()
+            )
+            proposal = await session.scalar(
+                select(Proposal).where(Proposal.id == pending.proposal_id).with_for_update()
+            )
+            await session.refresh(pending, with_for_update=True)
+            if not pending_matches_callback(pending, callback):
+                await callback.answer("Карточка устарела", show_alert=True)
+                return
+            if pending.status != "pending":
+                await callback.answer("Already processed", show_alert=True)
+                return
+            if not await proposal_card_is_current(session, pending.id, job, proposal):
+                await callback.answer("Карточка устарела — запросите новую", show_alert=True)
+                return
 
-            if action in ("approved", "edited") and job and job.platform == "kwork" and is_kwork_paused():
+            if (
+                action in ("approved", "edited")
+                and job
+                and job.platform == "kwork"
+                and blocks_kwork_operator_send()
+            ):
                 try:
                     await callback.answer("Kwork на паузе", show_alert=True)
                 except Exception:
@@ -803,6 +932,16 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 await callback.message.answer(duplicate_msg)
                 return
 
+            if action == "approved":
+                await record_proposal_approval(
+                    session,
+                    pending.id,
+                    job,
+                    proposal,
+                    actor_user_id=callback.from_user.id,
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                )
             pending.status = action
             proposal = await session.get(Proposal, uuid.UUID(proposal_id))
             if proposal:
@@ -936,7 +1075,10 @@ async def run_bot() -> None:
 
     logger.info("JobPilot AI Telegram bot starting")
     try:
-        await register_command_menu(bot, int(settings.telegram_admin_chat_id))
+        if settings.telegram_register_commands:
+            await register_command_menu(bot, int(settings.telegram_admin_chat_id))
+        else:
+            logger.info("Skipping Telegram command menu registration (TELEGRAM_REGISTER_COMMANDS=false)")
         await dp.start_polling(bot)
     finally:
         if cursor_client is not None:

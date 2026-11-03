@@ -2,7 +2,7 @@ import structlog
 
 from app.llm.provider import get_llm_provider
 from app.schemas.agent_state import JobPilotState
-from app.schemas.llm_outputs import is_validation_error, parse_chat_output
+from app.schemas.llm_outputs import parse_chat_output
 
 logger = structlog.get_logger(__name__)
 
@@ -130,14 +130,12 @@ class ChatAgent:
             }
         except Exception as exc:
             logger.error("ChatAgent failed", error=str(exc))
-            retryable = not is_validation_error(exc)
+            from app.services.pipeline_processing_errors import pipeline_error_from_exception
+
             return {
+                **pipeline_error_from_exception(exc, stage="chat"),
                 "chat_intent": "error",
                 "chat_reply": "",
-                "error": str(exc),
-                "pipeline_processing_error": True,
-                "processing_retryable": retryable,
-                "processing_stage": "chat",
             }
 
 

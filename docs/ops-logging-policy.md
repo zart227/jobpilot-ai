@@ -1,5 +1,7 @@
 # Политика логирования и диагностики
 
+Реализация: `app/utils/log_scrubber.py` и `app/logging_setup.configure_application_logging()` (structlog + stdlib filter для SQLAlchemy/uvicorn/celery). SQL-вывод только при явном `SQLALCHEMY_ECHO=true` (не привязан к `DEBUG`).
+
 ## Не писать в логи
 
 - `API_AUTH_TOKEN`, `TELEGRAM_BOT_TOKEN`, `OPENAI_API_KEY`, `CURSOR_API_KEY`
@@ -20,7 +22,7 @@
 | `data/kwork_connects_pause.json` | pause state | не коммитить |
 | `data/cursor_bridge.env` | bridge secrets | `chmod 600`, не коммитить |
 
-Ротация: удалять старые debug-дампы вручную; в Docker ограничить размер логов драйвера (`max-size` в logging driver при необходимости).
+Ротация: удалять старые debug-дампы вручную; в Docker для api/worker/beat/bot задан `json-file` driver (`max-size: 10m`, `max-file: 5` в `docker-compose.yml`).
 
 ## Инциденты
 

@@ -4,7 +4,9 @@ import structlog
 from celery import Celery
 
 from app.config import get_settings
+from app.logging_setup import configure_application_logging
 
+configure_application_logging()
 logger = structlog.get_logger(__name__)
 settings = get_settings()
 

@@ -15,10 +15,11 @@ from app.services.kwork_browser import (
 from app.services.kwork_pause import (
     get_kwork_pause_reason,
     is_kwork_paused,
+    load_pause_state,
     record_connects_limit_detected,
 )
 from app.services.send_attempt_service import finalize_send_attempt, prepare_proposal_send
-from app.utils.formatting import compose_kwork_submission, extract_site_order_id
+from app.utils.formatting import extract_site_order_id
 
 logger = structlog.get_logger(__name__)
 
@@ -40,10 +41,12 @@ class ProposalSender:
                     return True
 
             result = await session.execute(
-                select(Proposal.id).where(
+                select(Proposal.id)
+                .where(
                     Proposal.job_id == job.id,
                     Proposal.status == "sent",
-                ).limit(1)
+                )
+                .limit(1)
             )
             return result.scalar_one_or_none() is not None
 
@@ -72,7 +75,9 @@ class ProposalSender:
         if not job or not proposal or not claim.attempt_id or not claim.claim_token:
             return False, "Не удалось захватить отправку", None
 
-        success, error, debug = await self._send_to_platform(job, proposal, content)
+        success, error, debug = await self._send_to_platform(
+            job, proposal, content, approved_payload=claim.approved_payload
+        )
 
         finalized = await finalize_send_attempt(
             claim.attempt_id,
@@ -80,6 +85,7 @@ class ProposalSender:
             success=success,
             error=error,
             platform_response=debug,
+            ambiguous=bool(debug and debug.get("ambiguous")),
         )
         if not finalized:
             return False, "Устаревший claim отправки", {"error_label": "stale_claim"}
@@ -90,8 +96,10 @@ class ProposalSender:
                 platform=job.platform,
                 job_id=job_id,
             )
-        else:
+        elif not (debug and debug.get("ambiguous")):
             await self._handle_send_failure(job_id, proposal_id, error, debug)
+        else:
+            logger.warning("Proposal delivery outcome requires reconciliation", job_id=job_id)
 
         if debug is not None:
             debug["job_title"] = job.title
@@ -151,9 +159,11 @@ class ProposalSender:
         job: Job,
         proposal: Proposal,
         content: str,
+        *,
+        approved_payload: dict[str, Any] | None = None,
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
-        if job.platform == "kwork":
-            content = compose_kwork_submission(content)
+        if not approved_payload or approved_payload.get("content") != content:
+            return False, "approved_payload_mismatch", {"error_label": "approved_payload_mismatch"}
 
         logger.info(
             "JobPilot AI sending proposal",
@@ -169,19 +179,36 @@ class ProposalSender:
                 platform=job.platform,
                 job_id=str(job.id),
             )
-            return True, None, {"dry_run": True, "platform": job.platform}
+            debug: dict[str, Any] = {"dry_run": True, "platform": job.platform}
+            if job.platform == "kwork":
+                state = load_pause_state()
+                if state and state.connects_remaining is not None:
+                    debug["connects_remaining"] = state.connects_remaining
+                if state and state.connects_total is not None:
+                    debug["connects_total"] = state.connects_total
+            return True, None, debug
 
         if job.platform == "kwork" and is_kwork_paused():
             reason = get_kwork_pause_reason() or "Kwork приостановлен"
             return False, reason, {"error_label": "kwork_paused"}
 
         if job.platform == "kwork" and job.url:
-            return await send_kwork_offer(
+            success, error, debug = await send_kwork_offer(
                 job.url,
                 content,
                 float(job.budget_min) if job.budget_min else None,
                 float(job.budget_max) if job.budget_max else None,
+                offer_price=approved_payload.get("offer_price"),
+                duration_days=approved_payload.get("duration_days"),
             )
+            debug = dict(debug or {})
+            debug["dry_run"] = False
+            if success:
+                # Current browser signals do not bind an external receipt to this payload.
+                debug["ambiguous"] = True
+                debug["error_label"] = "payload_receipt_unverified"
+                return False, "Отправка не подтверждена по точному содержимому", debug
+            return success, error, debug
 
         logger.warning(
             "JobPilot AI has no sender for platform, skipping real delivery",

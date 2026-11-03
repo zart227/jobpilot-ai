@@ -43,9 +43,18 @@ def test_verify_api_token_required() -> None:
     )
 
 
-def test_verify_api_token_skipped_when_not_required() -> None:
-    settings = Settings(_env_file=None, API_AUTH_TOKEN="", API_AUTH_REQUIRED=False)
-    verify_api_token(authorization=None, x_api_key=None, settings=settings)
+def test_verify_api_token_skipped_only_for_explicit_loopback_dev() -> None:
+    from starlette.requests import Request
+
+    settings = Settings(
+        _env_file=None,
+        API_AUTH_TOKEN="",
+        API_AUTH_REQUIRED=False,
+        API_ALLOW_UNAUTHENTICATED_LOCAL=True,
+        API_HOST="127.0.0.1",
+    )
+    request = Request({"type": "http", "client": ("127.0.0.1", 42), "headers": []})
+    verify_api_token(authorization=None, x_api_key=None, settings=settings, request=request)
 
 
 def test_verify_api_token_enforced_when_token_configured() -> None:

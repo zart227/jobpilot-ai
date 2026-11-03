@@ -1,6 +1,7 @@
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 import structlog
 
@@ -17,6 +18,19 @@ def _kwork_project_number(external_id: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _buyer_profile_path(href: str | None) -> str | None:
+    if not href:
+        return None
+    parsed = urlsplit(href)
+    if (parsed.scheme or parsed.netloc) and (
+        parsed.scheme != 'https' or parsed.hostname != 'kwork.ru' or parsed.username or parsed.password
+    ):
+        return None
+    if not re.fullmatch(r'/user/[A-Za-z0-9_.-]+/?', parsed.path):
+        return None
+    return parsed.path.rstrip('/')
+
+
 class KworkScraper(BaseScraper):
     """Scraper for Kwork.ru freelance marketplace."""
 
@@ -30,54 +44,39 @@ class KworkScraper(BaseScraper):
         self._max_pages = settings.kwork_max_pages
         self._buyer_cache: dict[str, dict] = {}
 
-    async def scrape(self) -> list[NormalizedJob]:
-        from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
-
-        if is_kwork_paused():
-            reason = get_kwork_pause_reason() or "Kwork приостановлен"
-            logger.info("Kwork scraper skipped: connects limit pause", reason=reason)
-            return []
-
+    async def _scrape_listing_pages(self, page: Any) -> list[NormalizedJob]:
         jobs: list[NormalizedJob] = []
         seen_ids: set[str] = set()
-        playwright, browser, page = await self._launch_browser()
-
-        try:
-            settings = get_settings()
-            if settings.kwork_scrape_login and self._email and self._password:
-                try:
-                    await self._login(page)
-                except Exception as exc:
-                    logger.warning("Kwork login skipped, using public listing", error=str(exc))
-
-            for page_num in range(1, self._max_pages + 1):
-                url = self._page_url(page_num)
+        for page_num in range(1, self._max_pages + 1):
+            url = self._page_url(page_num)
+            try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    await page.wait_for_selector(".want-card", timeout=20000)
-                except Exception:
-                    logger.warning("Kwork page has no cards", page=page_num, url=url)
-                    break
-                await page.wait_for_timeout(1500)
+            except Exception as exc:
+                logger.warning("Kwork listing page failed", page=page_num, error=str(exc))
+                break
+            try:
+                await page.wait_for_selector(".want-card", timeout=20000)
+            except Exception:
+                logger.warning("Kwork page has no cards", page=page_num, url=url)
+                break
+            await page.wait_for_timeout(1500)
 
-                cards = page.locator(".want-card")
-                count = await cards.count()
-                logger.info("Kwork scraper found projects", page=page_num, count=count)
-                if count == 0:
-                    break
+            cards = page.locator(".want-card")
+            count = await cards.count()
+            logger.info("Kwork scraper found projects", page=page_num, count=count)
+            if count == 0:
+                break
 
-                for i in range(count):
-                    card = cards.nth(i)
-                    job = await self._extract_kwork_card(card, page)
-                    if job and job.external_id not in seen_ids:
-                        seen_ids.add(job.external_id)
-                        jobs.append(job)
-        except Exception as exc:
-            logger.error("Kwork scraper failed", error=str(exc))
-        finally:
-            await self._close_browser(playwright, browser)
+            for i in range(count):
+                card = cards.nth(i)
+                job = await self._extract_kwork_card(card, page)
+                if job and job.external_id not in seen_ids:
+                    seen_ids.add(job.external_id)
+                    jobs.append(job)
+        return jobs
 
-        # Kwork mixes old and new projects on the same page; higher ID ≈ newer project.
+    @staticmethod
+    def _finalize_job_list(jobs: list[NormalizedJob]) -> list[NormalizedJob]:
         jobs.sort(key=lambda job: _kwork_project_number(job.external_id), reverse=True)
         if jobs:
             logger.info(
@@ -85,9 +84,58 @@ class KworkScraper(BaseScraper):
                 newest=_kwork_project_number(jobs[0].external_id),
                 oldest=_kwork_project_number(jobs[-1].external_id),
             )
-
         logger.info("Kwork scraper total unique jobs", count=len(jobs))
         return jobs
+
+    async def scrape(self) -> list[NormalizedJob]:
+        from app.services.kwork_browser import BLOCKED_TITLE, close_browser, launch_browser
+        from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
+        from app.utils.proxy import get_proxy_candidates, mask_proxy
+
+        if is_kwork_paused():
+            reason = get_kwork_pause_reason() or "Kwork приостановлен"
+            logger.info("Kwork scraper skipped: connects limit pause", reason=reason)
+            return []
+
+        settings = get_settings()
+        candidates = list(get_proxy_candidates(settings, "openai"))
+        if not candidates:
+            candidates = [None]
+
+        saw_block = False
+        for proxy in candidates:
+            label = mask_proxy(proxy) if proxy else "direct"
+            playwright = browser = None
+            try:
+                playwright, browser, page = await launch_browser(proxy=proxy)
+                if settings.kwork_scrape_login and self._email and self._password:
+                    try:
+                        await self._login(page)
+                    except Exception as exc:
+                        logger.warning("Kwork login skipped, using public listing", error=str(exc))
+
+                jobs = await self._scrape_listing_pages(page)
+                if jobs:
+                    logger.info("Kwork scraper listing ok", proxy=label, count=len(jobs))
+                    return self._finalize_job_list(jobs)
+
+                title = await page.title()
+                if BLOCKED_TITLE in title:
+                    saw_block = True
+                    logger.warning(
+                        "Kwork listing blocked (Доступ заблокирован)",
+                        proxy=label,
+                        hint="Re-export kwork_session.json from a normal browser or add OPENAI_PROXY_URL",
+                    )
+            except Exception as exc:
+                logger.error("Kwork scraper failed", proxy=label, error=str(exc))
+            finally:
+                if playwright is not None and browser is not None:
+                    await close_browser(playwright, browser)
+
+        if saw_block:
+            logger.error("Kwork scraper: no route could load listing (IP/session block)")
+        return self._finalize_job_list([])
 
     def _page_url(self, page_num: int) -> str:
         base = self._category_url
@@ -127,13 +175,9 @@ class KworkScraper(BaseScraper):
                 if tag:
                     skills.append(tag)
 
-            client_el = card.locator('a[href*="/user/"]').first
-            client_name = (await client_el.text_content() or "").strip() or None
-
-            client_href = await client_el.get_attribute("href")
-            history = {}
-            if client_href and client_href.startswith("/user/"):
-                history = await self._read_buyer_history(page, client_href)
+            client_name, client_href, card_stats = await self._read_card_buyer(card)
+            history = await self._read_buyer_history(page, client_href) if client_href else {}
+            history = {**history, **card_stats}
 
             deadline_text = (await card.locator(".want-card__informers, .color-gray").first.text_content() or "")
             deadline = self._parse_kwork_deadline(deadline_text)
@@ -152,11 +196,40 @@ class KworkScraper(BaseScraper):
                 deadline=deadline,
                 url=url,
                 client=ClientInfo(name=client_name, external_id=client_href or client_name, rating=history.get("rating"), metadata=history),
-                raw_data={"source": "kwork.ru"},
+                raw_data={"source": "kwork.ru", "listing_observed_at": datetime.now(UTC).isoformat()},
             )
         except Exception as exc:
             logger.warning("Kwork card extraction failed", error=str(exc))
             return None
+
+    async def _read_card_buyer(self, card: Any) -> tuple[str | None, str | None, dict]:
+        """Read one buyer block; never use job description or unrelated links as evidence."""
+        from app.services.opportunity_policy import parse_kwork_card_buyer_stats
+
+        blocks = card.locator(':scope > .want-payer-statistic, :scope > .want-card__statistic')
+        if await blocks.count() != 1:
+            return None, None, {}
+        block = blocks.first
+        links = block.locator('.want-card__statistic-item a[href*="/user/"]')
+        if await links.count() != 1:
+            return None, None, {}
+        link = links.first
+        href = _buyer_profile_path(await link.get_attribute('href'))
+        if not href:
+            return None, None, {}
+        name = (await link.text_content() or '').strip() or None
+        rows = block.locator('.want-card__statistic-item')
+        values = [await rows.nth(i).inner_text() for i in range(await rows.count())]
+        if sum('Покупатель:' in row for row in values) != 1:
+            return None, None, {}
+        if any(sum(label in row for row in values) != 1 for label in (
+            'Размещено проектов на бирже:', 'Нанято:',
+        )):
+            return name, href, {}
+        stats = parse_kwork_card_buyer_stats('\n'.join(values))
+        if 'projects_posted' in stats and 'hire_percent' in stats:
+            stats['stats_source'] = 'kwork_buyer_block_v1'
+        return name, href, stats
 
     async def _read_buyer_history(self, page: Any, href: str) -> dict:
         from app.services.opportunity_policy import parse_buyer_history
@@ -187,10 +260,13 @@ class KworkScraper(BaseScraper):
 
     async def _read_description(self, card: Any, page: Any, url: str | None) -> str:
         expand = card.locator("span.kw-link-dashed:has-text('Показать полностью')").first
+        expansion_unconfirmed = False
         if await expand.count() > 0:
+            expansion_unconfirmed = True
             try:
                 await expand.click()
                 await page.wait_for_timeout(400)
+                expansion_unconfirmed = await expand.is_visible()
             except Exception:
                 pass
 
@@ -206,13 +282,18 @@ class KworkScraper(BaseScraper):
                     desc_parts.append(text)
 
         description = "\n".join(desc_parts).strip()
-        if len(description) > 120:
+        looks_truncated = description.endswith(("...", "…"))
+        if len(description) > 120 and not expansion_unconfirmed and not looks_truncated:
             return description
 
         if url:
             detail_desc = await self._fetch_detail_description(page, url)
-            if detail_desc:
+            if detail_desc and not detail_desc.rstrip().endswith(("...", "…")):
                 return detail_desc
+
+        if expansion_unconfirmed or looks_truncated:
+            logger.info("Kwork description may be truncated", url=url)
+            return ""
 
         title = (await card.locator(".wants-card__header-title").first.text_content() or "").strip()
         return description or title

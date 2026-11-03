@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -5,9 +6,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_checklist_report_runs_and_shows_zero_open() -> None:
+def test_checklist_report_counts_actual_open_and_closed() -> None:
+    text = (ROOT / "docs/remediation-checklists.md").read_text()
+    closed = len(re.findall(r"^- \[x\]", text, re.MULTILINE))
+    opened = len(re.findall(r"^- \[ \]", text, re.MULTILINE))
     result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "remediation_checklist_report.py")],
+        [sys.executable, str(ROOT / "scripts/remediation_checklist_report.py")],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -15,5 +19,4 @@ def test_checklist_report_runs_and_shows_zero_open() -> None:
     )
     assert result.returncode == 0
     tail = result.stdout.split("Итого")[-1]
-    assert "**115**" in tail and "**0**" in tail
-    assert "Итого" in result.stdout
+    assert f"**{closed}**" in tail and f"**{opened}**" in tail

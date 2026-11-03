@@ -16,10 +16,11 @@ def test_is_authorized_telegram_requires_chat_and_optional_user() -> None:
     assert is_authorized_telegram(101, 42, settings) is False
 
 
-def test_is_authorized_telegram_chat_only_when_user_not_configured() -> None:
+def test_private_chat_infers_owner_when_user_not_configured() -> None:
     settings = Settings(TELEGRAM_ADMIN_CHAT_ID="100", TELEGRAM_ADMIN_USER_ID="")
-    assert is_authorized_telegram(100, None, settings) is True
-    assert is_authorized_telegram(100, 7, settings) is True
+    assert is_authorized_telegram(100, None, settings) is False
+    assert is_authorized_telegram(100, 7, settings) is False
+    assert is_authorized_telegram(100, 100, settings) is True
 
 
 def test_pending_matches_callback_checks_message_id() -> None:

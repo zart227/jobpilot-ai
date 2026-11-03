@@ -8,8 +8,12 @@ from typing import Any
 from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Job, NotificationOutbox, SendAttempt
-from app.db.send_attempt_states import ATTEMPT_CONFIRMED_SENT, ATTEMPT_UNKNOWN_RESULT
+from app.db.models import InboundMessage, Job, MemoryIndexPending, NotificationOutbox, SendAttempt
+from app.db.send_attempt_states import (
+    ATTEMPT_CONFIRMED_SENT,
+    ATTEMPT_KIND_PROPOSAL,
+    ATTEMPT_UNKNOWN_RESULT,
+)
 
 
 async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
@@ -18,7 +22,7 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
     outbox_pending = await session.execute(
         select(func.count())
         .select_from(NotificationOutbox)
-        .where(NotificationOutbox.status.in_(("pending", "claimed")))
+        .where(NotificationOutbox.status.in_(("pending", "sending")))
     )
     outbox_needs_attention = await session.execute(
         select(func.count())
@@ -27,7 +31,7 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
     )
     oldest_outbox = await session.execute(
         select(func.min(NotificationOutbox.created_at)).where(
-            NotificationOutbox.status.in_(("pending", "claimed"))
+            NotificationOutbox.status.in_(("pending", "sending"))
         )
     )
     oldest_outbox_at = oldest_outbox.scalar()
@@ -58,6 +62,26 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
         .select_from(Job)
         .where(Job.raw_data["embedding_pending"].as_boolean().is_(True))
     )
+    memory_index_pending = await session.execute(
+        select(func.count()).select_from(MemoryIndexPending)
+    )
+    oldest_memory_index = await session.execute(
+        select(func.min(MemoryIndexPending.created_at))
+    )
+    oldest_memory_index_at = oldest_memory_index.scalar()
+    memory_index_age_seconds = None
+    if oldest_memory_index_at:
+        memory_index_age_seconds = int((now - oldest_memory_index_at).total_seconds())
+    inbound_needs_attention = await session.execute(
+        select(func.count())
+        .select_from(InboundMessage)
+        .where(InboundMessage.status == "needs_attention")
+    )
+    inbound_received = await session.execute(
+        select(func.count())
+        .select_from(InboundMessage)
+        .where(InboundMessage.status == "received")
+    )
     llm_calls = await session.execute(
         select(
             func.coalesce(
@@ -69,7 +93,11 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
     confirmed_send_jobs = await session.execute(
         select(func.count(func.distinct(SendAttempt.job_id))).where(
             SendAttempt.status == ATTEMPT_CONFIRMED_SENT,
+            SendAttempt.kind == ATTEMPT_KIND_PROPOSAL,
             SendAttempt.job_id.is_not(None),
+            # Legacy rows without an explicit execution mode cannot prove a live send.
+            SendAttempt.platform_response.contains({"dry_run": False}),
+            ~SendAttempt.platform_response.contains({"simulated": True}),
         )
     )
 
@@ -100,5 +128,11 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
         "llm": {
             "pipeline_calls_recorded": int(llm_calls.scalar() or 0),
             "jobs_embedding_pending": int(embedding_pending.scalar() or 0),
+            "memory_index_pending": int(memory_index_pending.scalar() or 0),
+            "oldest_memory_index_pending_age_seconds": memory_index_age_seconds,
+        },
+        "inbound_messages": {
+            "received": int(inbound_received.scalar() or 0),
+            "needs_attention": int(inbound_needs_attention.scalar() or 0),
         },
     }

@@ -1,6 +1,9 @@
-.PHONY: verify test checklist-report checklist-gate install close-live audit-status rollout drill preflight fix-proposal-conflicts dependency-drill redis-drill cursor-bridge-drill qdrant-drill scoring-drill cursor-bridge-container verify-integration autonomous
+.PHONY: verify test checklist-report checklist-gate install close-live audit-status rollout drill preflight fix-proposal-conflicts dependency-drill redis-drill cursor-bridge-drill qdrant-drill scoring-drill cursor-bridge-container verify-integration autonomous ops-snapshot ops-outbox-triage ops-outbox-triage-md ops-rollout-readiness ops-remediation-preflight secret-scan
 
 PY ?= .venv/bin/python
+
+secret-scan:
+	$(PY) scripts/secret_scan_repo.py
 
 install:
 	sh scripts/verify_lockfile.sh
@@ -22,6 +25,28 @@ close-live:
 
 audit-status:
 	$(PY) scripts/audit_remediation_status.py --write docs/audit-remediation-matrix.md
+
+ops-snapshot:
+	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_remediation_snapshot.py
+
+ops-outbox-triage:
+	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
+
+ops-outbox-triage-md:
+	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_markdown_bundle.py
+
+ops-rollout-readiness:
+	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
+
+ops-remediation-preflight:
+	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_working_db_preflight.py
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
+	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
 
 rollout:
 	./scripts/production_rollout.sh

@@ -24,8 +24,7 @@ def _mini_app() -> Starlette:
 @pytest.mark.asyncio
 async def test_check_fixed_window_allows_then_blocks() -> None:
     mock_redis = AsyncMock()
-    mock_redis.incr = AsyncMock(side_effect=[1, 2, 3])
-    mock_redis.expire = AsyncMock(return_value=True)
+    mock_redis.eval = AsyncMock(side_effect=[1, 2, 3])
     allowed1, _ = await _check_fixed_window(mock_redis, "b", limit=2, window_seconds=60)
     allowed2, _ = await _check_fixed_window(mock_redis, "b", limit=2, window_seconds=60)
     allowed3, retry = await _check_fixed_window(mock_redis, "b", limit=2, window_seconds=60)
@@ -44,8 +43,7 @@ def test_rate_limit_returns_429_when_exceeded(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(rate_limit_mod, "get_settings", lambda: settings)
 
     mock_redis = AsyncMock()
-    mock_redis.incr = AsyncMock(side_effect=[1, 2, 3])
-    mock_redis.expire = AsyncMock(return_value=True)
+    mock_redis.eval = AsyncMock(side_effect=[1, 2, 3])
 
     with patch("app.api.rate_limit.redis.from_url", return_value=mock_redis):
         client = TestClient(_mini_app())
@@ -65,3 +63,39 @@ def test_rate_limit_disabled_skips_redis(monkeypatch: pytest.MonkeyPatch) -> Non
         for _ in range(5):
             assert client.get("/api/ping").status_code == 200
         from_url.assert_not_called()
+
+
+def test_redis_failure_is_closed_by_default(monkeypatch):
+    import redis
+
+    settings = Settings(_env_file=None, API_RATE_LIMIT_ENABLED=True)
+    monkeypatch.setattr(rate_limit_mod, "get_settings", lambda: settings)
+    mock = AsyncMock()
+    mock.eval.side_effect = redis.ConnectionError("test backend unavailable")
+    with patch("app.api.rate_limit.redis.from_url", return_value=mock):
+        assert TestClient(_mini_app()).get("/api/ping").status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_atomic_redis_quota_concurrent_requests(monkeypatch):
+    import asyncio
+    import os
+    import uuid
+
+    import redis.asyncio as redis
+
+    if os.environ.get("JOBPILOT_INTEGRATION_TESTS") != "1":
+        pytest.skip("requires isolated integration Redis")
+    bucket = f"block-a-test:{uuid.uuid4()}"
+    client = redis.from_url(os.environ["REDIS_URL"])
+    monkeypatch.setattr(rate_limit_mod.time, "time", lambda: 1800000000)
+    try:
+        results = await asyncio.gather(
+            *[_check_fixed_window(client, bucket, limit=3, window_seconds=60) for _ in range(20)]
+        )
+        assert sum(allowed for allowed, _ in results) == 3
+        key = f"api_rl:{bucket}:{1800000000 // 60}"
+        assert await client.ttl(key) > 0
+        await client.delete(key)
+    finally:
+        await client.aclose()
