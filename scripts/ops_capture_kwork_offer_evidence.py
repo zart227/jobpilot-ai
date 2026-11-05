@@ -9,7 +9,7 @@ import hashlib
 import json
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +19,7 @@ DEFAULT_OUT = ROOT / "data/acceptance-evidence"
 async def _capture(project_id: str, out_dir: Path) -> dict:
     from app.config import get_settings
     from app.db.models import Job, SendAttempt
-    from app.db.session import AsyncSessionLocal, engine
+    from app.db.session import AsyncSessionLocal
     from app.services.kwork_browser import close_browser, launch_browser
     from app.utils.formatting import extract_site_order_id
     from app.utils.proxy import get_proxy_candidates, mask_proxy
@@ -114,7 +114,7 @@ async def _capture(project_id: str, out_dir: Path) -> dict:
 
 def _update_signoff(meta: dict, *, authorization: str) -> None:
     signoff_path = ROOT / "data/live_kwork_signoff.json"
-    now = datetime.now(timezone.utc).astimezone()
+    now = datetime.now(UTC).astimezone()
     data = json.loads(signoff_path.read_text(encoding="utf-8"))
     rel_png = meta["png_path"].relative_to(ROOT / "data")
     rel_attempt = meta["attempt_path"].relative_to(ROOT / "data")
