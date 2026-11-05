@@ -1,6 +1,6 @@
 # План и чеклисты JobPilot AI
 
-**112/115 подтверждено; 3 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
+**113/115 подтверждено; 2 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
 
 Дата сверки: 05.11.2026. Очереди A–B закрыты по integration/unit прогонам (журнал 05.11). Полный Ruff/pytest — **C107**; CI — **C006**.
 
@@ -31,7 +31,7 @@
 - [x] pytest, Ruff и pip check запущены, исходные результаты сохранены. **C003** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Тесты паузы проходят независимо от текущей даты и проверяют границы возобновления/смену года. **C004** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] ensure_proposal_greeting имеет одно определение и согласованные вызовы. **C005** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
-- [ ] Unit tests и lint выполняются в CI без production secrets. **C006** — ОТКРЫТО 05.11: **внешний блокер** — uncommitted diff не прогонялся в GitHub Actions (push не запрошен; последний remote CI **failure** на `main` **2026-11-03** — ruff, не это дерево). Локальная реплика CI **05.11**: `ruff check app tests scripts` OK; `python scripts/secret_scan_repo.py` OK; `pip check` OK; CI-шаг `validate_live_signoff.py` → отсутствует (OK); `sh scripts/verify_lockfile.sh` OK; **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0** (gate **28 passed**); unit **626**/integration **33**/browser **44** (ранее); `docker build` OK. Закрытие только после зелёного CI на remote для этого дерева.
+- [x] Unit tests и lint выполняются в CI без production secrets. **C006** — ПОДТВЕРЖДЕНО **05.11**: GitHub Actions [**42023422545**](https://github.com/zart227/jobpilot-ai/actions/runs/42023422545) **success** на **`cf3ac12`** (`main`) — **lockfile-lint-test** (ruff, secret_scan, pytest, audit, remediation_verify, live signoff absent, pip check), **integration**, **browser-form-contract**, **docker-build**; без production secrets в workflow.
 
 ## 1. Доступ
 

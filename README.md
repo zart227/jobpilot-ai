@@ -1,6 +1,6 @@
 # JobPilot AI
 
-> **Статус 05.11.2026:** remediation **не завершена** (**112/115** подтверждено, **3** открыто). Единственный источник: [план и чеклисты](docs/remediation-plan.md). Dry-run / simulation signoff **не** означает live-приёмку или release approval.
+> **Статус 05.11.2026:** remediation **не завершена** (**113/115** подтверждено, **2** открыто). Единственный источник: [план и чеклисты](docs/remediation-plan.md). Dry-run / simulation signoff **не** означает live-приёмку или release approval.
 
 AI-powered freelance automation system for a single developer. JobPilot AI scrapes job boards, filters and scores opportunities with AI, generates personalized proposals, routes them through Telegram for human approval, sends approved proposals, handles client chat, and learns from outcomes.
 

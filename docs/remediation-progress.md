@@ -1397,21 +1397,43 @@ Reply command зарегистрирована до edit handlers; успешн�
 
 ## Передача следующему агенту
 
-- Сделано и подтверждено: **C006** (локально, пункт открыт) — полный **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0**, gate **28 passed** (**05.11**, после 7-го policy-теста); **`ruff check app tests scripts`** OK; CI-ожидание **`validate_live_signoff.py`** — signoff отсутствует (OK). Прошлая передача (+1 тест **C090** `-f`, secret_scan, pip check) — diff подтверждён.
-- Не доделано: **C006** — push/PR и зелёный GitHub Actions на remote. **C110** — live signoff после разрешения оператора.
-- Проблемы, которые выявил: **C089/C098/C110** — внешние блокеры; **untracked** acceptance-тесты не попадут в CI `pytest -q` без коммита.
-- Из них решено: свежий end-to-end **`remediation_verify.sh`** + ruff + live-signoff absent check.
-- Из них не решено: push/коммит без запроса; working corpus; backup-сервер; live send.
-- Не трогать: закрытые **C090** (галочка) и **C101–C107**/очереди A–B; `_verify_approved_form`; **C110** rehearsal UUID; незакоммиченный diff.
-- Следующий шаг: **C006** — внешний блокер: push/PR (весь diff, incl. untracked `tests/test_c*.py`) и зелёный GitHub Actions.
-- Счёт: `python3 scripts/remediation_checklist_status.py` → **111 closed, 4 open** (C006, C089, C098, C110).
+- Сделано и подтверждено: **C006** (локально, пункт открыт) — lockfile-job **`pytest -q`** **631 passed**, **403 skipped** (~4m40s, clean env); **`remediation_verify.sh`** exit **0**, gate **30 passed**; **`tests/test_ci_workflow_policy.py`**: +2 теста (secret_scan/audit, live signoff absent в `ci.yml`); **`pytest tests/test_ci_workflow_policy.py`** **9 passed** (**05.11**). **C110** — в плане уже **`[x]`** (signoff **3271087**, не трогал). Прошлая передача (verify **28**) — superseded свежим unit/gate прогоном.
+- Не доделано: **C006** — push/PR и зелёный GitHub Actions на remote.
+- Проблемы, которые выявил: **C089/C098** — внешние блокеры; **untracked** `tests/test_c*.py` не в remote CI без коммита; счёт плана **112/3** ( **C110** закрыт чужой правкой плана).
+- Из них решено: свежая полная unit-реплика CI + policy-тесты шагов lockfile job.
+- Из них не решено: push/коммит без запроса; working corpus (**C089**); backup-сервер (**C098**).
+- Не трогать: **`[x]` C110** и остальные закрытые ID; `_verify_approved_form`; незакоммиченный diff вне **C006** prep.
+- Следующий шаг: **C006** — внешний блокер: push/PR (весь diff) и зелёный GitHub Actions.
+- Счёт: `python3 scripts/remediation_checklist_status.py` → **112 closed, 3 open** (C006, C089, C098).
 
-## 05.11 — C110 UI↔DB + CI repair (owner: «сделай все сам»)
+## Передача следующему агенту
 
-**C110:** `scripts/ops_capture_kwork_offer_evidence.py 3271087 --update-signoff` → **`ui-kwork-offer-3271087.png`**, attempt **`6b5b79e9…`**, **`validate_live_signoff.py` exit 0**; **[x] C110** (без новой отправки).
+- Сделано и подтверждено: **C006** (локально, пункт открыт) — CI run **42022792289** разобран; **`tests/test_c027_inbox_llm_failure_acceptance.py`** skip без test DB; **`tests/test_c090_c093_production_repro_policy.py`** compose с **`--env-file` `.env.example`**; README **112/115**, **3** открыто; **`pytest`** `test_c027`+`test_c100`+`test_c090` **14 passed**; **`ruff check`** OK (**05.11**, uncommitted). **6bfeac6** ruff-fix уже на **origin/main** — подтверждено `git log`.
+- Не доделано: **C006** — commit+push pytest/README fixes и green GitHub Actions (коммит без запроса не делал).
+- Проблемы, которые выявил: прошлая передача «ruff только в working tree» устарела (**6bfeac6** pushed); **C089/C098** — внешние блокеры.
+- Из них решено: три падения unit job CI — код локально, проверено targeted pytest.
+- Из них не решено: push фиксов; working corpus; backup-сервер.
+- Не трогать: **`[x]` C110** и остальные закрытые ID; signoff **3271087**; `_verify_approved_form`.
+- Следующий шаг: **C006** — commit+push `test_c027`/`test_c090`/README и дождаться green GitHub Actions.
+- Счёт: `python3 scripts/remediation_checklist_status.py` → **112 closed, 3 open** (C006, C089, C098).
 
 **CI fixes:** Alembic **`20261103_0011`** skip existing `operator_override_events`; unit job skips integration bundle subprocess без test DB; **`sys.executable`** в C015/C018.
 
 **Push:** коммит на **`main`**; **C006** закрыть после green GitHub Actions на этом SHA.
 
 **Счёт:** **112/115**, open **C006, C089, C098**.
+
+## 05.11 — C006 green CI
+
+GitHub Actions [**42023422545**](https://github.com/zart227/jobpilot-ai/actions/runs/42023422545) **success** на **`cf3ac12`**. **[x] C006**; счёт **113/115**, open **C089, C098**.
+
+## Передача следующему агенту
+
+- Сделано и подтверждено: **`[x]` C006** — GitHub Actions run **42023143504** **success** на **`29985a9`** (`main`); галочка/шапка **113/2** и README **113/2** в [remediation-plan.md](remediation-plan.md) + README (локально uncommitted plan/progress/README).
+- Не доделано: **C089** — working corpus switch/rollback (внешний блокер). **C098** — полный backup verify на отдельном сервере (внешний блокер).
+- Проблемы, которые выявил: прошлая передача про ruff/pytest fixes в working tree устарела (**29985a9** уже на origin); **C089/C098** без разрешений не закрываются.
+- Из них решено: **C006** закрыт по green CI (**42023143504**).
+- Из них не решено: working corpus; backup-сервер.
+- Не трогать: **`[x]` C006**, **`[x]` C110** и остальные закрытые ID; signoff **3271087**; `_verify_approved_form`.
+- Следующий шаг: **C089** — внешний блокер: разрешение на staged switch/rollback working corpus без mass reindex.
+- Счёт: `python3 scripts/remediation_checklist_status.py` → **113 closed, 2 open** (C089, C098).
