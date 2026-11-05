@@ -10,7 +10,7 @@ Read-only инвентаризация **не отправляет** Telegram и
 ## Команда
 
 ```bash
-export JOBPILOT_WORKING_DATABASE_URL='postgresql+asyncpg://…/jobpilot_ai'
+export DATABASE_URL='postgresql+asyncpg://…/jobpilot_ai'   # из .env (127.0.0.1:5434); при `JOBPILOT_WORKING_DATABASE_URL=@postgres:` host-side `make` выберет localhost через `scripts/ops_database_url.py`
 PYTHONPATH=. .venv/bin/python scripts/ops_working_db_preflight.py
 make -s ops-outbox-triage    # JSON rollup: P1/P2/inbox counts
 make -s ops-outbox-triage-md > /tmp/outbox-triage-bundle.md   # full markdown bundle
@@ -43,7 +43,7 @@ PYTHONPATH=. .venv/bin/python scripts/ops_outbox_recovery.py --id '<uuid>' --app
 - `by_kind_status` — агрегаты по kind/status
 - `needs_attention_totals_by_kind` — полные счётчики `needs_attention` (не только sample)
 - `needs_attention_totals_by_error_bucket` — полная разбивка по bucket на всех `needs_attention`
-- `needs_attention_by_reference_type` — полные счётчики по `reference_type` (working **02.11**: `telegram_pending` **20**, `telegram_inbox_pending` **12**)
+- `needs_attention_by_reference_type` — полные счётчики по `reference_type` (working **03.11**: `telegram_pending` **20**, `telegram_inbox_pending` **13**; всего **33**)
 - `needs_attention_sample_by_error_bucket` — buckets только в sample (до `--pending-limit`)
 - `needs_attention_total` — число всех строк `needs_attention`
 - `needs_attention_triage_groups` — группы `{kind, error_bucket}` с id/reference для чеклиста (без payload)

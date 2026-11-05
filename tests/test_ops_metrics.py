@@ -11,7 +11,9 @@ async def test_counts_can_be_reused_in_job_and_funnel_metrics() -> None:
     engine = create_engine("sqlite://")
     try:
         with engine.connect() as connection:
-            values = [2, 1, None, 0, 1, 3, 4, 42, 5, 0, None, 0, 3, 7, 9]
+            values = [
+                2, 1, None, 0, 0, 1, 3, 4, 0, None, 42, 5, 0, None, 0, 3, 0, 0, 0, 7, 9, None, None
+            ]
             results = [connection.execute(text("SELECT :value"), {"value": v}) for v in values]
             session = AsyncMock()
             session.execute.side_effect = results
@@ -19,6 +21,8 @@ async def test_counts_can_be_reused_in_job_and_funnel_metrics() -> None:
         assert metrics["jobs"]["total"] == metrics["funnel"]["unique_jobs"] == 42
         assert metrics["jobs"]["with_confirmed_send"] == 9
         assert metrics["funnel"]["jobs_with_confirmed_external_send"] == 9
+        assert metrics["llm"]["total_cost_usd"] == 0.0
+        assert metrics["llm"]["total_prompt_tokens"] == 0
     finally:
         engine.dispose()
 

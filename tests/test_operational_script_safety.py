@@ -50,8 +50,7 @@ def dump(tmp_path):
 
 
 def run_restore(env, dump, name):
-    return subprocess.run(
-        ["sh", str(ROOT / "scripts/restore_postgres_drill.sh"), str(dump)],
+    return subprocess.run(["sh", str(ROOT / "scripts/restore_postgres_drill.sh"), str(dump)],
         env={**env, "JOBPILOT_DRILL_DB": name}, capture_output=True, text=True, check=False,
     )
 
@@ -96,8 +95,7 @@ def test_restore_existing_database_fails_without_restoring(fake_commands, dump):
 ])
 def test_readiness_smoke_requires_real_ready_result(fake_commands, code, body, ok):
     env, _ = fake_commands
-    result = subprocess.run(
-        ["sh", str(ROOT / "scripts/readiness_smoke.sh")],
+    result = subprocess.run(["sh", str(ROOT / "scripts/readiness_smoke.sh")],
         env={**env, "FAKE_READY_CODE": code, "FAKE_READY_BODY": body},
         capture_output=True, text=True, check=False,
     )
@@ -106,8 +104,7 @@ def test_readiness_smoke_requires_real_ready_result(fake_commands, code, body, o
 
 def test_readiness_smoke_fails_when_liveness_fails(fake_commands):
     env, _ = fake_commands
-    result = subprocess.run(
-        ["sh", str(ROOT / "scripts/readiness_smoke.sh")],
+    result = subprocess.run(["sh", str(ROOT / "scripts/readiness_smoke.sh")],
         env={**env, "FAKE_HEALTH_FAIL": "1", "FAKE_READY_CODE": "200",
              "FAKE_READY_BODY": '{"ready":true,"status":"ready"}'},
         capture_output=True, text=True, check=False,
@@ -161,8 +158,7 @@ def test_rollout_refuses_before_migrations_without_backup_and_smoke(fake_rollout
         env["JOBPILOT_ROLLOUT_BACKUP_SHA256"] = hashlib.sha256(backup.read_bytes()).hexdigest()
     else:
         (root / "scripts/readiness_smoke.sh").unlink()
-    result = subprocess.run(
-        ["sh", str(root / "scripts/production_rollout.sh")],
+    result = subprocess.run(["sh", str(root / "scripts/production_rollout.sh")],
         env=env,
         capture_output=True,
         text=True,
@@ -174,8 +170,7 @@ def test_rollout_refuses_before_migrations_without_backup_and_smoke(fake_rollout
 
 def test_rollout_stops_when_ops_readiness_enabled_without_working_url(fake_rollout):
     root, env, log, _ = fake_rollout
-    result = subprocess.run(
-        ["sh", str(root / "scripts/production_rollout.sh")],
+    result = subprocess.run(["sh", str(root / "scripts/production_rollout.sh")],
         env={**env, "JOBPILOT_ROLLOUT_OPS_READINESS": "1"},
         capture_output=True,
         text=True,
@@ -189,8 +184,7 @@ def test_rollout_stops_when_ops_readiness_enabled_without_working_url(fake_rollo
 @pytest.mark.parametrize("smoke_exit", [0, 1])
 def test_rollout_runs_smoke_and_propagates_failure(fake_rollout, smoke_exit):
     root, env, log, _ = fake_rollout
-    result = subprocess.run(
-        ["sh", str(root / "scripts/production_rollout.sh")],
+    result = subprocess.run(["sh", str(root / "scripts/production_rollout.sh")],
         env={**env, "FAKE_SMOKE_EXIT": str(smoke_exit)},
         capture_output=True,
         text=True,

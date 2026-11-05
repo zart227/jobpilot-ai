@@ -1,6 +1,6 @@
 # Staging drill log (шаблон)
 
-> Актуальный счёт критериев: [remediation-checklists.md](remediation-checklists.md) (**72/115 подтверждено, 43 открыто**). Dry-run не закрывает live.
+> Журнал drill, не текущий счёт. Критерии: [remediation-plan.md](remediation-plan.md). Dry-run не закрывает live.
 
 Заполнять после прогона сценариев из [runbook.md](runbook.md) § Staging drills. Не коммитить секреты.
 
@@ -17,6 +17,8 @@
 | Разрешение active proposals + migrate | 2026-10-14 | local 5434 | agent | `resolve_active_proposal_conflicts.py --apply --confirm` (4 rows); `alembic upgrade head` → **0004** OK |
 | `make dependency-drill` (postgres stop/start) | 2026-11-03 | local API :8000 | agent | `/ready` **503** while postgres down, **200** after recovery (repeat drill OK) |
 | `make redis-drill` | 2026-11-03 | local API :8000 | agent | `/ready` **503** while redis down, **200** after recovery (repeat drill OK) |
+| `make dependency-drill` (postgres stop/start) | 2026-11-05 | local API :8000 | agent | `/ready` **503** while postgres down, **200** after recovery (`dependency_failure_drill.sh` OK) |
+| `make redis-drill` | 2026-11-05 | local API :8000 | agent | `/ready` **503** while redis down, **200** after recovery (`redis_failure_drill.sh` OK) |
 | `make cursor-bridge-drill` | 2026-11-03 | local | agent | policy **5 passed**; unauth **404** on **19247** (not **200**) |
 | `make cursor-bridge-container` | 2026-11-03 | telegram-bot Up | agent | curl **9247** без auth → **HTTP 404** |
 | `c106_runtime_api_probe.sh` | 2026-11-03 | local API :8000 | agent | `/health` **200**, `/jobs` без token **401** |

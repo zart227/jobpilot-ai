@@ -59,6 +59,41 @@ async def test_fallback_compatibility_and_ambiguous_data(mode):
 
 
 @pytest.mark.skipif(os.environ.get('JOBPILOT_INTEGRATION_TESTS') != '1', reason='isolated DB required')
+async def test_identity_ambiguity_enqueues_durable_ops_alert():
+    from sqlalchemy import func, select
+
+    from app.config import Settings
+    from app.db.models import NotificationOutbox
+    from app.db.session import AsyncSessionLocal
+    from app.services.kwork_inbox import (
+        _enqueue_identity_ambiguity_ops_alerts,
+        _identity_ambiguity_idempotency_key,
+    )
+
+    entry = {
+        "user_id": str(uuid.uuid4().int % (10**8)),
+        "reason": "identical_messages_without_id",
+        "timestamp": 999,
+    }
+    key = _identity_ambiguity_idempotency_key(entry)
+    settings = Settings(_env_file=None, telegram_admin_chat_id="7")
+    async with AsyncSessionLocal() as session:
+        await _enqueue_identity_ambiguity_ops_alerts(session, settings, [entry])
+        await _enqueue_identity_ambiguity_ops_alerts(session, settings, [entry])
+        await session.commit()
+        outbox = await session.scalar(
+            select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key)
+        )
+        assert outbox is not None and outbox.kind == "ops_alert" and outbox.status == "pending"
+        count = await session.scalar(
+            select(func.count()).select_from(NotificationOutbox).where(
+                NotificationOutbox.idempotency_key == key
+            )
+        )
+        assert int(count or 0) == 1
+
+
+@pytest.mark.skipif(os.environ.get('JOBPILOT_INTEGRATION_TESTS') != '1', reason='isolated DB required')
 async def test_legacy_database_record_blocks_direct_reprocessing_without_raw_timestamp(monkeypatch):
     from app.config import Settings
     from app.db.models import InboundMessage

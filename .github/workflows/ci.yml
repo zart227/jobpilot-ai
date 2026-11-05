@@ -85,11 +85,25 @@ jobs:
       - name: Install
         run: sh scripts/verify_lockfile.sh
 
+      - name: Install PostgreSQL client (restore drill tests)
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
       - name: Alembic upgrade head
         run: alembic upgrade head
 
       - name: Integration pytest
-        run: pytest -q tests/test_integration_db.py tests/test_migration_preflight_integration.py tests/test_acceptance_dry_run.py tests/test_acceptance_inbox_flow.py tests/test_send_attempt_inbox_concurrency.py tests/test_send_attempt_reconcile.py tests/test_notification_outbox_delivery.py tests/test_job_processing_integration.py
+        run: |
+          pytest -q \
+            tests/test_integration_db.py \
+            tests/test_migration_preflight_integration.py \
+            tests/test_c018_legacy_upgrade_acceptance.py \
+            tests/test_c098_restore_drill_acceptance.py \
+            tests/test_acceptance_dry_run.py \
+            tests/test_acceptance_inbox_flow.py \
+            tests/test_send_attempt_inbox_concurrency.py \
+            tests/test_send_attempt_reconcile.py \
+            tests/test_notification_outbox_delivery.py \
+            tests/test_job_processing_integration.py
 
   browser-form-contract:
     runs-on: ubuntu-latest

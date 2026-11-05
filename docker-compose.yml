@@ -78,6 +78,7 @@ services:
             <<: *app-env
             API_HOST: 0.0.0.0
             API_PORT: 8000
+            JOBPILOT_SKIP_DB_MIGRATE: "0"
         ports:
             - "8000:8000"
         depends_on:
@@ -105,6 +106,7 @@ services:
             - "host.docker.internal:host-gateway"
         environment:
             <<: *app-env
+            JOBPILOT_SKIP_DB_MIGRATE: "1"
         depends_on:
             postgres:
                 condition: service_healthy
@@ -116,6 +118,7 @@ services:
             - ./app:/app/app
             - ./alembic.ini:/app/alembic.ini:ro
             - ./alembic:/app/alembic:ro
+            - ./scripts:/app/scripts:ro
             - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
             - ./data:/app/data
 
@@ -129,9 +132,12 @@ services:
             - "host.docker.internal:host-gateway"
         environment:
             <<: *app-env
+            JOBPILOT_SKIP_DB_MIGRATE: "1"
         depends_on:
             redis:
                 condition: service_healthy
+            api:
+                condition: service_started
         volumes:
             - ./app:/app/app
             - ./alembic.ini:/app/alembic.ini:ro
@@ -154,6 +160,7 @@ services:
             <<: *app-env
             API_HOST: api
             API_PORT: 8000
+            JOBPILOT_SKIP_DB_MIGRATE: "1"
             CURSOR_WORKSPACE_HOST: ${JOBPILOT_HOST_WORKSPACE:-/home/arthur/jobpilot-ai}
             CURSOR_BRIDGE_BASE_URL: ${CURSOR_BRIDGE_BASE_URL:-http://host.docker.internal:9247}
             TELEGRAM_DEV_AGENT_ENABLED: ${TELEGRAM_DEV_AGENT_ENABLED:-true}

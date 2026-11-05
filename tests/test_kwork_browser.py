@@ -2,8 +2,27 @@ from app.services.kwork_browser import (
     KWORK_ORDER_CLOSED_ERROR,
     _order_closed_in_body,
     is_kwork_order_closed_error,
+    kwork_browser_proxy_candidates,
 )
 
+
+def test_kwork_browser_proxy_candidates_skip_openai_rotation_list() -> None:
+    from app.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        PROXY_ENABLED=True,
+        OPENAI_PROXY_LIST="/app/proxy-lists/openai.txt",
+    )
+    assert kwork_browser_proxy_candidates(settings) == [None]
+
+    settings_with_proxy = Settings(
+        _env_file=None,
+        PROXY_ENABLED=True,
+        PROXY="http://127.0.0.1:7890",
+        OPENAI_PROXY_LIST="/app/proxy-lists/openai.txt",
+    )
+    assert kwork_browser_proxy_candidates(settings_with_proxy) == [None, "http://127.0.0.1:7890"]
 
 def test_order_closed_in_body_detects_project_already_closed() -> None:
     body = "К сожалению, проект уже закрыт. Смотрите похожие проекты на Бирже"

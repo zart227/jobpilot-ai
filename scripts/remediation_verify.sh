@@ -30,7 +30,7 @@ echo "== remediation_verify =="
 
 _SAVED_INTEGRATION="${JOBPILOT_INTEGRATION_TESTS:-}"
 unset JOBPILOT_INTEGRATION_TESTS
-"$PY" -m pytest -q tests/test_remediation_checklist_gate.py tests/test_audit_remediation_status.py tests/test_settings_generic_selectors.py tests/test_proposal_conflict_resolution.py tests/test_qdrant_embedding_drill.py
+"$PY" -m pytest -q tests/test_remediation_checklist_gate.py tests/test_audit_remediation_status.py tests/test_settings_generic_selectors.py tests/test_proposal_conflict_resolution.py tests/test_qdrant_embedding_drill.py tests/test_ci_workflow_policy.py tests/test_c090_c093_production_repro_policy.py
 JOBPILOT_INTEGRATION_TESTS="${_SAVED_INTEGRATION}"
 
 if [ "${JOBPILOT_INTEGRATION_TESTS:-}" = "1" ]; then

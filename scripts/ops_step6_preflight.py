@@ -20,13 +20,13 @@ SIGNOFF = Path(os.environ.get("JOBPILOT_LIVE_SIGNOFF_PATH", str(ROOT / "data/liv
 
 def _run_pilot_status() -> int:
     env = {**os.environ, "JOBPILOT_WORKING_DATABASE_URL": WORKING_DB}
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/ops_pilot_status.py")],
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/ops_pilot_status.py")],
         cwd=ROOT,
         env=env,
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     print(proc.stdout, end="")
     if proc.stderr:
@@ -44,11 +44,20 @@ async def _unknown_result_note() -> dict:
     from app.db.models import SendAttempt
     from app.db.session import AsyncSessionLocal
 
+    legacy_prefix = "commit_failed_after_platform_success: simulated"
     async with AsyncSessionLocal() as session:
         count = await session.scalar(
             select(func.count())
             .select_from(SendAttempt)
             .where(SendAttempt.status.in_(("sending", "unknown_result", "needs_attention")))
+        )
+        legacy = await session.scalar(
+            select(func.count())
+            .select_from(SendAttempt)
+            .where(
+                SendAttempt.status == "unknown_result",
+                SendAttempt.last_error.like(f"{legacy_prefix}%"),
+            )
         )
         rows = (
             await session.scalars(
@@ -58,26 +67,38 @@ async def _unknown_result_note() -> dict:
                 .limit(3)
             )
         ).all()
+    total = int(count or 0)
+    legacy_n = int(legacy or 0)
     return {
-        "count": int(count or 0),
+        "count": total,
+        "legacy_simulated_commit_failure": legacy_n,
+        "actionable_uncertainty": max(0, total - legacy_n),
         "latest_errors": [
-            {"id": str(r.id), "kind": r.kind, "last_error": (r.last_error or "")[:100]}
+            {
+                "id": str(r.id),
+                "kind": r.kind,
+                "status": r.status,
+                "last_error": (r.last_error or "")[:100],
+            }
             for r in rows
         ],
-        "note": "Includes sending, unknown_result and needs_attention; resolve before live.",
+        "note": (
+            "Includes sending, unknown_result and needs_attention. "
+            "Legacy simulated: scripts/ops_reconcile_legacy_simulated_unknown.py"
+        ),
     }
 
 
 def _signoff_gate() -> dict:
     if not SIGNOFF.is_file():
         return {"path": str(SIGNOFF.relative_to(ROOT)), "present": False, "validator": "skip (file missing)"}
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/validate_live_signoff.py")],
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/validate_live_signoff.py")],
         cwd=ROOT,
         env={**os.environ, "JOBPILOT_LIVE_SIGNOFF_PATH": str(SIGNOFF)},
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     return {
         "path": str(SIGNOFF.relative_to(ROOT)),
@@ -89,14 +110,14 @@ def _signoff_gate() -> dict:
 
 def _qdrant_drill_dry() -> dict:
     env = {**os.environ, "DATABASE_URL": WORKING_DB}
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/qdrant_embedding_drill.py")],
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/qdrant_embedding_drill.py")],
         cwd=ROOT,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         timeout=120,
+        check=False,
     )
     try:
         payload = json.loads(proc.stdout)
@@ -117,15 +138,29 @@ def _qdrant_drill_dry() -> dict:
 
 
 def _kwork_access_gate() -> dict:
-    proc = subprocess.run(
-        [sys.executable, str(ROOT / "scripts/ops_kwork_access_probe.py")],
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/ops_kwork_access_probe.py")],
         cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=180,
+        check=False,
     )
-    # This probe establishes listing access only; it does not establish browser login.
-    return {"exit_code": proc.returncode, "ok": proc.returncode == 0, "browser_auth_verified": False}
+    browser_auth_verified = False
+    if proc.stdout.strip():
+        try:
+            report = json.loads(proc.stdout)
+            if isinstance(report, list):
+                for row in report:
+                    if row.get("browser_auth_verified"):
+                        browser_auth_verified = True
+                        break
+        except json.JSONDecodeError:
+            pass
+    return {
+        "exit_code": proc.returncode,
+        "ok": proc.returncode == 0,
+        "browser_auth_verified": browser_auth_verified,
+    }
 
 
 def main() -> int:
@@ -151,8 +186,19 @@ def main() -> int:
     blockers = []
     if pilot_status != 0:
         blockers.append("pilot_status_failed")
-    if type(unknown.get("count")) is not int or unknown["count"] != 0:
+    if type(unknown.get("count")) is not int:
         blockers.append("unknown_result_requires_resolution")
+    else:
+        legacy_n = int(unknown.get("legacy_simulated_commit_failure") or 0)
+        actionable = unknown.get("actionable_uncertainty")
+        if actionable is None:
+            actionable = max(0, int(unknown.get("count") or 0) - legacy_n)
+        else:
+            actionable = int(actionable)
+        if actionable > 0:
+            blockers.append("unknown_result_requires_resolution")
+        elif legacy_n > 0:
+            blockers.append("legacy_simulated_unknown_pending_reconcile")
     if drill.get("qdrant", {}).get("ok") is not True or drill.get("exit_code") != 0:
         blockers.append("qdrant")
     os.environ["DATABASE_URL"] = WORKING_DB

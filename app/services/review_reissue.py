@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import select, update
 
 from app.config import Settings, get_settings
 from app.db.models import (
@@ -219,22 +219,68 @@ async def reissue_review(
                 proposal.content, proposal_card_payload(job, proposal)["offer_price"]
             ):
                 return ReviewReissueResult("blocked", reason="price_text_mismatch")
+            from app.db.workflow_states import (
+                JOB_STATUS_SIMULATED_SENT,
+                PROPOSAL_STATUS_SENT,
+                PROPOSAL_STATUS_SIMULATED_SENT,
+            )
+            from app.services.submission_policy import job_has_live_submitted_proposal
+
             sent = await session.scalar(
                 select(Proposal.id)
                 .where(
                     Proposal.job_id == job.id,
-                    or_(Proposal.status == "sent", Proposal.sent_at.is_not(None)),
+                    Proposal.status == PROPOSAL_STATUS_SENT,
                 )
                 .limit(1)
             )
+            allowed_job_statuses = {
+                "new",
+                "scored",
+                "pending_approval",
+                "approved",
+                "edited",
+                JOB_STATUS_SIMULATED_SENT,
+            }
+            allowed_proposal_statuses = {
+                "draft",
+                "pending_approval",
+                "approved",
+                "edited",
+                PROPOSAL_STATUS_SIMULATED_SENT,
+            }
             if (
                 sent
-                or job.status not in ("new", "scored", "pending_approval", "approved", "edited")
-                or proposal.status not in ("draft", "pending_approval", "approved", "edited")
+                or await job_has_live_submitted_proposal(session, job.id)
+                or job.status not in allowed_job_statuses
+                or proposal.status not in allowed_proposal_statuses
             ):
                 return ReviewReissueResult("blocked", reason="already_sent_or_protected")
             if await delivery_blocks_mutation(session, job_id=job.id, include_confirmed=True):
-                return ReviewReissueResult("blocked", reason="delivery_requires_resolution")
+                from app.db.models import SendAttempt
+                from app.db.send_attempt_states import ATTEMPT_CONFIRMED_SENT
+                from app.services.delivery_scope import is_live_confirmed_send_attempt
+
+                rows = (
+                    await session.scalars(
+                        select(SendAttempt).where(
+                            SendAttempt.job_id == job.id,
+                            SendAttempt.status.in_(
+                                (
+                                    ATTEMPT_CONFIRMED_SENT,
+                                    "sending",
+                                    "unknown_result",
+                                    "needs_attention",
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+                if any(
+                    row.status != ATTEMPT_CONFIRMED_SENT or is_live_confirmed_send_attempt(row)
+                    for row in rows
+                ):
+                    return ReviewReissueResult("blocked", reason="delivery_requires_resolution")
             pending, outbox = await _queue_proposal(session, source, job, proposal, key, user_id)
         else:
             sent = await session.scalar(
@@ -251,6 +297,61 @@ async def reissue_review(
             ):
                 return ReviewReissueResult("blocked", reason="delivery_requires_resolution")
             pending, outbox = await _queue_inbox(session, source, key, user_id)
+        from app.services.operator_override_journal import record_operator_override
+
+        await record_operator_override(
+            session,
+            action="review_reissue",
+            actor_source="telegram",
+            actor_user_id=user_id,
+            reference_type=f"telegram_{kind}_pending",
+            reference_id=source.id,
+            detail={
+                "kind": kind,
+                "new_pending_id": str(pending.id),
+                "outbox_id": str(outbox.id),
+                "source_status": source.status,
+            },
+        )
         source.status = "superseded"
+        await session.commit()
+        return ReviewReissueResult("queued", pending.id, outbox.id)
+
+
+async def queue_edit_existing_proposal_review(
+    *,
+    pending_id: uuid.UUID,
+    chat_id: int,
+    user_id: int,
+    source_message_id: int | None = None,
+    settings: Settings | None = None,
+) -> ReviewReissueResult:
+    """Queue a fresh full-text review card authorized to edit an already-submitted offer."""
+    from app.services.submission_policy import job_has_submitted_proposal
+
+    settings = settings or get_settings()
+    if not is_authorized_telegram(chat_id, user_id, settings):
+        return ReviewReissueResult("blocked", reason="unauthorized")
+    key = f"review_edit_existing:proposal:{pending_id}"
+    async with AsyncSessionLocal() as session:
+        source = await _lock(session, TelegramPending, pending_id)
+        if not source or source.chat_id != chat_id:
+            return ReviewReissueResult("blocked", reason="chat_mismatch")
+        if source_message_id is not None and source.message_id != source_message_id:
+            return ReviewReissueResult("blocked", reason="stale_card")
+        existing = await session.scalar(
+            select(NotificationOutbox).where(NotificationOutbox.idempotency_key == key)
+        )
+        if existing:
+            return ReviewReissueResult("already_queued", existing.reference_id, existing.id)
+        job = await _lock(session, Job, source.job_id)
+        proposal = await _lock(session, Proposal, source.proposal_id)
+        if not job or not proposal or proposal.job_id != job.id:
+            return ReviewReissueResult("blocked", reason="invalid_target")
+        if not await job_has_submitted_proposal(session, job.id):
+            return ReviewReissueResult("blocked", reason="no_prior_send")
+        if await delivery_blocks_mutation(session, job_id=job.id, include_confirmed=True):
+            return ReviewReissueResult("blocked", reason="delivery_requires_resolution")
+        pending, outbox = await _queue_proposal(session, source, job, proposal, key, user_id)
         await session.commit()
         return ReviewReissueResult("queued", pending.id, outbox.id)

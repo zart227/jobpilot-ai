@@ -182,7 +182,7 @@ async def test_beat_queue_cycle_after_stale_recovery_re_enqueues_once(short_leas
 
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
-        job.processing_claimed_at = datetime.now(UTC) - timedelta(seconds=120)
+        job.processing_claimed_at = datetime.now(UTC) - timedelta(seconds=400)
         await session.commit()
 
     assert await recover_stale_job_claims(short_lease_settings) >= 1

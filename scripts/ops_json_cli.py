@@ -23,10 +23,13 @@ def parse_json_stdout(text: str) -> dict:
 
 async def rebind_async_engine() -> None:
     """Point SQLAlchemy at JOBPILOT_WORKING_DATABASE_URL / DATABASE_URL (ops CLIs)."""
-    url = os.environ.get("JOBPILOT_WORKING_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    from scripts.ops_database_url import pick_ops_database_url
+
+    url = pick_ops_database_url()
     if not url:
         return
     os.environ["DATABASE_URL"] = url
+    os.environ.pop("JOBPILOT_WORKING_DATABASE_URL", None)
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
     import app.db.session as db_session

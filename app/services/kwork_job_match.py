@@ -69,7 +69,19 @@ async def find_kwork_job_for_message(
     *,
     username: str,
     project_id: str | None,
+    bound_job_id: uuid.UUID | None = None,
 ) -> KworkJobMatchResult:
+    if bound_job_id is not None:
+        job = await session.get(Job, bound_job_id)
+        if job and job.platform == "kwork":
+            if username:
+                client = await session.get(Client, job.client_id) if job.client_id else None
+                if not kwork_username_matches_client(client, username):
+                    return KworkJobMatchResult(needs_context=True)
+            proposal = await best_proposal_for_reply(session, job.id)
+            return KworkJobMatchResult(job=job, proposal=proposal)
+        return KworkJobMatchResult(needs_context=True)
+
     if project_id:
         result = await session.execute(select(Job).where(Job.platform == "kwork"))
         matches = [job for job in result.scalars().all() if kwork_project_id_matches(job, project_id)]

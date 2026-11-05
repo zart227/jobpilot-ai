@@ -42,8 +42,7 @@ def test_render_markdown_includes_groups_and_checkboxes():
 def test_checklist_requires_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

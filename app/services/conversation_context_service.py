@@ -15,6 +15,7 @@ from app.db.send_attempt_states import ATTEMPT_CONFIRMED_SENT, ATTEMPT_KIND_PROP
 from app.db.session import AsyncSessionLocal
 from app.services.conversation_summary import SUMMARY_CACHE_KEY, build_conversation_context
 from app.services.kwork_conversation import (
+    conversation_summary_thread_scope,
     resolve_conversation_context,
     resolve_conversation_history,
 )
@@ -93,6 +94,7 @@ async def build_chat_agent_state(
     thread_messages: list[dict[str, Any]] | None = None,
     my_username: str = "",
     my_user_id: int | None = None,
+    client_message_id: str | None = None,
     proposal: Proposal | None = None,
 ) -> dict:
     job = await session.get(Job, job_id)
@@ -100,6 +102,12 @@ async def build_chat_agent_state(
         return {}
 
     sent_attempt = await _confirmed_proposal_for_chat(session, job, proposal)
+    summary_thread_scope = conversation_summary_thread_scope(
+        channel=channel,
+        job_id=job.id,
+        thread_messages=thread_messages,
+        client_message_id=client_message_id,
+    )
 
     conversation_history = await resolve_conversation_history(
         session,
@@ -109,6 +117,7 @@ async def build_chat_agent_state(
         thread_messages=thread_messages,
         my_username=my_username,
         my_user_id=my_user_id,
+        client_message_id=client_message_id,
     )
     conversation_context = await resolve_conversation_context(
         session,
@@ -118,6 +127,8 @@ async def build_chat_agent_state(
         thread_messages=thread_messages,
         my_username=my_username,
         my_user_id=my_user_id,
+        client_message_id=client_message_id,
+        thread_scope=summary_thread_scope,
     )
 
     return {
@@ -128,6 +139,7 @@ async def build_chat_agent_state(
         "proposal_id": str(sent_attempt.proposal_id) if sent_attempt and sent_attempt.proposal_id else None,
         "conversation_history": conversation_history,
         "conversation_context": conversation_context,
+        "_summary_thread_scope": summary_thread_scope,
         "_summary_cache": deepcopy((job.raw_data or {}).get(SUMMARY_CACHE_KEY)),
     }
 
@@ -139,7 +151,10 @@ async def finalize_chat_agent_state(state: dict) -> dict:
     old_cache = state.pop("_summary_cache")
     holder = SimpleNamespace(raw_data={SUMMARY_CACHE_KEY: deepcopy(old_cache)})
     state["conversation_context"] = await build_conversation_context(
-        None, holder, state.get("conversation_history") or [],
+        None,
+        holder,
+        state.get("conversation_history") or [],
+        thread_scope=state.get("_summary_thread_scope"),
     )
     new_cache = holder.raw_data.get(SUMMARY_CACHE_KEY)
     if new_cache != old_cache:

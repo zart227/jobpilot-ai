@@ -71,7 +71,6 @@ async def send_node(state: JobPilotState) -> dict:
         job_id,
         proposal_id,
         content,
-        allow_resubmit=state.get("approval_status") == "edited",
     )
     logger.info("JobPilot AI proposal sent", job_id=job_id, success=success, error=error)
     return {

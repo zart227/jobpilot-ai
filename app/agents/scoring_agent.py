@@ -74,7 +74,12 @@ Platform: {job.get('platform')}"""
             return {
                 "score": final_score,
                 "score_breakdown": breakdown,
-                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
+                "llm_stage_log": append_stage_log(
+                    state,
+                    "scoring",
+                    "scoring",
+                    usage=self._llm.consume_last_call_usage(),
+                ),
             }
         except LLMServiceError as exc:
             logger.error("ScoringAgent LLM error", error=str(exc), kind=exc.kind.value)
@@ -82,7 +87,6 @@ Platform: {job.get('platform')}"""
 
             return {
                 **pipeline_error_from_exception(exc, stage="scoring"),
-                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
             }
         except Exception as exc:
             logger.error("ScoringAgent failed", error=str(exc))
@@ -90,7 +94,6 @@ Platform: {job.get('platform')}"""
 
             return {
                 **pipeline_error_from_exception(exc, stage="scoring"),
-                "llm_stage_log": append_stage_log(state, "scoring", "scoring"),
             }
 
     async def _get_active_weights(self) -> dict[str, float]:

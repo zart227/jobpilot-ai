@@ -18,6 +18,10 @@ sys.exit(0 if asyncio.run(check()) else 1)
 done
 
 echo "JobPilot AI: initializing database..."
-python scripts/init_db.py
+if [ "${JOBPILOT_SKIP_DB_MIGRATE:-0}" = "1" ]; then
+  echo "JobPilot AI: skipping migrations (JOBPILOT_SKIP_DB_MIGRATE=1)"
+else
+  python scripts/init_db.py
+fi
 
 exec "$@"

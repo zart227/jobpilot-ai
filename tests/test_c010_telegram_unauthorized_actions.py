@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,10 +13,10 @@ from app.telegram.access import is_authorized_telegram
 
 
 def _admin_settings(**overrides) -> Settings:
-    base = dict(
-        TELEGRAM_ADMIN_CHAT_ID="100",
-        TELEGRAM_ADMIN_USER_ID="100",
-    )
+    base = {
+        "TELEGRAM_ADMIN_CHAT_ID": "100",
+        "TELEGRAM_ADMIN_USER_ID": "100",
+    }
     base.update(overrides)
     return Settings(_env_file=None, **base)
 

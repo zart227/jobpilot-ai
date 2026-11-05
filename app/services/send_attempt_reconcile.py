@@ -19,6 +19,7 @@ from app.db.send_attempt_states import (
     ATTEMPT_UNKNOWN_RESULT,
 )
 from app.db.session import AsyncSessionLocal
+from app.db.status_transitions import allows_send_attempt_transition
 from app.services.kwork_api import clean_kwork_message_text, create_kwork_api
 from app.services.send_attempt_service import _lock_attempt
 
@@ -82,6 +83,8 @@ async def _confirm_reconciled_send(
         merged = dict(attempt.platform_response or {})
         merged["reconciliation"] = {"source": source, **(evidence or {})}
         attempt.platform_response = merged
+        if not allows_send_attempt_transition(attempt.status, ATTEMPT_CONFIRMED_SENT):
+            return False
         attempt.status = ATTEMPT_CONFIRMED_SENT
         attempt.last_error = None
         await _apply_confirmed_send(session, attempt)
@@ -178,6 +181,8 @@ async def mark_inconclusive_needs_attention(attempt_id: uuid.UUID, reason: str) 
     async with AsyncSessionLocal() as session:
         attempt = await _lock_attempt(session, attempt_id)
         if not attempt or attempt.status != ATTEMPT_UNKNOWN_RESULT:
+            return False
+        if not allows_send_attempt_transition(attempt.status, ATTEMPT_NEEDS_ATTENTION):
             return False
         attempt.status = ATTEMPT_NEEDS_ATTENTION
         attempt.last_error = reason[:2000]

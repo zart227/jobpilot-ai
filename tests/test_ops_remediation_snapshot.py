@@ -12,8 +12,7 @@ SCRIPT = ROOT / "scripts" / "ops_remediation_snapshot.py"
 def test_snapshot_requires_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
@@ -26,8 +25,7 @@ def test_snapshot_requires_database_url(monkeypatch):
 @pytest.mark.skipif(os.environ.get("JOBPILOT_INTEGRATION_TESTS") != "1", reason="isolated DB required")
 def test_snapshot_json_shape(monkeypatch):
     monkeypatch.setenv("JOBPILOT_WORKING_DATABASE_URL", os.environ["DATABASE_URL"])
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--sample-limit", "3"],
+    result = subprocess.run([sys.executable, str(SCRIPT), "--sample-limit", "3"],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

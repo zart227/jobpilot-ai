@@ -233,3 +233,31 @@ async def test_stale_claim_released_before_reclaim(monkeypatch):
     monkeypatch.setattr("app.services.memory_index_queue.get_memory_store", lambda: memory)
     stats = await process_memory_index_queue(limit=5)
     assert stats["memory_queue_succeeded"] == 1
+
+
+async def test_recover_stale_claims_does_not_clear_fresh_claim():
+    from datetime import UTC, datetime, timedelta
+
+    key = f"proposal:{uuid.uuid4()}"
+    fresh_token = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            MemoryIndexPending(
+                kind=KIND_SUCCESSFUL_PROPOSAL,
+                dedupe_key=key,
+                payload={"memory_key": key, "content": "fresh", "metadata": {}},
+                claim_token=fresh_token,
+                claim_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                claim_owner="memory_index_worker",
+            )
+        )
+        await session.commit()
+
+    assert await recover_stale_memory_index_claims() == 0
+
+    async with AsyncSessionLocal() as session:
+        row = await session.scalar(
+            select(MemoryIndexPending).where(MemoryIndexPending.dedupe_key == key)
+        )
+        assert row is not None
+        assert row.claim_token == fresh_token

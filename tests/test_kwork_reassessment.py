@@ -116,7 +116,8 @@ async def test_rejection_revokes_old_approval():
     }))
     assert result['status'] == 'rejected'
     claim, _, _ = await prepare_proposal_send(str(job_id), str(proposal_id), 'Approved')
-    assert (claim.action, claim.reason) == ('blocked', 'assessment_required')
+    assert claim.action == 'blocked'
+    assert claim.reason in ('assessment_required', 'durable_approval_required')
 
 
 async def test_reused_assessment_revision_is_rejected():

@@ -48,18 +48,29 @@ def is_from_client(message: dict[str, Any], my_username: str, my_user_id: int | 
     return bool(text.strip())
 
 
+def platform_message_id(message: dict[str, Any]) -> str | None:
+    raw = message.get("MID") or message.get("id") or message.get("message_id")
+    if raw is None or raw == "":
+        return None
+    return str(raw)
+
+
 def conversation_from_kwork_thread(
     messages: list[dict[str, Any]] | None,
     *,
     my_username: str,
     my_user_id: int | None,
+    exclude_client_message_id: str | None = None,
     exclude_last_client_text: str | None = None,
 ) -> list[dict[str, str]]:
     if not messages:
         return []
 
     turns: list[dict[str, str]] = []
+    exclude_id = str(exclude_client_message_id) if exclude_client_message_id else None
     for message in sorted(messages, key=_message_timestamp):
+        if exclude_id and platform_message_id(message) == exclude_id:
+            continue
         msg_type = str(message.get("type", "text"))
         if msg_type in SYSTEM_MESSAGE_TYPES:
             continue
@@ -116,12 +127,14 @@ async def resolve_conversation_history(
     thread_messages: list[dict[str, Any]] | None = None,
     my_username: str = "",
     my_user_id: int | None = None,
+    client_message_id: str | None = None,
 ) -> list[dict[str, str]]:
     if channel == "kwork" and thread_messages:
         thread_history = conversation_from_kwork_thread(
             thread_messages,
             my_username=my_username,
             my_user_id=my_user_id,
+            exclude_client_message_id=client_message_id,
             exclude_last_client_text=client_message,
         )
         if thread_history:
@@ -134,6 +147,26 @@ async def resolve_conversation_history(
     )
 
 
+def conversation_summary_thread_scope(
+    *,
+    channel: str,
+    job_id: uuid.UUID,
+    thread_messages: list[dict[str, Any]] | None = None,
+    client_message_id: str | None = None,
+) -> str:
+    if thread_messages:
+        mids = sorted(
+            mid
+            for mid in (platform_message_id(message) for message in thread_messages)
+            if mid
+        )
+        if mids:
+            return f"{channel}:thread:{mids[0]}:{mids[-1]}:{len(mids)}"
+    if client_message_id:
+        return f"{channel}:client_mid:{client_message_id}"
+    return f"{channel}:job:{job_id}"
+
+
 async def resolve_conversation_context(
     session,
     job: Job,
@@ -143,6 +176,8 @@ async def resolve_conversation_context(
     thread_messages: list[dict[str, Any]] | None = None,
     my_username: str = "",
     my_user_id: int | None = None,
+    client_message_id: str | None = None,
+    thread_scope: str | None = None,
 ) -> str:
     turns = await resolve_conversation_history(
         session,
@@ -152,5 +187,12 @@ async def resolve_conversation_context(
         thread_messages=thread_messages,
         my_username=my_username,
         my_user_id=my_user_id,
+        client_message_id=client_message_id,
     )
-    return await build_conversation_context(session, job, turns)
+    scope = thread_scope or conversation_summary_thread_scope(
+        channel=channel,
+        job_id=job.id,
+        thread_messages=thread_messages,
+        client_message_id=client_message_id,
+    )
+    return await build_conversation_context(session, job, turns, thread_scope=scope)

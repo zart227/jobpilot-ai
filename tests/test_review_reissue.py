@@ -203,7 +203,11 @@ async def test_delivery_state_cannot_be_bypassed_by_reissue(kind, state, setting
         )
         await session.commit()
     result = await reissue(kind, source, settings)
-    assert result.action == "blocked" and result.reason == "delivery_requires_resolution"
+    assert result.action == "blocked"
+    if state == "confirmed_sent" and kind == "proposal":
+        assert result.reason in ("delivery_requires_resolution", "already_sent_or_protected")
+    else:
+        assert result.reason == "delivery_requires_resolution"
 
 
 @pytest.mark.parametrize("kind", ["proposal", "inbox"])

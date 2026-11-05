@@ -12,8 +12,7 @@ SCRIPT = ROOT / "scripts" / "ops_outbox_triage_rollup.py"
 def test_triage_rollup_requires_working_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--json"],
+    result = subprocess.run([sys.executable, str(SCRIPT), "--json"],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
@@ -28,8 +27,7 @@ def test_triage_rollup_json_ok(monkeypatch):
     monkeypatch.setenv("JOBPILOT_WORKING_DATABASE_URL", os.environ["DATABASE_URL"])
     monkeypatch.setenv("DATABASE_URL", os.environ["DATABASE_URL"])
     monkeypatch.setenv("JOBPILOT_ALLOW_TEST_URL", "1")
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--json"],
+    result = subprocess.run([sys.executable, str(SCRIPT), "--json"],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

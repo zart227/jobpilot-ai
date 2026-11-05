@@ -61,10 +61,13 @@ async def test_duration_does_not_select_17_as_7_or_first_fallback():
     option = SimpleNamespace(inner_text=AsyncMock(return_value="17 дней"), click=AsyncMock())
     options = SimpleNamespace(count=AsyncMock(return_value=1), nth=lambda _: option)
     input_field = SimpleNamespace(count=AsyncMock(return_value=1), click=AsyncMock())
-    page = SimpleNamespace(
-        locator=lambda selector: input_field if selector.startswith("input") else options,
-        wait_for_timeout=AsyncMock(),
-    )
+
+    def _locator(selector: str):
+        if selector.startswith("input"):
+            return SimpleNamespace(first=input_field)
+        return options
+
+    page = SimpleNamespace(locator=_locator, wait_for_timeout=AsyncMock())
     with pytest.raises(RuntimeError, match="отсутствует"):
         await _select_duration(page, 7)
     option.click.assert_not_awaited()
@@ -88,12 +91,26 @@ async def test_sender_passes_frozen_parameters_and_text_without_padding(monkeypa
         budget_min=10000,
         budget_max=20000,
     )
-    payload = {"content": "Exact approved text", "offer_price": 8500, "duration_days": 7}
+    payload = {
+        "content": "Exact approved text",
+        "offer_price": 8500,
+        "duration_days": 7,
+        "offer_title": "Test title",
+        "payment_type_label": "Безопасная",
+    }
     await proposal_sender.ProposalSender()._send_to_platform(
         job, None, payload["content"], approved_payload=payload
     )
     send.assert_awaited_once_with(
-        job.url, payload["content"], 10000.0, 20000.0, offer_price=8500, duration_days=7
+        job.url,
+        payload["content"],
+        10000.0,
+        20000.0,
+        offer_price=8500,
+        duration_days=7,
+        submission_action=None,
+        offer_title="Test title",
+        payment_type_label="Безопасная",
     )
 
 

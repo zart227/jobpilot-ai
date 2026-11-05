@@ -118,10 +118,19 @@ async def _run() -> dict:
                 )
             )
         ).scalar_one()
+        from app.db.workflow_states import job_is_submitted, proposal_is_submitted
+
         proposal = await session.get(Proposal, proposal_id)
-        assert proposal is not None
+        job = await session.get(Job, job_id)
+        assert proposal is not None and job is not None
         snapshot_ok = attempt.snapshot_content.strip() == content.strip()
-        db_ok = proposal.status == "sent" and proposal.content.strip() == content.strip()
+        dry_run = (attempt.platform_response or {}).get("dry_run") is True
+        db_ok = (
+            proposal_is_submitted(proposal.status)
+            and job_is_submitted(job.status)
+            and proposal.content.strip() == content.strip()
+            and dry_run
+        )
         if not snapshot_ok or not db_ok:
             raise RuntimeError("snapshot/DB mismatch after dry-run send")
 

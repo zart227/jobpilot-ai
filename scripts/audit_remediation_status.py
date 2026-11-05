@@ -19,7 +19,7 @@ def render_markdown() -> str:
         "",
         "Reviewed source: [audit-2026-10-14.md](audit-2026-10-14.md); historical baseline: [audit-2026-10-13.md](audit-2026-10-13.md).",
         "",
-        "Historical finding statuses below are dated and may be stale; see [current audit](audit-2026-11-03-completion.md) and the checklist for current work. Rendering does not rerun tests or approve release.",
+        "Historical finding statuses below are dated and may be stale. Current plan and checklists: [remediation-plan.md](remediation-plan.md). Rendering does not rerun tests or approve release.",
         "",
         "| # | P | Статус | Находка | Остаток / evidence |",
         "| - | - | ------ | ------- | ----------------- |",
@@ -31,7 +31,7 @@ def render_markdown() -> str:
             f"| {f['num']} | {f['priority']} | {f['status']} | {f['title']} | {f['notes']} |"
         )
     checklist = data["checklist"]
-    checklist_text = (ROOT / "docs" / "remediation-checklists.md").read_text(encoding="utf-8")
+    checklist_text = (ROOT / "docs" / "remediation-plan.md").read_text(encoding="utf-8")
     current_closed = len(re.findall(r"^- \[x\].*\*\*C\d{3}\*\*", checklist_text, re.MULTILINE))
     current_open = len(re.findall(r"^- \[ \].*\*\*C\d{3}\*\*", checklist_text, re.MULTILINE))
     lines.extend(

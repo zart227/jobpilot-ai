@@ -3,6 +3,7 @@ import structlog
 from app.llm.provider import get_llm_provider
 from app.schemas.agent_state import JobPilotState
 from app.schemas.llm_outputs import parse_chat_output
+from app.services.pipeline_llm_ledger import append_stage_log
 
 logger = structlog.get_logger(__name__)
 
@@ -127,6 +128,12 @@ class ChatAgent:
             return {
                 "chat_intent": parsed.intent,
                 "chat_reply": parsed.reply,
+                "llm_stage_log": append_stage_log(
+                    state,
+                    "chat",
+                    "main",
+                    usage=self._llm.consume_last_call_usage(),
+                ),
             }
         except Exception as exc:
             logger.error("ChatAgent failed", error=str(exc))

@@ -1,6 +1,6 @@
 # Сквозная приёмка (dry-run)
 
-> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+> **05.11.2026:** dry-run не закрывает live. Счёт — [remediation-plan.md](remediation-plan.md) (**98/115**, **17** открыто).
 
 Цель: проверить цепочку **без** реальных сообщений Kwork, без расхода коннектов и без платных LLM-вызовов в сценарии отправки.
 
@@ -10,7 +10,7 @@
 PLATFORM_DRY_RUN=true
 ```
 
-- `ProposalSender` помечает отправку успешной и пишет `send_attempts` → `confirmed_sent`, proposal → `sent`.
+- `ProposalSender` помечает отправку успешной и пишет `send_attempts` → `confirmed_sent` с `platform_response.dry_run=true`; proposal/job → **`simulated_sent`** (**C050**).
 - `send_kwork_inbox_reply` не вызывает Kwork API.
 - Telegram/LLM в pipeline **не** отключаются — для полного E2E без LLM используйте моки в тестах или staging с отключённым beat.
 

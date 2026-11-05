@@ -100,7 +100,63 @@ async def test_reconcile_dry_run_proposal_confirms_unknown(monkeypatch: pytest.M
         attempt = await session.get(SendAttempt, attempt_id)
         proposal = await session.get(Proposal, proposal_id)
         assert attempt is not None and attempt.status == "confirmed_sent"
-        assert proposal is not None and proposal.status == "sent"
+        assert proposal is not None and proposal.status == "simulated_sent"
+
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+@pytestmark_db
+async def test_live_kwork_proposal_reconcile_stays_inconclusive_without_payload_receipt() -> None:
+    from app.config import Settings, get_settings
+
+    get_settings.cache_clear()
+    from app.db.models import Job, Proposal, SendAttempt
+    from app.db.send_attempt_states import ATTEMPT_KIND_PROPOSAL, ATTEMPT_UNKNOWN_RESULT
+    from app.db.session import AsyncSessionLocal
+    from app.services.send_attempt_reconcile import reconcile_send_attempt
+
+    job_id = uuid.uuid4()
+    proposal_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=job_id,
+                platform="kwork",
+                external_id=f"kwork-live-{job_id.hex[:8]}",
+                title="T",
+                description="d",
+                url="https://kwork.ru/projects/1/view",
+                status="approved",
+            )
+        )
+        session.add(
+            Proposal(
+                id=proposal_id,
+                job_id=job_id,
+                content="Offer text long enough",
+                status="approved",
+                version=1,
+            )
+        )
+        session.add(
+            SendAttempt(
+                id=attempt_id,
+                kind=ATTEMPT_KIND_PROPOSAL,
+                idempotency_key=f"live:{attempt_id}",
+                job_id=job_id,
+                proposal_id=proposal_id,
+                snapshot_content="Offer text long enough",
+                status=ATTEMPT_UNKNOWN_RESULT,
+                platform_response={"dry_run": False},
+            )
+        )
+        await session.commit()
+
+    settings = Settings(_env_file=None, PLATFORM_DRY_RUN=False)
+    outcome = await reconcile_send_attempt(attempt_id, settings=settings)
+    assert outcome == "inconclusive"
 
     get_settings.cache_clear()
 

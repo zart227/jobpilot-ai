@@ -2,6 +2,7 @@ import uuid
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,9 +13,9 @@ from app.api.auth import CHAT_MESSAGE_MAX_CHARS, clamp_api_limit, verify_api_tok
 from app.api.rate_limit import ApiRateLimitMiddleware
 from app.celery_app import celery_app  # noqa: F401 — init Celery before task imports
 from app.config import get_settings
-from app.logging_setup import configure_application_logging
 from app.db.models import Job, Outcome, Proposal
 from app.db.session import get_db
+from app.logging_setup import configure_application_logging
 from app.schemas.job import ChatRequest, ChatResponse, JobResponse, OutcomeRequest
 from app.services.job_task_enqueue import queue_process_single_job
 from app.services.reward_system import RewardSystem
@@ -219,6 +220,41 @@ async def reconcile_send_attempt_endpoint(
 
     outcome = await reconcile_send_attempt(attempt_id)
     return {"attempt_id": str(attempt_id), "outcome": outcome}
+
+
+class InboundBindJobRequest(BaseModel):
+    job_id: uuid.UUID
+
+
+@app.post("/inbound/{inbound_id}/bind-job")
+async def bind_inbound_job_endpoint(
+    inbound_id: uuid.UUID,
+    body: InboundBindJobRequest,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_api_token),
+) -> dict:
+    from app.services.kwork_inbox import bind_inbound_to_job
+
+    ok = await bind_inbound_to_job(db, inbound_id, body.job_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Inbound bind rejected")
+    await db.commit()
+    return {"inbound_id": str(inbound_id), "job_id": str(body.job_id), "bound": True}
+
+
+@app.post("/inbound/{inbound_id}/reprocess")
+async def reprocess_inbound_endpoint(
+    inbound_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_api_token),
+) -> dict:
+    from app.services.kwork_inbox import operator_reprocess_inbound_after_bind
+
+    ok = await operator_reprocess_inbound_after_bind(db, inbound_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Inbound reprocess rejected")
+    await db.commit()
+    return {"inbound_id": str(inbound_id), "reprocessed": True}
 
 
 @app.get("/stats")

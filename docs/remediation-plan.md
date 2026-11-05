@@ -1,261 +1,181 @@
-# Актуальный план JobPilot AI — 14 октября 2026
-
-Основание: [повторный аудит](audit-2026-10-14.md), [evidence](audit-2026-10-14-evidence.json), [чеклисты](remediation-checklists.md). Предыдущий план сохранён в [архиве](archive/2026-10-14-before-reaudit/remediation-plan.md).
-
-**Статус 03.11 (later): 72/115 критериев подтверждено, 43 открыто.** **C106/C016** закрыты. Журнал — [remediation-progress.md](remediation-progress.md).
-
-> Разделы ниже сохраняют исторические решения и промежуточные состояния. При противоречии используйте аудит 03.11, план закрытия и актуальный чеклист; runtime-состояние проверяйте отдельно.
-
-## Правила исполнения
-
-- Сначала воспроизводить R-дефект, затем исправлять его и проверять связанные C-ID. Не повторять выполненные части ради галочек.
-- Сохранить текущие данные и незнакомые изменения; не делать reset. Имеющийся untracked session backup содержит потенциально чувствительную сессию: не добавлять в Git и не выводить содержимое.
-- Runtime config, production migrations/restarts/restore выполнять в пределах действующих разрешений пользователя и только после подготовки backup, проверки и rollback. Для адресной реальной отправки использовать разрешение на конкретное содержимое и получателя. Подготовка исправлений и isolated tests выполняются автономно.
-- В тестах отдельная *_test БД, отдельные Redis>=2, отключённые внешние credentials, fake LLM/Telegram/Kwork. PLATFORM_DRY_RUN сам по себе не изолирует БД и не отключает LLM/Telegram notifications.
-- Все state changes проверяются по business object, claim token и version. UNIQUE строки — не замена атомарному claim.
-- Не держать DB TX во время сети; unknown_result не повторять вслепую. Не обещать exactly-once без idempotency площадки.
-- Полная ручная пауза Kwork, review-first и human approval сохраняются. Любое изменение approved text/price/duration требует новой версии и одобрения.
-- [x] только после полного доказательства. Release gate с открытыми blockers обязан падать; report gate не требует завершения проекта.
-
-## Отбор коротких задач Kwork — 30.10
-
-- [x] Изолировать извлечение количества проектов и процента найма в блоке покупателя; отклонять неоднозначную разметку и старые неподтверждённые показатели. Проверены 12 публичных DOM-карточек и offline browser tests; сквозная проверка остаётся отдельным пунктом.
-- [x] Для новых обработок требовать минимум 5 проектов, найм от 50%, простой понятный объём и оценку до 3 рабочих часов; недостающие данные отклонять.
-- [x] Получать минимальную разумную цену от ИИ; показывать её и фиксировать цену и срок один день в approval snapshot.
-- [x] Требовать отдельную оценку календарного срока до одного дня; не оценивать только усечённые 2000 символов описания.
-- [x] Отклонять явно обрезанное описание, если раскрытие не подтверждено и полная версия недоступна.
-- [ ] Проверить полноту описания, парсинг реальной разметки и качество оценок на примерах с ручной проверкой.
-- [x] Блокировать повторный review, подтверждение и отправку старых Kwork-карточек без действующей оценки; сверять данные заказа и заказчика с оценкой.
-- [ ] Реализовать операторский процесс безопасной переоценки старых карточек; проверить полный поток с отдельным тестовым заказом без автоматической отправки. Добавлены [read-only отчёт и ручная переоценка одного свежеполученного заказа](operator-kwork-assessment-inventory.md); новая оценка требует отдельного /rereview. Сквозная проверка с актуальной карточкой и оператором остаётся открытой.
-
-## Следующие шаги после 02.11
-
-- [x] Сохранять полученную пачку входящих сообщений до генерации; при ошибке или пустом ответе сохранять received и повторять с backoff после авторизации Kwork.
-- [ ] Устранить окно между сетевым чтением текущего диалога и фиксацией; eager capture с platform ID сразу после `get_messages`, per-message commit в цикле. Проверить отказ и рестарт на разных стадиях.
-- [ ] Проверить heartbeat 15-минутного claim в restart/outage drills и подготовить совместимый rollout; добавить автоматическое operator notification и журнал. Heartbeat, пять попыток и [явный requeue](operator-inbox-generation-recovery.md) реализованы и проверены изолированно.
-- [ ] Восстановить исторические pending без слепой повторной отправки и реализовать разрешение неопределённого результата. Read-only `ops_pending_cards.py` теперь показывает delivery evidence и требует явный адрес БД; на рабочей БД не запускался.
-- [ ] Завершить durable retry всех типов памяти; rollout **0008** на `jobpilot_ai` выполнен. Переиндексация: [operator-qdrant-reindex.md](operator-qdrant-reindex.md) — инвентаризация сделана; mass `--apply` и удаление legacy Qdrant — нет.
-- [ ] Проверить [старые счётчики job attempts](operator-job-retry-recovery.md) до rollout; cap, heartbeat, журнал attempts, isolated и **process-level E2E** restart drill готовы; stale recovery снимает enqueue dedup. Смешанный rollout и полная классификация ошибок на всех этапах остаются.
-- [ ] Сверить исторические confirmed sends без явного режима; воронка уже исключает dry-run, simulation и inbox, но может недосчитывать старые записи. Дополнить operational metrics и учёт стоимости LLM.
-- [ ] Реализовать и проверить настоящую browser auth, актуальный form contract, Qdrant recovery и изолированные restart/restore drills.
-
-## Приоритет после сверки 01.11
-
-**Выполнено:** fail-closed synthetic form, точный review/snapshot/sender, минимум цены ИИ, preflight, обработка текста, scraper recovery, атомарный proposal/outbox и деградация при недоступном Qdrant. Изолированно 707 тестов прошли, Ruff чистый. **Остаётся:** настоящая browser auth в preflight (сейчас намеренно блокируется), актуальная форма и receipt, восстановление старых карточек, durable inbox capture и retry памяти. Стек ранее обнаружен работающим в dry-run; процессы не перезапускались и могут использовать разные версии кода.
-
-1. Проверить полный поток извлечения и оценки реальных карточек без отправки; реализовать безопасную переоценку устаревших записей. При повторном scrape сохраняются актуальные поля и корректная привязка buyer; оценки теперь привязаны к buyer ID, предыдущие оценки требуют пересмотра. Read-only inventory и ручная переоценка подготовлены; реальный сквозной поток ещё не подтверждён.
-2. OpenRouter TTL выбранной модели и fallback при временном сбое каталога исправлены; auto fallback принудительно использует Ollama auto с проверкой бесплатной доступности и сохраняет тип задачи. Нужна дальнейшая сквозная проверка. Ollama auto проверяет /api/show; облачный выбор использует free usage со страницы аккаунта, квоту, баланс, auto-reload, retirement и совпадение аккаунта с API-ключом. Обновлённая сессия позволила проверить реальный cloud auto и короткие JSON-запросы beam/gpt-oss:120b; качество и runtime deployment не подтверждены. Отсутствие списаний при одновременных изменениях аккаунта сервером не гарантировано. Скриншот пользователя показывает account-specific список моделей, доступных в рамках free usage credits, и сроки отключения: после авторизованного доступа проверить реальный DOM и подготовленный synthetic parser, извлекать список и retirement, сопоставлять с /api/tags и /api/show, использовать ограниченный TTL и fail-closed при ошибках/исчерпании квоты. Не считать бесплатную квоту бессрочным нулевым тарифом.
-3. Локально Ruff и полный isolated suite проходят; remote CI подтвердить отдельно.
-4. Проверить безопасную ручную переоценку и /rereview на отдельном тестовом заказе без автоматической отправки; код подготовлен и проверен с fake LLM.
-5. Проверить и стабилизировать dry-run: сейчас `.env` и worker содержат `PLATFORM_DRY_RUN=true`, основные Compose сервисы запущены; исторические утверждения о runtime, backup, паузе и схеме не являются текущим подтверждением. Рабочие изменения и live-действия выполнять только по отдельному разрешению. [Доказательства](audit-2026-11-01.md).
-
-## A. Восстановить достоверную приёмку и закрыть runtime-доступ
-
-**Приоритет:** P1. **Зависимости:** нет. **R01, R02, R15. C006–C016, C100, C106, C109–C110.**
-
-**Уже сделано:** middleware/dependency, настройки токена, local bind инфраструктуры; в этом аудите исправлены статусы документов и отчётность. Код guards исправлен15.10: runtime API без токена503. Операционные token/deployment и version-card проверки остаются.
-
-**Изменения15.10:** fail-closed guard, verified quota+Lua, group identity, simulation/live evidence v2 и запрет auto-close реализованы.212 isolated tests passed. Детали: [блок A](block-a-access-and-evidence.md). Открытые подпункты ниже не закрывать до runtime/deployment и versioned approval review.
-
-**Работы:**
-
-1. Fail-closed API auth в сетевом режиме; отсутствие токена при обязательной защите блокирует запуск/доступ. Отдельно описать opt-in localhost development mode.
-2. Обязательные Telegram user/chat identity для групп и /dev; version/message checks для всех preview callbacks. Согласовать и применить runtime config только после готового reviewable diff.
-3. Rate limit key строить по проверенной identity; не позволять secondary header менять bucket. INCR/EXPIRE атомарны; отдельная анонимная/IP квота и workload лимиты.
-4. Разделить simulation/live signoff. Удалить auto ui_matches_db и auto approved_by; запретить live closure по dry-run. Validator проверяет mode, attempt evidence, источник UI подтверждения и отдельное human authorization.
-5. Заменить closure scripts, которые автоматически переписывают чеклист, на запись evidence для ручного review. Статическая матрица не подтверждает поведение кодом наличия файла.
-
-**Приёмка:** существующие auth unit tests плюс runtime GET без token=401/503 после согласованного применения; valid Bearer+любой другой header даёт одну квоту; dry-run signoff отклоняется live validator; CI допускает честный backlog как отчёт, но запрещает release.
-
-## B. Атомарная отправка и approval snapshots
-
-**30.10, B3 частично:** браузер не повторяет submit через другой proxy после исключения в submit; ошибки после клика и косвенный success без точной payload receipt приводят к unknown_result. Inbox send ошибки после начала сетевого вызова тоже считаются неизвестным результатом. В текущей реализации успешный live Kwork proposal без точной receipt не станет confirmed автоматически и потребует будущего operator reconciliation. C045/C047 остаются открытыми до полной stage/crash приёмки и реализации ручного разрешения.
-
-**30.10, B2.11:** автоматические выбор оплаты и подстановка названия удалены; при обнаружении известных полей оплата/название форма блокируется и при заполнении, и непосредственно перед submit. Это временный fail-closed guard: полноценные snapshot/review/readback параметров и проверка реальной разметки ещё необходимы; C041 остаётся открытым. Из-за ограничения реальные формы с этими полями не отправляются. Далее — безопасная модель approval для всех параметров и C032 fencing outbox, затем остальные задачи блока C.
-
-**16.10, B2.10:** /rereview reply/UUID и transactional reissue реализованы: одна source→одна новая full-text карточка, no automatic approval/send, strict actor/chat/delivery guards; race с sender и rollback проверены.376 full +10 targeted passed. Schema head0007 без изменений, deployment не выполнялся. C111/C112 partial — полная queue/unknown resolution/immutable override journal ещё впереди. [Operator flow](operator-review-reissue.md). Следом — remaining form params и all callback/FSM acceptance.
-
-**16.10, B2.9:** browser-contract реализован и прогнан настоящим Chromium на synthetic offline HTML.6 исходных DOM регрессий исправлены;30 focused passed, затем333 tests passed в едином isolated+browser прогоне (оба opt-in flags=1,без skips). Readback проверяет editor+textarea, unique/same-form controls и selected duration, hidden textarea заполняется native setter/events. CI browser job настроен, remote run отсутствует. C041 не закрыт: current DOM/staging, title/payment/прочие params и внешняя receipt ещё впереди. [Повторный запуск и ограничения](block-b-browser-contract.md).
-
-**16.10, B2.8:** full-text review вместо truncated/sanitized карточки: plain text части без нормализации, UTF-16 split, кнопки только после всех частей, финальный SHA-256. Ordinary/edit proposal+inbox используют общий путь; review_format в immutable payload инвалидирует старые truncated presentations. Skip inbox теперь locked и требует current presentation. C012 остаётся открытым до all-callback/FSM приёмки; далее HTML/staging формы, thread selector и operator recovery. Новая миграция не нужна сверх0007, но rollout всё ещё не выполнен.
-
-**15.10, B2.7:** immutable inbox presentation/human event + exact sender enforcement реализованы. ID события — revision inbox payload. Ordinary/edit callbacks проверены на DB;308 full +11 targeted passed. C042 закрыт для кода, C012/C040/C041 остаются открытыми. Перед deployment требуется0007; рабочая БД не мигрирована. Следом — полнотекстовый UI review, HTML/staging формы, thread selector и explicit edit-existing/resubmit.
-
-**15.10, B2.6:** sender/browser передают exact approved text/price/duration без compose/padding/recompute/fallback. Перед submit — readback textarea/price/duration с отказом при несовпадении. Existing offer больше не auto-edit по new_offer approval. C041/C051 остаются открытыми до HTML/staging приёмки и отдельного edit-existing approval flow. Схема по-прежнему требует0006 перед deployment.
-
-**15.10, B2.5:** durable proposal approval event и sender enforcement реализованы для ordinary card/edited preview. Sender требует совпадающий immutable event text/version/params и связывает attempt с event ID. Отсутствующий/старый event блокирует отправку. Требуется migration0006 после0005 до deployment. Остаток — actual form payload/price/duration, inbox approvals и resubmit policy; полные C-ID пока открыты.
-
-**15.10, B2.4 частично:** введена proposal_approval_snapshots и forward migration0005. Новая proposal-карточка сохраняет immutable payload в одной TX с pending/outbox; ordinary Approve/Edit отклоняет legacy/stale snapshot. Это presented snapshot, не завершённое human approval. Следом — durable actor/approval event и sender enforcement actual payload/price/duration, включая edit/inbox/resubmit. Применение0005 на рабочей БД не выполнялось и требуется перед deployment этого кода.
-
-**15.10, B2.3:** inbox maintenance regeneration/resend заменяет pending отдельной карточкой+outbox, старую помечает superseded. Генерация отделена от TX сохранения; stale result и защищённая доставка блокируют замену. pending_only=False больше не переоткрывает processed rows. Durable approval snapshot остаётся следующим открытым шагом.
-
-**15.10, B2.2:** regenerate проверяет отправку до LLM и под business lock перед сохранением; устаревший результат генерации отбрасывается при смене версии/текста/статуса. Telegram edit не меняет draft при sending/unknown_result/needs_attention. Проверка остальных write paths и durable approval остаются открытыми. Детали и проверки — в журнале блока B.
-
-**15.10, B2.1 выполнена частично:** preview callbacks привязаны к message/chat/hash; inbox edited-send исправлен; proposal edit проверяет исходную версию под lock.239 isolated tests passed. Следующий шаг — долговечный approval snapshot text/version/price/duration и binding обычных approve-карточек. Критерии пока не закрыты.
-
-**15.10, B1 выполнена:** business claims/fencing/строгая conservative reconciliation и4 критерия закрыты.232 tests passed. [Реализация и остаток B2](block-b-send-claims.md).
-
-**Приоритет:** P1. **Зависимость:** A. **R03–R05. C037–C051.**
-
-**Уже сделано:** send_attempts, snapshot fields, обычный token check finalize, known_failed/backoff и unknown states. Не переделывать всю интеграцию — исправить границы атомарности.
-
-1. Lock/CAS по proposal/job или inbox pending; bounded retries и ON CONFLICT на создание. Один business object не может одновременно отправляться под разными content keys.
-2. Approved snapshot/version/hash/price/duration фиксируется отдельной записью. Sender требует её и сравнивает actual submission после нормализации с approved payload.
-3. Regenerate/edit во время sending/unknown блокируются или создают отдельную версию. Старая approval card не одобряет новое содержимое.
-4. Reconcile exact content+sender+message/time boundary; proposal reconcile проверяет payload/версию, а не наличие любого offer. Prefix-only запрещён.
-5. Finalize/mark_unknown/reconcile CAS по допустимому state и token; истечение lease не даёт новому worker права повторить неизвестную отправку. Network reconciliation выполняется без TX.
-6. Не записывать simulated sent в production delivery scope. Dry-run result имеет simulation marker в попытке и бизнес-статусе либо выполняется исключительно в тестовой среде.
-
-**Приёмка:** initial/retry/edit/resubmit из двух DB sessions и двух процессов; zero send для draft/другого payload; stale token и late commit failure не меняют confirmed/new attempt. Старый offer/похожий reply не подтверждает новый payload. Timeout-after-success требует сверки, а не новой отправки.
-
-## C. Устранить окна потери inbox/outbox и истории
-
-**30.10, C3 частично:** confirmed inbox attempt, pending и outbound interaction сохраняются одной TX; reconciliation создаёт ту же точную историю и не дублирует legacy запись с тем же attempt ID. Ошибка записи приводит к rollback и unknown_result. Исторические уже-confirmed записи без interaction не backfilled; crash/restart E2E остаётся открытым. C043 остаётся открытым до аудита всех сетевых путей; inbound fetch/generation и summary LLM вынесены из DB-транзакции, кэш summary сохраняется отдельной guarded TX.
-
-**30.10, C4 частично:** inbox message fetch и генерация вынесены из caller DB-сессии; перед сохранением match и основные поля job/proposal перепроверяются под row locks, устаревший результат отбрасывается без отметки seen. Сохранение inbound до LLM, дедупликация параллельной генерации и полная проверка зависимых DB/сеть путей остаются открытыми; C027/C032/C043 не закрыты.
-
-**30.10, C2 частично:** конкурирующие poller для одинакового platform message ID используют ON CONFLICT и сохраняют один bundle без ошибки; то же относится к первичному seed. Это не предотвращает параллельный LLM до insert и не делает inbound durable до него. C026 остаётся частичным: fallback без message ID теперь стабилен, точные legacy DB записи распознаются, неоднозначные JSON/сообщения блокируются и возвращаются в diagnostic. Отдельный operator recovery, идентичные сообщения с одним временем и rollout legacy-копии остаются открытыми; смешанные версии poller запрещены. C032 остаётся открытым.
-
-**30.10, C1 частично:** fencing outbox success/failure/commit-failure по state/token и блокировка повторного claim просроченного sending; перед каждой частью проверяется актуальный claim, частично доставленные сообщения при ошибке переходят в needs_attention. C032 остаётся открытым: concurrent inbound pollers и неатомарная граница DB/Telegram требуют отдельной приёмки. Durable фиксация ID позднего ответа и operator reconciliation ещё не реализованы. C028 переоткрыт: needs_attention не означает автоматическую доставку после восстановления Telegram.
-
-**Приоритет:** P1. **Зависимость:** B. **R06, R09. C026–C036, C069.**
-
-1. Capture inbound commit до LLM; отдельные processing state/retry для blank/error drafts. First-run seed и JSON policy должны сохранять фактическую идентичность сообщения.
-2. Proposal+approval pending+outbox в одной TX со стабильным key proposal/version. Повтор notify не создаёт второй business request.
-3. Recovery ищет approvals без events, не только уже существующие outbox rows.
-4. Outbox claim/finalize/recovery используют token и CAS. Poller concurrent insert штатно обрабатывает UNIQUE conflict.
-5. Confirmed inbox send и outbound interaction фиксируются атомарно; reconcile также восстанавливает историю без дубликатов.
-6. Сетевой timeout Telegram остаётся needs_attention; оператор может восстановить карточку, сохранив одно approval/send business action.
-
-**Приёмка:** рестарт между сохранением proposal и notification не теряет карточку; сообщения переживают LLM failure; token mismatch не закрывает outbox; одинаковые inbound events из двух pollers дают одну обработку.
-
-## D. Pipeline fencing, очередь retries и точный контекст
-
-**30.10, D6 частично:** общий контекст API/inbox берёт точный snapshot последней confirmed proposal attempt, исключая явно помеченный dry-run. При отсутствии подтверждения либо чужом proposal текст не подставляется. Старые confirmed записи могут быть недостоверны, thread isolation и payload-specific receipt ещё не доказаны; C067 остаётся открытым.
-
-**30.10, D5 частично:** явный несопоставленный Kwork project ID теперь требует контекста вместо fallback по username; unbound pending не регенерируется по username. Исходный ID записывается в metadata, сообщение без совпадений не заявляет выдуманные два заказа. Ручной selector и thread isolation отсутствуют, C065/C066 остаются открытыми; регенерация unbound pending ограничена до реализации выбора.
-
-**30.10, D4:** ошибки отдельного scraper и ранних стадий заказа больше не прерывают цикл; pipeline/release errors также локализованы, результат содержит failed_sources/failed_jobs. C061 закрыт. Исправлен циклический импорт Celery task modules; оба порядка импорта и регистрация задач проверены в отдельных процессах.
-
-**15.10, D1 частично:** token-fenced persist и production call sites, row locks release/error, skip-locked recovery реализованы;256 full tests и10 targeted после финальной правки прошли. C053 остаётся открытым до lease/terminal/freshness приёмки. Остальные пункты D не завершены.
-
-**30.10, D2 частично:** scoring criteria валидируются до преобразования типов; C056 закрыт. Filter/chat/learning отклоняют невалидные типы и лишние поля, learning weights проверяются до coercion и имеют точный набор ключей; C057 закрыт. Retry policy остаётся открытой.
-
-**Приоритет:** P1/P2. **Зависимость:** B–C. **R07, R09, R11. C052–C061, C065–C071.**
-
-1. Persist принимает claim token; recovery/release — atomic CAS. Ввести heartbeat или достаточный lease с контролем версии; stale worker не очищает новый claim.
-2. Queue выбирает due retryable_error с next_attempt/max attempts, исключает terminal/protected/active. Вызвать единый processing error recorder и нормализовать ошибки ProposalAgent.
-3. Save job/client выполняется через idempotent upsert или безопасный conflict retry, внутри per-job exception boundary.
-4. Strict Filter/Scoring/Learning types/exact keys: bool и numeric strings не выдаются за числа, invalid JSON не получает проходной score. Политика transient invalid output — явная ограниченная retry, затем needs_attention/permanent classification по причине.
-5. При конфликте явного project ID запретить username fallback. Хранить thread/project связь; needs_context получает реальный selector и reprocess действие.
-6. История по thread и cutoff message ID/time; sent snapshot из attempt. Summary cache учитывает thread/content/version. API /chat не запускает learning без зафиксированного корректного outcome.
-
-**Приёмка:** stale persist/recovery не меняет новый claim; повтор beat не множит активные дорогие работы; due retry с backoff восстанавливается; ambiguous thread требует выбора; старое inbound не получает будущие сообщения в prompt.
-
-## E. Async memory, durable indexing, outcomes и learning
-
-**Приоритет:** P2. **Зависимость:** C–D. **R08, R10. C079–C089.**
-
-1. Async/lazy Qdrant, startup/retrieval failure допускает генерацию без памяти. Обязательный async client не создаёт collections в constructor агента.
-2. Indexed/deferred result вместо silent None; durable queue jobs/successful proposals/edit preferences. SQL selection по pending, без окна «последние500»; ошибки не закрывают event.
-3. Collection signature provider/model/dimension/version, валидация existing dims, staged reindex и switch/rollback без смешения пространства.
-4. Reward уникален по job/milestone независимо от custom event key. Проверить event payload collision, transitions/corrections и journal отрицательных компенсаций по выбранной модели.
-5. Outcome+reward+learning event одной TX; learning worker retries после commit/crash и не требует нового outcome. Только confirmed sent version является successful pattern.
-6. Один active scoring weight под DB guard, качество перед activation и rollback. Min count — предварительный фильтр, не оценка качества; review-first остаётся фиксированным.
-
-**30.10, E1 частично:** новая job сохраняется с embedding_pending до сетевого вызова, вызов выполняется после закрытия DB-сессии; недоступный embedding не снимает pending. Повтор выбирает pending через SQL от старых к новым и проверяет актуальность текста под row lock. Sync Qdrant, индексация изменений существующих jobs и durable retry для других типов памяти остаются открытыми; C060 не закрыт.
-
-**Приёмка:** повтор hired с разными keys не даёт100; crash после commit восстанавливает learning один раз; отключённые embeddings остаются pending; смена dims/provider не читает старую коллекцию; Qdrant outage не блокирует предложение.
-
-## F. Миграции, production сборка и безопасная эксплуатация
-
-**30.10, F1 частично:** restore больше не завершает соединения и не удаляет существующую БД; принимает только ограниченное имя новой drill-БД и валидный gzip. Он использует настроенный Compose PostgreSQL server: настоящий isolated restore должен выполняться на отдельном сервере с доверенным dump. Readiness smoke требует успешные liveness и ready=true/HTTP 200; rollout требует имеющийся smoke и архив PostgreSQL dump с совпадающей SHA-256 и валидным gzip до миграций. Это не доказывает происхождение backup или его восстановимость. C094/C098 и R16 остаются открытыми до соответствующих реальных isolated drills.
-
-**Приоритет:** P1 для destructive safeguards; P2 для остального. **Зависимость:** safeguards можно делать параллельно A; upgrade после B–E. **R12, R13, R16. C018, C023–C025, C090–C100.**
-
-1. Restore guard: явное тестовое имя, отказ working DB/host, безопасный SQL identifier; запрет interpolation из произвольного env. До guard не запускать restore/drills на действующей инфраструктуре.
-2. Readiness smoke требует200+ready=true для rollout. В failure drill503 — отдельное ожидаемое условие, не успешный deploy.
-3. Rollout требует backup evidence и preservation check; print напоминания недостаточно.
-4. Заморозить migrations: не импортировать живой Base в исторической ревизии; single migration runner. Для уже применённых revisions выбрать forward repair, не переписывать историю вслепую.
-5. Проверить upgrade копии legacy schema с данными, fresh/legacy schema equivalence и восстановление backup в изолированной среде.
-6. Docker frozen install из lock; consistency pyproject/lock. Production rendered config без source mounts, со healthchecks/restart, конфигурируемыми путями и проверенными правами volumes.
-7. Secrets/debug content/retention: проверить реальные логи, session backups и permissions, без публикации содержимого.
-
-**Приёмка:** unsafe restore target отвергается до SQL; 503 rollout возвращает nonzero; fresh/legacy одинаковы; app Docker использует lock, merged production mounts соответствуют документации; backup restore сверяет counts/relations.
-
-## G. Достоверные метрики и продуктовые действия
-
-**Приоритет:** P2. **Зависимость:** B–F. **R14, R09. C096, C111–C115.**
-
-1. Метрики из реальных claim/state: outbox sending вместо claimed, active processing token вместо несуществующего status; last_success, retry/dead-letter age.
-2. Funnel proposal sends отдельно от replies/simulation; релевантные, approved, sent, replied, hired — уникальные jobs по бизнес-событиям.
-3. Per-call usage/tokens/USD и connects attribution; versioned ledger хранит каждую фактическую попытку, включая failures. Не называть stage_count расходами.
-4. Operator queue unknown_result/errors/needs_context с конкретными безопасными действиями и manual override journal.
-5. Dry-run следы действующей БД не удалять автоматически; подготовить read-only inventory и согласованный способ исключить simulation из метрик.
-
-**Приёмка:** fixture sending виден в metrics; simulation/inbox не увеличивают external proposal funnel; повтор job processing сохраняет все попытки billing, без двойной агрегации.
-
-## H. Полная приёмка и выпуск
-
-**Зависимость:** все предыдущие блокеры закрыты. **C101–C110.**
-
-1. Один fake full-story тест через graph+Telegram Update/FSM+sender+inbox+learning с настоящей тестовой БД. Existing helper tests сохранить, но не подменять ими сценарий.
-2. Отдельные процессы: crash/restart каждого persistence/send boundary; fault matrix PostgreSQL/Redis/Qdrant/LLM/Telegram. Проверить неопределённый успех и recovery.
-3. CI unit/integration/build и source/lock/config consistency; remote run evidence отдельно от наличия YAML.
-4. Staging migration/backup/failure/reindex drills с датой, средой и артефактами.
-5. Затем отдельное разрешение на конкретный live Kwork тест и UI↔snapshot сверка. Simulation signoff его не заменяет.
-6. Release допускается после доказанной приёмки; ещё открытые критерии показываются владельцу, а не переносятся в optional ради зелёной цифры.
-
-## Что не нужно переделывать без причины
-
-Дата-независимые pause tests, greeting cleanup, NULL-client guard, urljoin/optional scraper extraction и fixed review-first policy подтверждены. Auth/outbox/attempts/Alembic — рабочая база, которой нужна доводка, а не новая архитектура с нуля. Поддержка новых площадок и отдельный frontend не входят в устранение блокеров.
-
-## Минимальный запуск в работу (30.10.2026)
-
-### Какой режим возможен сейчас
-
-| Режим | Доступность | Смысл |
-| ----- | ----------- | ----- |
-| **Локальный dry-run / dev** | **После настройки и отдельной проверки**: сейчас dry-run выключен, сервисы остановлены; использовать изолированную тестовую БД и mock внешних вызовов | Scraping, pipeline, Telegram-карточки, симуляция отправки; без доказательства live Kwork receipt |
-| **Ограниченный пилот** (один admin, real Kwork/Telegram, минимальный объём) | **Нет без обязательных шагов ниже** | Требуются миграции до **0007**, runtime `API_AUTH_TOKEN`, `TELEGRAM_ADMIN_USER_ID`, backup, smoke `ready=true`, human signoff C109–C110 |
-| **Полноценная эксплуатация** | **Нет** | 64 открытых C-ID; unknown_result/reconcile, inbox durable до LLM, metrics C114–C115, staging E2E |
-
-### Блокеры по приоритету (ограниченный пилот)
-
-1. **Runtime secrets и auth (A):** без `API_AUTH_TOKEN` API отдаёт 503; Telegram group требует `TELEGRAM_ADMIN_USER_ID`. *Последствие:* открытый API или неоднозначный admin в группе.
-2. **Миграции 0005–0007 на копии/стaging (B):** журнал другого агента сообщает о 0007 на рабочей БД; фактическая текущая схема не проверена. *Последствие:* sender/enforcement рассинхрон с кодом.
-3. **Backup + rollout smoke (F):** `production_rollout.sh` требует gzip dump и `ready=true`; restore drill на **отдельном** Postgres server. *Последствие:* необратимая потеря данных при ошибке.
-4. **Live Kwork receipt (B3/C045–C047):** proposal без точной внешней receipt → `unknown_result`; operator reconciliation не завершён. *Последствие:* ложный confirmed или застрявший unknown.
-5. **Inbox / C027–C032:** входящее сохраняется до LLM, per-message commit внутри диалога сужает fetch→commit; token lease с heartbeat; остаются окно до первого commit после `get_messages`, restart/Kwork outage drills и внешняя граница outbox/Telegram.
-6. **C026 stable message identity:** fallback hash зависит от `PYTHONHASHSEED`. *Последствие:* дубликаты карточек после рестарта.
-7. **Human authorization C109–C110:** simulation signoff не заменяет live. *Последствие:* формальное «принято» без UI↔DB сверки.
-
-### Что можно отложить после пилота
-
-- Полный semantic Qdrant reindex и async client (E) — pipeline работает с `embedding_pending`.
-- Metrics/billing ledger C115 — не блокирует единичную отправку при ручном контроле.
-- Remote CI proof C006 остаётся открытым; локальный Ruff проходит.
-- Thread selector C065–C066 — при ручной привязке заказов.
-- Docker lockfile parity (F) — при запуске из текущего compose dev.
-
-### Последовательность подготовки пилота
-
-| Шаг | Критерий готовности | Проверка |
-| --- | ------------------- | -------- |
-| 1. Конфигурация | `API_AUTH_TOKEN`, Telegram admin IDs, `PLATFORM_DRY_RUN=true` до signoff | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/jobs` → 401/503 без token; с Bearer → 200 |
-| 2. Backup | Архив PostgreSQL + SHA-256 в rollout | `production_rollout.sh` dry-run на staging; отказ при битом gzip |
-| 3. Миграции | `alembic upgrade head` → 0007 на **копии** | `migration_preflight.py`; counts proposals/approvals |
-| 4. Сервисы | compose up; `/health` + `/ready` | `readiness_smoke.sh` → 200 и `ready=true` |
-| 5. Smoke сценарий | Telegram APPROVE в dry-run (reissue/smoke card) | `ops_verify_dry_run_approve.py`; `platform_response.dry_run=true` |
-| 6. Первый live send | отдельное разрешение; C109 evidence | `validate_live_signoff.py`; UI↔snapshot hash — см. [pilot-step6-live-send.md](pilot-step6-live-send.md) |
-| 7. Stop / rollback | unknown_result, needs_attention, `PLATFORM_DRY_RUN=true` | runbook; не resend blind |
-
-Условия остановки: `unknown_result` без operator plan; partial Telegram outbox; расхождение approved hash и формы; ошибка миграции — откат к backup, не «догонять» отправками.
-
-### LLM: автовыбор моделей (30.10)
-
-- `OPENROUTER_*=auto` или `openrouter/free`: каталог `/models`, prompt/completion обязательны и равны 0, другие присутствующие pricing-поля должны быть 0; отсутствующие поля не проверяются. Выбор модели в долгоживущем экземпляре не обновляется по TTL.
-- `OLLAMA_*=auto`: список `/api/tags` и проверка `/api/show`; для облака также требуется подтверждение free usage аккаунта. Cloud auto и два коротких JSON-запроса проверены с действующей сессией; рабочая конфигурация переключена по запросу пользователя; сервисы остановлены, runtime не перезапускался.
-- Явный id в `.env` отключает автопроверку цены (OpenRouter).
-- **Ограничение:** OpenRouter не гарантирует актуальность pricing для редких полей; неизвестная цена → модель исключается из auto. **Ollama→OpenAI fallback** остаётся платным — отключить `OLLAMA_AUTO_FALLBACK` для строго free контура.
-- Live OpenRouter/Ollama catalog в этой сессии **не вызывался**; покрытие — unit tests с mocks.
+# План и чеклисты JobPilot AI
+
+**111/115 подтверждено; 4 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
+
+Дата сверки: 05.11.2026. Очереди A–B закрыты по integration/unit прогонам (журнал 05.11). Полный Ruff/pytest — **C107**; CI — **C006**.
+
+## Что делать дальше
+
+Бери 1–3 открытых ID, доведи каждый до `[x]` или до одного внешнего блокера, обнови галочку, эту шапку и журнал одной записью. Не проходи заново блоки A–H октября. Не ставь `[x]` из-за соседнего ID и не держи `[ ]` только потому, что в старую заметку был вставлен провал соседа.
+
+Очередь A, сломанный код: C050 и C051 вместе, затем C060. В том же проходе по отправке импортируй `mark_proxy_failed` в `_send_kwork_offer` (`app/services/kwork_browser.py`, вызовы около строк 1930 и 2011 сейчас без импорта — NameError). Прокси Kwork не запрашивать как сервис `openai`.
+
+Очередь B, галочка снята чужим текстом: C018, C031, C045, C069, C083, C094. Закрой по собственной фразе, если она уже доказана. C083 не закрывает C089.
+
+Очередь C, локальное доказательство: C107, C006, C101, C104, C105, C098. C006 остаётся открытым, если этот diff не прогонялся в CI и push не запрошен. C098 после безопасного guard остаётся открытым, если нет отдельного сервера.
+
+Очередь D, только с отдельным разрешением: C110 (не отправлять; подготовить один кандидат) и C089 (не делать массовую переиндексацию и не удалять legacy). Пункты ручной разметки, сквозного `/rereview` старых карточек, окна `get_messages`→commit, heartbeat 15 минут и исторических pending без слепого resend закрывай только если это тот же дефект текущей очереди. `portfolio-plan.md` не входит в эту работу.
+
+41 закрытый критерий с формулировкой «код и текущие unit/integration проверки» пачкой не переоткрывать и не переподтверждать. Если правка роняет их тест — чинить.
+
+Правила: `[x]` только с командой, средой и результатом. Конкуренция — два соединения или процесса. `unknown_result` не переотправлять. Не держать DB-транзакцию на сети. Интеграции — база `*_test`, Redis DB ≥ 2, внешние credentials выключены. Не печатать секреты и сессии. Не удалять рабочие данные, не делать reset. Rollout, backup, миграция рабочей БД и рестарт — после проверки на копии. Коммиты и PR — только по прямой просьбе. Отбор Kwork, цена и срок, проверка заказчика, human approval и выбор бесплатных моделей сохраняются.
+
+## Чеклисты
+
+`[x]` — полный критерий. `[ ]` — не закрыт. Файл, отчёт или dry-run не закрывают runtime и live.
+
+## 0. Baseline и качество
+
+- [x] Изучены инструкции, diff и текущие изменения; чужие изменения сохранены. **C001** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Пункты аудита перепроверены; неверные/изменившиеся предположения записаны. **C002** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] pytest, Ruff и pip check запущены, исходные результаты сохранены. **C003** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Тесты паузы проходят независимо от текущей даты и проверяют границы возобновления/смену года. **C004** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] ensure_proposal_greeting имеет одно определение и согласованные вызовы. **C005** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [ ] Unit tests и lint выполняются в CI без production secrets. **C006** — ОТКРЫТО 05.11: **внешний блокер** — uncommitted diff не прогонялся в GitHub Actions (push не запрошен). Локальная реплика CI **05.11**: `sh scripts/verify_lockfile.sh` OK; `.venv/bin/python scripts/audit_remediation_status.py` OK; **`./scripts/remediation_verify.sh`** OK (**05.11**, incl. `test_c090` после правки assert под `"$PIP" install`); `ruff check app tests scripts` OK; `secret_scan_repo.py` OK; unit job **626 passed**, **403 skipped**; integration job **33 passed**; browser job **44 passed**; `docker build -t jobpilot-ai:local-ci` OK. Закрытие только после зелёного CI на remote для этого дерева.
+
+## 1. Доступ
+
+- [x] API без токена/с неверным токеном отклоняет чтение данных и управляющие действия. **C007** — ПОДТВЕРЖДЕНО15.10: fail-closed guard,9 ASGI data/control route tests; runtime GET /jobs без токена503. Неверный токен401; валидный token unit tests.
+- [x] Корректный токен допускает нужные маршруты; токен не попадает в логи и ответы. **C008** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Дорогие API-запросы ограничены по частоте, размеру текста и параметрам выборки. **C009** — ПОДТВЕРЖДЕНО15.10: HTTP length/list limits и verified identity quota;20 одновременных запросов на isolated Redis дают ровно3 разрешённых при limit3, TTL установлен атомарно. Workload/billing limits — отдельные D/G.
+- [x] Посторонний Telegram user не может approve/edit/skip/reply и запускать /dev. **C010** — ПОДТВЕРЖДЕНО 03.11 (later): **`test_c010_telegram_unauthorized_actions.py`** (все callback-префиксы approve/skip/edit/inbox\_\* + middleware deny + group admin user); **`test_access_regressions.py`** (API fail-closed, group без admin user, /dev denial); **`test_review_commands.py`** (unauthorized /rereview). **12+ passed** (unit). Runtime deployment token/chat audit — **C106**, не дублирует изолированную приёмку.
+- [x] Admin user в неразрешённом чате также не может выполнить действие. **C011** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Callback от чужой/устаревшей карточки или версии отклика отклоняется. **C012** — ПОДТВЕРЖДЕНО 03.11 (later): **`test_c012_callback_fsm_acceptance.py`** (catalog + proposal approve/skip stale message_id и mutated text); **`test_approval_snapshot.py`**, **`test_edit_preview_binding.py`**, **`test_inbox_approval_enforcement.py`** (stale skip/edit), **`test_full_text_review.py`**, **`test_draft_mutation_guards.py`**. Integration **4 passed** + регрессии. Operator recovery UI — **C111**, не C012.
+- [x] Авторизация применяется к FSM сообщениям и всем подключённым routers. **C013** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Redis/PostgreSQL/Qdrant не опубликованы на всех интерфейсах без необходимости. **C014** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Пароль БД задаётся конфигурацией; обязательные секреты отсутствуют в Git. **C015** — ПОДТВЕРЖДЕНО 03.11 (later): `POSTGRES_PASSWORD` / `${POSTGRES_PASSWORD:-…}` в `docker-compose.yml`; **`scripts/secret_scan_repo.py`** + CI step + **`make secret-scan`** OK; **`tests/test_c015_secrets_policy.py`** **6 passed**; dev placeholder `jobpilot_secret` документирован в `.env.example`, не production secret store.
+- [x] Проверены bind/auth Cursor bridge и доступ из контейнера без ненужного внешнего доступа. **C016** — ПОДТВЕРЖДЕНО 03.11 (later): **`test_c016_cursor_bridge_acceptance.py`** + **`test_cursor_bridge_policy.py`** (**5 passed**); **`make cursor-bridge-drill`** (unauth **404**, not **200** on **19247**); **`make cursor-bridge-container`** из `telegram-bot` → **HTTP 404** без auth; [cursor-bridge-security.md](cursor-bridge-security.md). Socat **9247→127.0.0.1:19247** — намеренный Docker path.
+
+## 2. Миграции и целостность
+
+- [x] Alembic upgrade head создаёт чистую БД со всеми ограничениями и индексами. **C017** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Обновление копии старой БД сохраняет заказы, отклики, связи и историю. **C018** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_c018_legacy_upgrade_acceptance.py`** **1 passed**; downgrade 0004 → seed → upgrade head, строки/FK; integration `jobpilot_ai_test`.
+- [x] Preflight выявляет дубли/несовместимость до изменения данных, без тихого удаления. **C019** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Jobs имеют уникальный platform/external_id; score ограничен 0..100. **C020** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Неизвестные клиенты с NULL external_id не объединяются в одного. **C021** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Уникальность активного proposal учитывает edit/approval/sending и версии. **C022** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Старый bootstrap больше не создаёт отличающуюся схему или гонку DDL. **C023** — ПОДТВЕРЖДЕНО 03.11 (later): `init_db.py` → только **`alembic upgrade head`**; compose — migrate только **`api`**, workers/beat/bot **`JOBPILOT_SKIP_DB_MIGRATE=1`**; **`pg_advisory_lock`** + **`await connection.commit()`** в `alembic/env.py` (async migrations persist); baseline **`0001`** `create_all` только при пустой БД; **`tests/test_c023_c024_migration_policy.py`** **7 passed**.
+- [x] Миграции запускаются один раз до сервиса; downgrade/rollback ограничения документированы. **C024** — ПОДТВЕРЖДЕНО 03.11 (later): single migrator + skip flags (см. **C023**); [runbook.md](runbook.md) rollback/backup границы; `production_rollout.sh` один `upgrade head`; policy tests **7 passed** (shared с C023).
+- [x] Статусы и допустимые переходы определены отдельно для processing/approval/delivery. **C025** — ПОДТВЕРЖДЕНО 03.11 (later): `app/db/status_transitions.py` — job processing (`_transition_job_status` в pipeline), proposal/Telegram approval tables, delivery (`allows_send_attempt_transition` в claim/finalize/reconcile); outcome — **C080**; **`tests/test_status_transitions.py`** + **`test_c025_status_transitions_acceptance.py`** bundle.
+
+## 3. Inbox и уведомления
+
+- [x] Повтор получения одного platform/thread/message key создаёт одну durable inbound запись. **C026** — ПОДТВЕРЖДЕНО 03.11 (later): platform MID + stable fallback key; legacy DB/JSON match (**`test_kwork_inbox_identity.py`** modes `legacy_db`/`legacy_json`); concurrent poller/seed **`ON CONFLICT`** (**`test_inbox_concurrent_capture.py`**); ambiguous batch → **`identity_ambiguities`** + durable **`ops_alert`** (**`test_identity_ambiguity_enqueues_durable_ops_alert`**); bundle **`tests/test_c026_inbox_identity_acceptance.py`**. Фундаментальный предел: два одинаковых сообщения без ID в одной выдаче не различимы — блокируются, не дублируют inbound ([operator-inbox-identity.md](operator-inbox-identity.md)). Mixed poller rollout на working — operator, не автоматический критерий.
+- [x] Ошибка LLM сохраняет входящее сообщение и оставляет возможность обработки. **C027** — ПОДТВЕРЖДЕНО 03.11 (later): eager **`_capture_inbound`** до LLM; retryable chat errors → `received` + **`generation_retry_after`** (**`test_inbox_chat_pipeline_errors.py`**); poller restart retry + exhausted **`ops_alert`** outbox mock delivery (**`test_inbox_poller_restart_drill.py`**); Kwork **`get_messages`** outage на одном dialog не теряет другой (**`test_inbox_generation_claims.py`**); bundle **`tests/test_c027_inbox_llm_failure_acceptance.py`**. Нестабильный identity без platform message ID — **C026**, не C027. Live working Telegram drill не требовался (как **C028**: mock bot доказывает delivery path).
+- [x] При сбое Telegram событие остаётся в outbox и доставляется после восстановления. **C028** — ПОДТВЕРЖДЕНО 03.11 (later): pending/backoff для definite errors; timeout/stale lease → `needs_attention` без auto-resend; operator **`requeue_outbox_for_delivery`** (+ optional `--ack-ambiguous-lease`); integration bundle **30 passed** ×2 (`test_outbox_operator_recovery`, `test_notification_outbox_delivery`, `test_outbox_claim_fencing`) на `jobpilot_ai_test`. Working **33** historical NA (read-only triage 03.11) — operator reconcile по [operator-outbox-needs-attention.md](operator-outbox-needs-attention.md), не автоматический resend. Live Telegram outage drill не требовался: mock bot доказывает recovery path.
+- [x] Proposal и запрос уведомления сохраняются в одной транзакции. **C029** — новая версия, snapshot, pending и outbox коммитятся вместе; отказ очереди откатывает транзакцию, повтор не создаёт дубль. Исторические карточки требуют отдельного восстановления (C030 legacy scope).
+- [x] Pending без message_id автоматически подхватывается delivery worker. **C030** — ПОДТВЕРЖДЕНО 03.11 (later): `test_pending_outbox_delivers_when_telegram_pending_has_no_message_id` + outbox bundle **30 passed**; beat/worker path без operator requeue для fresh pending. Working **5** active pending+NA — UI reconcile/reissue ([operator-outbox-needs-attention.md](operator-outbox-needs-attention.md)), не провал auto-pickup.
+- [x] Рестарт до/после commit не теряет событие; повтор обработки не создаёт новый бизнес-объект. **C031** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_outbox_restart_drill.py`**, **`test_inbox_poller_restart_drill.py`** **7 passed** (integration `jobpilot_ai_test`).
+- [x] Параллельные pollers/outbox workers не обрабатывают один активный claim. **C032** — ПОДТВЕРЖДЕНО 03.11 (later): inbox generation claim/fencing + **`test_concurrent_generation_claims_yield_at_most_one_token`**; **`test_inbox_concurrent_capture.py`** (dual poller bundle); outbox **`test_outbox_claim_fencing.py`** (concurrent `_claim_batch`, stale token, late Telegram after lease recovery). Integration bundle **32 passed** (`test_inbox_generation_claims`, `test_inbox_concurrent_capture`, `test_outbox_claim_fencing`) на `jobpilot_ai_test`.
+- [x] Backoff, предел retries и needs_attention проверены с фиксированным временем. **C033** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Старый JSON state импортируется/игнорируется по документированной политике. **C034** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Поведение первого запуска и старых unread messages явно проверено. **C035** — ПОДТВЕРЖДЕНО 03.11 (later): `check_kwork_inbox` — первый tick без state file → `capture_mode=seeded`, `InboundMessage.status=seeded`, **без** `_process_and_notify`; последующие ticks → **`received`**; **`tests/test_c035_first_run_inbox_acceptance.py`** **2 passed** (`jobpilot_ai_test`). Live Kwork API poll на working не требовался для политики seed/unread.
+- [x] При timeout Telegram допускается неопределённость доставки; повторные карточки не допускают повторную отправку клиенту. **C036** — ПОДТВЕРЖДЕНО 03.11 (later): ambiguous/timeout outbox → **`needs_attention`** без auto-resend (**`test_outbox_claim_fencing.py`**, **`test_outbox_operator_recovery.py`**); **`/rereview`** supersede без approval/send, блок при **`sending`/`unknown_result`/`needs_attention`/`confirmed_sent`** (**`test_review_reissue.py`**); **`format_inbox_send_failure`** → EDIT/SKIP/runbook для **`unknown_result`** (**`test_delivery_alerts.py`**); bundle **`tests/test_c036_telegram_ambiguity_acceptance.py`**. Business send fencing — **C037/C049**; stale callback на superseded — **C012**; attempt reconcile — **C047**.
+
+## 4. Внешние отправки
+
+- [x] Два одновременных approve вызывают mock отправку максимум один раз. **C037** — ПОДТВЕРЖДЕНО15.10:8 конкурентных ProposalSender с approved payload → один mock platform call; initial и retry claims → один победитель. test_send_attempt_atomicity.
+- [x] То же проверено для inbox reply и из двух независимых DB connections/processes. **C038** — ПОДТВЕРЖДЕНО15.10:8 конкурентных inbox sends → один mock API call; proposal и inbox claims также проверены двумя независимыми Python-процессами с общей PostgreSQL.
+- [x] Скрипты отправки используют общий claim/attempt сервис. **C039** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Job/proposal связь, user/thread и одобренная версия проверяются перед отправкой. **C040** — ПОДТВЕРЖДЕНО 03.11 (later): `prepare_proposal_send` / `prepare_inbox_reply_send` + durable approval events, snapshot mismatch, opportunity gates, draft mutation guards; ambiguous job bind — **C065**; live DOM submit — **C109/C110**; bundle **`test_c040_pre_send_validation_acceptance.py`** (inbox enforcement, send atomicity, opportunity gate, draft guards).
+- [x] Сохранён immutable snapshot фактически отправляемого текста, цены и параметров. **C041** — ПОДТВЕРЖДЕНО 03.11 (later): `SendAttempt.snapshot_content` + approval snapshot payload (`offer_price`, `duration_days`, text); **`validate_approved_submission`** / **`_verify_approved_form`** fail-closed readback (**`test_frozen_submission.py`**); proposal card snapshot immutability (**`test_approval_snapshot.py`**); synthetic Kwork DOM contract (**`test_kwork_form_dom.py`**, `JOBPILOT_BROWSER_TESTS=1`); bundle **`tests/test_c041_kwork_form_acceptance.py`** (**3 passed**, ~31s browser opt-in). Актуальная live HTML Kwork, все динамические form params и payload-specific receipt — **C109/C110** (R15), не дублируют offline C041.
+- [x] Изменение текста после approval требует новой версии и одобрения. **C042** — восстановлен неизменённый текст snapshot и review; конфликт текста и цены блокирует review/send. Живая форма отдельно учитывается в C041.
+- [x] Внешние вызовы выполняются вне долгой DB-транзакции. **C043** — ПОДТВЕРЖДЕНО 03.11 (later): sender (`prepare`/`finalize` + browser без open session), inbox fetch/generation/edit, summary LLM + guarded cache TX, job embedding, reconcile (load attempt → close session → Kwork API); **`tests/test_c043_network_transaction_acceptance.py`** **4 passed** + **`test_inbox_transaction_boundaries.py`**, **`test_inbox_edit_transaction_boundaries.py`**, **`test_conversation_summary_transactions.py`**, **`test_job_embedding_delivery.py`**.
+- [x] Known failure допускает управляемый повтор согласно типу ошибки. **C044** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Timeout после фактической отправки переводит attempt в `unknown_result`. **C045** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_c045_submission_ambiguity_acceptance.py`** **2 passed** + **`test_submission_ambiguity.py`** (bundle); integration DB.
+- [x] Commit failure после внешнего успеха также требует сверки, а не слепого повтора. **C046** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Сверка находит уже отправленный объект; невозможность сверки требует ручного разрешения. **C047** — ПОДТВЕРЖДЕНО 03.11 (later): inbox reply — strict **`outbound_reply_visible_in_thread`**; dry-run proposal reconcile; live proposal без payload-specific receipt → **`inconclusive`** (operator **`/send-attempts/{id}/reconcile`** + **`mark_inconclusive_needs_attention`**); **`tests/test_send_attempt_reconcile.py`** через **`test_c047_reconcile_acceptance.py`**. Live Kwork thread fetch на working — operator; blind confirm запрещён.
+- [x] Истёкший lease не разрешает автоматический повтор неопределённой отправки. **C048** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Старый worker не завершает новый claim благодаря token/version проверке. **C049** — ПОДТВЕРЖДЕНО15.10 для send attempts: state/token проверяются под lock; старый token не завершает/не переводит в unknown новый retry, confirmed не перезаписывается поздней ошибкой, новый draft сохраняется. Outbox/pipeline fencing — C032/C053.
+- [x] Sent означает подтверждённую отправку; draft/approved не отображаются как delivered. **C050** — ПОДТВЕРЖДЕНО 05.11: dry-run → `simulated_sent`; повтор `ProposalSender.send` → `already_sent`/`unchanged` без второго attempt; `job_already_sent` не смягчается в wrapper; **`tests/test_c050_dry_run_sent_scope_acceptance.py`**, **`test_c104_stage_restart_acceptance.py`**; integration `jobpilot_ai_test`, `JOBPILOT_INTEGRATION_TESTS=1`.
+- [x] Новая отправка и обновление существующего отклика имеют разные правила и попытки. **C051** — ПОДТВЕРЖДЕНО 05.11: `prepare_proposal_send` — `new_offer_after_sent` vs `edit_existing` idempotency; **`tests/test_c051_edit_existing_acceptance.py`** (integration DB).
+
+## 5. Pipeline и LLM
+
+- [x] Повтор beat не ставит в активную обработку тот же job без причины. **C052** — ПОДТВЕРЖДЕНО 03.11: dedup/enqueue release (`test_c052_enqueue_release_on_failure.py`), beat ordering и re-enqueue после stale (`test_scrape_beat_restart_drill.py`, `test_job_processing_restart_drill.py::test_beat_queue_cycle_*`); compose drill [staging-drill-log.md](staging-drill-log.md) 02.11. **03.11 (later):** targeted bundle **35 passed** (~893s, integration DB). Live Kwork storm не требовался.
+- [x] Processing lease восстанавливается; terminal/approved/sending статусы не перезаписываются. **C053** — ПОДТВЕРЖДЕНО 03.11: outage/E2E stale recovery (`test_job_processing_restart_drill.py`), protected status fencing (`test_pipeline_claim_fencing.py`), heartbeat/cancel (`test_job_retry_queue.py`), integration claims (`test_job_processing_integration.py`, `test_job_processing_claim.py`). **03.11 (later):** **+4 passed** в том же прогоне/доп. файлах; compose drill 02.11. Эксплуатационный rollout/restart — также C094/C104.
+- [x] LLM timeout/rate limit сохраняется как ошибка обработки, а не filtered. **C054** — ПОДТВЕРЖДЕНО 03.11 (later): `pipeline_error_from_exception` во всех pipeline LLM модулях (filter/scoring/proposal/chat/learning + `conversation_summary`); `persist_pipeline_results` → `retryable_error`/`apply_processing_failure`, не `filtered`; inbox chat timeout → defer + `generation_retry_after` (**`test_inbox_chat_pipeline_errors.py`**); **`tests/test_c054_llm_error_acceptance.py`** + **`test_pipeline_processing_errors.py`**, **`test_learning_pipeline_errors.py`**. Telegram edit agents поднимают ошибку в UI, не меняют job.status.
+- [x] Некорректный JSON не получает 50 баллов и не проходит к proposal. **C055** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Проверены missing criteria, строки вместо чисел, NaN/Infinity, значения <0 и >100. **C056** — ПОДТВЕРЖДЕНО30.10: каждый из пяти критериев проверен на отсутствие, строку, bool, null, NaN/±Infinity и выход за диапазон; допустимые целые и дробные границы принимаются. Ошибка типа перед coercion становится Pydantic ValidationError. Остальные типы Filter/Learning и retry policy — C057/C058 (R11).
+- [x] Filter/chat/learning ответы также проходят строгую проверку схемы. **C057** — ПОДТВЕРЖДЕНО30.10: Filter отклоняет bool/числа после строкового coercion, неfinite и лишние поля; Chat отклоняет некорректные обязательные поля/intent и лишние поля; Learning проверяет точные ключи, исходные числовые типы, finite/nonnegative веса, finite positive sum и типы списков. Retry policy остаётся C058 (R11).
+- [x] Retries/timeouts/concurrency ограничены, лог содержит stage и attempt id. **C058** — ПОДТВЕРЖДЕНО 03.11 (later): caps в `Settings` (job/send/outbox/memory/inbound); compose celery **`--concurrency=2`**; `processing_attempt_journal` + structlog `attempt_id`/`claim_token` при claim; все graph LLM stages (**filter/scoring/proposal/chat/learning**) пишут **`llm_stage_log`** → `persist_stage_log` с `processing_attempt_id`; **`tests/test_c058_retry_ledger_acceptance.py`** **6 passed** + **`test_job_retry_queue.py`**, **`test_job_processing_restart_drill.py`**, **`test_inbox_generation_claims.py`**.
+- [x] Недоступный Qdrant не теряет заказ и допускает генерацию без памяти. **C059** — инициализация памяти в генерации и записи правок допускает отказ Qdrant; ошибка LLM сохраняется с retry. Долговечное повторение индексации остаётся в C060.
+- [x] Индексация восстанавливается отдельной задачей; Qdrant не блокирует event loop. **C060** — ПОДТВЕРЖДЕНО 05.11: `recover_stale_memory_index_claims` — `SELECT … FOR UPDATE`, CAS по `claim_expires_at`; **`tests/test_memory_index_queue.py::test_stale_claim_released_before_reclaim`**, **`test_recover_stale_claims_does_not_clear_fresh_claim`**; integration `jobpilot_ai_test`.
+- [x] Ошибка одного заказа/площадки не останавливает весь цикл без диагностики. **C061** — ПОДТВЕРЖДЕНО30.10: ошибки отдельного scraper, сохранения/проверки/claim заказа, pipeline и release логируются; счётчики failed_sources/failed_jobs возвращаются, следующие источники и заказы обрабатываются. Общий сбой инфраструктуры и durable retry остаются C053/C058 (R07).
+- [x] Ручная полная пауза сохранена; автоматическая пауза по коннектам имеет отдельную проверенную политику. **C062** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] При ограничении offers работа inbox/других площадок соответствует выбранному режиму. **C063** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+
+## 6. Переписка и scraping
+
+- [x] Project ID 123 не совпадает с 91234; username alice не совпадает с malice. **C064** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Несколько заказов одного клиента дают needs_context и явный выбор. **C065** — ПОДТВЕРЖДЕНО 03.11 (later): ambiguous username/project → `needs_context` + candidate list; operator **`bind_inbound_to_job`** + **`operator_reprocess_inbound_after_bind`**; API **`POST /inbound/{id}/bind-job`**, **`POST /inbound/{id}/reprocess`**; `find_kwork_job_for_message(..., bound_job_id=...)` — **`tests/test_c065_inbox_job_bind_acceptance.py`** **2 passed** + **`test_kwork_job_match.py`**. Telegram UI selector — **C111** (operator может использовать API).
+- [x] API /chat и inbox используют общий сервис контекста нужного thread. **C066** — ПОДТВЕРЖДЕНО 03.11 (later): `conversation_context_service` в API `handle_client_chat` (rollback до LLM) и inbox generation; **`tests/test_c066_shared_context_service_acceptance.py`** **3 passed**. Explicit job bind — **C065**; summary scope — **C071**.
+- [x] В контекст входит фактически отправленный proposal snapshot. **C067** — ПОДТВЕРЖДЕНО 03.11 (later): confirmed non-dry-run snapshot; dry-run/unknown/inbox_reply/chужой proposal отклонены; latest non-simulated wins — **`tests/test_chat_confirmed_proposal_context.py`** через **`test_c067_proposal_context_acceptance.py`** **2 passed** (+ bundle). Исторические confirmed без receipt — operator (R09/R14).
+- [x] Последнее сообщение не дублируется в истории; порядок сообщений корректен. **C068** — ПОДТВЕРЖДЕНО 03.11 (later): Kwork thread — `platform_message_id` cutoff + text fallback (`exclude_last_client_text`); inbox generation передаёт MID в `build_chat_agent_state`; порядок по `time`; **`tests/test_c068_conversation_history_acceptance.py`** + **`test_kwork_inbox.py`** (roles/exclude). DB-only history без thread/MID — text exclusion (legacy).
+- [x] Генерация reply создаёт draft, фактическая отправка — отдельный outbound interaction. **C069** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_c069_inbox_draft_outbound_acceptance.py`** **7 passed** (integration DB).
+- [x] Изменённая история с тем же числом сообщений инвалидирует summary cache. **C070** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Summary разных threads не смешиваются; сбой summary сохраняет доступный контекст. **C071** — ПОДТВЕРЖДЕНО 03.11 (later): `thread_scope` в summary cache (`conversation_summary_thread_scope` + Kwork MID bounds); mismatch scope не переиспользует чужой summary; LLM failure → truncated history без poison cache — **`tests/test_conversation_summary.py`** + **`test_c071_conversation_summary_acceptance.py`** **14 passed** bundle. Привязка заказа к thread при нескольких jobs — **C065** (R09).
+- [x] Relative href преобразуется в URL заказа, а не в URL списка. **C072** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Смена заголовка не создаёт новый job при том же platform ID. **C073** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Одинаковые заголовки разных заказов не объединяются. **C074** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Отсутствие optional fields не отбрасывает карточку и не вызывает длительное ожидание. **C075** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Реальный статус поддержки Upwork/FL.ru указан в настройках и README. **C076** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+
+## 7. Результаты и обучение
+
+- [x] Неизвестный outcome status отклоняется схемой запроса. **C077** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Повтор hired с тем же event key не создаёт дополнительные Outcome/Reward. **C078** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Разные event keys не позволяют повторно начислить ту же награду за один этап результата. **C079** — ПОДТВЕРЖДЕНО 03.11 (later): `record_outcome` dedupe по `job_id`+`proposal_id`+`status` (`_existing_outcome_for_stage`); **`tests/test_c079_c080_outcome_acceptance.py::test_double_hired_different_event_keys_single_reward`** + **`test_c103_outcome_learning_memory_e2e.py`** — **7 passed** integration bundle.
+- [x] Переход replied → hired и исправление ошибочного исхода имеют явные правила. **C080** — ПОДТВЕРЖДЕНО 03.11 (later): `allows_transition` в `record_outcome` (skip при `allow_correction=True`); block illegal `hired→replied`; correction path; **`tests/test_c079_c080_outcome_acceptance.py`** + **`tests/test_outcome_states.py`** — см. C079 bundle.
+- [x] Outcome записан до запуска learning; обучение видит свежий результат. **C081** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Hired/replied передают learning proposal ID, version и отправленный текст. **C082** — ПОДТВЕРЖДЕНО 03.11 (later): `sent_proposal_for_learning` только **`ATTEMPT_CONFIRMED_SENT`** snapshot (без draft fallback); `build_learning_state` блокирует **replied/hired** без snapshot; memory — только `proposal_content`; **`tests/test_c082_outcome_learning_acceptance.py`** **2 passed** + **`test_c103_outcome_learning_memory_e2e.py`**.
+- [x] Сбой Qdrant восстанавливает индексацию успешного примера без дубля reward. **C083** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_c083_outcome_memory_recovery_acceptance.py`** **1 passed**; integration DB. C089 — corpus/switch отдельно.
+- [x] Веса проверены: набор критериев, finite, nonnegative, положительная сумма. **C084** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Одновременно активна одна версия весов; доступен rollback. **C085** — ПОДТВЕРЖДЕНО 03.11 (later): partial unique index **`uq_scoring_weights_one_active`** (миграция **`20261103_0010`**); **`scoring_weights_service.replace_active_scoring_weights`** / **`activate_scoring_weight_row`**; **`scripts/rollback_scoring_weights.py`**; **`tests/test_c085_scoring_weights_acceptance.py`** **2 passed**. Качество перед activation — **C086**.
+- [x] Автоактивация требует достаточной выборки и проверки качества. **C086** — ПОДТВЕРЖДЕНО 03.11 (later): **`learning_weight_activation`** — min total/positive/hired outcomes + max per-criterion delta vs active/default weights; **`LearningAgent._persist_weights`**; **`LEARNING_MIN_*`**, **`LEARNING_MAX_WEIGHT_DELTA`**; **`tests/test_c086_learning_weight_quality.py`** **4 passed**.
+- [x] Review-first использует ожидаемую фиксированную политику и не меняется скрытно. **C087** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Embedding provider не зависит от LLM_PROVIDER; hash fallback исключён из semantic search. **C088** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [ ] Разные модели/размерности имеют отдельные коллекции; переиндексация проверена до переключения. **C089** — ОТКРЫТО 05.11: **`tests/test_c089_staged_embedding_pilot.py`** **1 passed** (~7s) при `JOBPILOT_INTEGRATION_TESTS=1`, `JOBPILOT_QDRANT_DRILL=1`, fake embed, compose Qdrant — staged reindex+search smoke, legacy collections preserved. **Внешний блокер:** не доказывает полноту working corpus и безопасный switch/rollback на `jobpilot_ai`; mass `--apply`, удаление legacy и платные embeddings запрещены.
+
+## 8. Эксплуатация
+
+- [x] Lockfile позволяет воспроизвести установку; CI проверяет frozen install. **C090** — ПОДТВЕРЖДЕНО 03.11 (later): `Dockerfile` → `pip install -r requirements-lock.txt` + `pip install --no-deps -e .` (как `verify_lockfile.sh`); **`docker build`** OK; **`tests/test_c090_c093_production_repro_policy.py`** **6 passed**; CI `verify_lockfile.sh` + unit pytest.
+- [x] Integration tests используют настоящую тестовую PostgreSQL и отдельную Redis. **C091** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] CI проверяет чистую/старую схему и сборку Docker image. **C092** — ПОДТВЕРЖДЕНО 03.11 (later): CI `alembic upgrade head` + integration **`test_c018_legacy_upgrade_acceptance.py`** + **`test_c098_restore_drill_acceptance.py`** (postgresql-client); **`docker-build`** job; **`tests/test_c092_ci_schema_policy.py`** **3 passed**.
+- [x] Production API без reload; приложение работает non-root с нужными writable volumes. **C093** — ПОДТВЕРЖДЕНО 03.11 (later): `docker-compose.prod.yml` **`volumes: !override`** → только `./data`; без `--reload`; `Dockerfile` **`USER 1000:1000`**; merged `docker compose config` без `./app` bind; policy tests **6 passed**; runtime **`JOBPILOT_SKIP_DB_MIGRATE=0`** api / **`=1`** worker+bot после recreate.
+- [x] Restart/readiness проверены; liveness и readiness не смешаны. **C094** — ПОДТВЕРЖДЕНО 05.11: **`tests/test_health_checks.py`**, **`tests/test_operational_script_safety.py`**, **`tests/test_ops_rollout_readiness.py`** (unit paths) **32 passed**; `/health` vs `/ready` разделены. Runtime JSON smoke **`test_rollout_readiness_json_shape`** требует поднятый API — не блокирует изолированную приёмку.
+- [x] Readiness учитывает обязательные зависимости, опциональная память помечается degraded. **C095** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Метрики отражают возраст очереди, ошибки, последние успехи и unknown_result. **C096** — ПОДТВЕРЖДЕНО 03.11 (later): `collect_ops_metrics` — outbox age, `unknown_result`/`known_failed`, `permanent_error`, `oldest_retryable_age_seconds`, `last_success.confirmed_external_send_at` / `notification_outbox_sent_at`; dry-run/simulation excluded from funnel (см. **`test_ops_metrics.py`**, **`test_c114_funnel_acceptance.py`**); **`tests/test_c096_ops_metrics_acceptance.py`** **1 passed**. Per-call LLM USD — **C115**, не C096.
+- [x] Логи и диагностические файлы не раскрывают tokens/cookies/пароли; политика хранения задана. **C097** — ПОДТВЕРЖДЕНО 03.11 (later): **`app/utils/log_scrubber.py`** + **`configure_application_logging()`** (api/celery/bot); **`SQLALCHEMY_ECHO`** default **false** (отделено от `DEBUG`); Docker **`json-file`** rotation `10m×5`; [ops-logging-policy.md](ops-logging-policy.md); **`tests/test_c097_log_scrubbing.py`** **7 passed**.
+- [ ] Backup восстановлен в изолированную среду, сверены количества и связи. **C098** — ОТКРЫТО 05.11: guard `_assert_drill_db_allowed` в `tests/test_c098_restore_drill_acceptance.py`; **`pytest tests/test_c098_restore_drill_acceptance.py`** **1 passed** (~4s) на `jobpilot_ai_test` (**05.11** повтор). **Внешний блокер:** нет отдельного сервера для полной сверки backup working corpus; рабочую БД не трогать.
+- [x] Runbook описывает recovery, unknown_result, migration и rollback границы. **C099** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] README/.env.example соответствуют портам, auth, настройкам пауз и реальному функционалу. **C100** — ПОДТВЕРЖДЕНО 03.11 (later): README — актуальный счёт из header, postgres **5434**, `API_AUTH_TOKEN` / `TELEGRAM_ADMIN_USER_ID`, auth curl examples, Kwork pause vars, без устаревших «176 pytest»/115 ready; `.env.example` — порты, pause, dry-run, `POSTGRES_PASSWORD`/`SQLALCHEMY_ECHO`; **`tests/test_c100_docs_accuracy.py`** **5 passed**; [closeout](remediation-closeout.md) header синхронизирован.
+
+## Сквозная приёмка перед реальной отправкой
+
+- [x] На тестовой платформе: job → filter → score → proposal → Telegram mock → admin approve → platform mock → confirmed_sent. **C101** — ПОДТВЕРЖДЕНО 05.11: `tests/test_c101_mock_e2e_proposal_flow.py` — `filter_node` → `scoring_node` → `proposal_node` (mock LLM), `persist_pipeline_results`, outbox deliver до `sent`, `handle_approve` → `simulated_sent` + `ATTEMPT_CONFIRMED_SENT` dry-run; среда `JOBPILOT_INTEGRATION_TESTS=1` + `.jobpilot_integration_test.env`, Postgres `jobpilot_ai_test`; **1 passed** (~35s).
+- [x] Продолжение: inbound → точный thread context → draft → edit → новое approval → confirmed reply. **C102** — ПОДТВЕРЖДЕНО 03.11 (later): **`tests/test_c102_mock_e2e_inbox_flow.py`** — inbound persist, confirmed proposal context, **`handle_inbox_edit`** → **`receive_inbox_edit_instruction`** → **`handle_inbox_edit_send`**, dry-run inbox **`ATTEMPT_CONFIRMED_SENT`**; **1 passed** (~6s). Live Telegram FSM на production bot — не дублирует изолированную приёмку.
+- [x] Продолжение: replied → hired → однократный reward → успешный пример в memory. **C103** — ПОДТВЕРЖДЕНО 03.11 (later): **`tests/test_c103_outcome_learning_memory_e2e.py`** — `record_outcome_and_learn` **replied** (reward **5**) → **hired** (reward **50**), duplicate **hired** без второго reward (**2** rows total); distinct dedupe keys `{proposal_id}:replied:1` / `:hired:1`; **`MemoryIndexPending`** → **`process_memory_index_queue`** → mock **`store_successful_proposal`** (durable path); **`test_hired_outcome_idempotent`** + **`test_memory_index_queue`** (payload refresh / concurrent index) — регрессии R10. **1 passed** (~7s). Live Qdrant corpus quality — не дублирует C089 pilot.
+- [x] Каждый этап прерван рестартом; сохранённые данные восстановлены без слепых повторных отправок. **C104** — ПОДТВЕРЖДЕНО 05.11: `tests/test_c104_stage_restart_acceptance.py` (confirmed send без второй доставки) + каталог `STAGE_RESTART_EVIDENCE`; bundle job/outbox/inbox/scrape/memory/send drills — **`pytest` 95 passed** (см. `test_job_processing_restart_drill.py`, `test_outbox_restart_drill.py`, `test_inbox_poller_restart_drill.py`, `test_scrape_beat_restart_drill.py`, `test_memory_index_queue.py`, `test_send_attempt_atomicity.py`); среда `JOBPILOT_INTEGRATION_TESTS=1`, Redis `6379`, Postgres `jobpilot_ai_test`; live SIGKILL не требовался.
+- [x] Проверены отказы PostgreSQL/Redis/Qdrant/LLM/Telegram и восстановление. **C105** — ПОДТВЕРЖДЕНО 05.11: каталог `DEPENDENCY_OUTAGE_EVIDENCE` + `test_c105_automated_outage_recovery_evidence_pytest_green` (**8 modules**, subprocess **passed** ~41s); `make dependency-drill` / `make redis-drill` → `/ready` **503→200** (запись **2026-11-05** в `docs/staging-drill-log.md`); среда `JOBPILOT_INTEGRATION_TESTS=1`, `.jobpilot_integration_test.env`, API `:8000`, compose Postgres/Redis/Qdrant.
+- [x] Посторонний пользователь не может выполнить действия ни через API, ни через Telegram. **C106** — ПОДТВЕРЖДЕНО 03.11 (later): **`test_c106_cross_access_acceptance.py`** + **`test_access_regressions.py`**, **`test_c010_*`**, **`test_api_auth.py`**; runtime **`scripts/c106_runtime_api_probe.sh`** на working API → `/health` **200**, `/jobs` без token **401**. Telegram — **C010**. Multi-tenant deployment audit — ops, не блокирует изолированную приёмку.
+- [x] Полные pytest/Ruff/pip check проходят; незакрытые ограничения отражены в отчёте. **C107** — ПОДТВЕРЖДЕНО 05.11: `ruff check app tests scripts` — **All checks passed**; `pip check` — OK; полный `pytest -q` — **984 passed**, **46 skipped**, **0 failed** (~21m) при `JOBPILOT_INTEGRATION_TESTS=1`, `.jobpilot_integration_test.env`, локальный `uvicorn :8000`, Redis/Qdrant compose, `API_RATE_LIMIT_ENABLED=false`; browser-only (`JOBPILOT_BROWSER_TESTS=1`) не в этом прогоне. CI (**C006**) и live Chromium — отдельно.
+- [x] Dry-run завершён без реальных сообщений, платных запросов и расхода коннектов. **C108** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Получено отдельное разрешение на конкретную реальную проверку **C109** — ПОДТВЕРЖДЕНО 03.11 (later): Telegram pending **`2a52cff9…`** msg **807** + chat «подтвердил» / «да» на live signoff; **`data/live_kwork_signoff.json`** schema v2; **`validate_live_signoff.py` exit 0** (working DB).
+- [ ] После разрешённой проверки подтверждены внешний результат, фактический send attempt и соответствующий DB snapshot. **C110** — ОТКРЫТО 05.11: live UI↔DB signoff не выполнялся. **Кандидат-rehearsal (test DB `jobpilot_ai_test`, не отправлять):** job `e4c85fde-be73-453f-8cc1-880390cf7e08`, proposal `b65ce9fc-9b38-4cc9-8dd4-7b030b06b4ea`, pending `35f4312a-50ae-4c73-95a3-a2eb4ac62ff2`, цена **700 RUB**, срок **1** день (read-only query **05.11**); URL/job listing для live — отдельно. **Блокер:** явное разрешение оператора + `PLATFORM_DRY_RUN=false` + сверка UI Kwork; не писать заказчику без разрешения.
+
+## Продуктовые улучшения
+
+- [x] Telegram показывает errors/unknown_result/needs_context и допустимые действия. **C111** — ПОДТВЕРЖДЕНО 03.11 (later): **`format_client_message_alert`** (needs_context + **POST /inbound/{id}/bind-job** hint); **`format_inbox_send_failure`** (unknown → EDIT/SKIP/runbook); **`/rereview`** (**`test_review_commands.py`**); reissue без auto-send при protected delivery (**`test_review_reissue.py`**); bundle **`tests/test_c111_operator_surface_acceptance.py`**. Inline Telegram job picker — **C065** API; consolidated operator queue dashboard — **C096**/ops inventory; immutable override journal — **C112**.
+- [x] Видны причины отказа, источник buyer data и журнал ручного override. **C112** — ПОДТВЕРЖДЕНО 03.11 (later): `relevance_reason` + **`decision_audit`** в job **`raw_data`**; **`format_job_decision_context`** / **`format_kwork_skipped_message`** (buyer ID + audit); buyer stats с источником в **`format_job_alert`**; append-only **`operator_override_events`** (migration **`20261103_0011`**) + **`record_operator_override`** on bind/reissue/reassess; **`tests/test_c112_operator_audit_acceptance.py`** + **`test_operator_override_journal.py`**. Telegram inline job picker — **C065** API.
+- [x] Есть проверка актуальности заказа до затратной генерации. **C113** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
+- [x] Воронка считает уникальные заказы и подтверждённые отправки. **C114** — ПОДТВЕРЖДЕНО 03.11 (later): `collect_ops_metrics` distinct job + `dry_run:false` + не simulated; **`test_ops_metrics.py`** + **`tests/test_c114_funnel_acceptance.py`** (duplicate sends → +1 job, legacy `{}` не в funnel) **2 passed**; live Kwork external proof — **C109/C110**.
+- [x] Стоимость LLM/коннектов привязана к этапам и результатам без двойного учёта. **C115** — ПОДТВЕРЖДЕНО 03.11 (later): `LLMCallUsage` + `consume_last_call_usage` в OpenRouter/OpenAI/Ollama; stage log хранит **`resolved_model`**, tokens, **`cost_usd`**; upsert stage+bucket без двойного учёта failed retry; `llm_usage_summary` на job + **`collect_ops_metrics`** aggregates (`total_cost_usd`, prompt/completion tokens); **`tests/test_c115_llm_usage_acceptance.py`** **3 passed** + ops metrics **12 passed**. Kwork **connects** как отдельная billing line — ops pause state, не в этом ledger.
+
+## Правила доказательств
+
+Для закрытия пункта: ID, исходная ревизия, среда, команда/сценарий, ожидаемый и фактический результат, дата, артефакт, ограничения. Test process с fake platform — integration evidence; он не является live evidence.
+
+Release gate должен вернуть nonzero, пока существуют открытые критерии. Report/inventory tests проверяют полноту и достоверный подсчёт115 критериев и не требуют «0 open». Не закрывать чеклист shell helper без review конкретного пункта.
+
+Новые пункты не добавляются ради обхода 115. R01–R16 — история аудита 14.10 в архиве, не второй план.

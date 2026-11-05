@@ -173,7 +173,12 @@ estimated_calendar_days, scope_clear, complexity, minimum_price_rub.
                     "minimum_price_rub": parsed.minimum_price_rub,
                     "reason": reason,
                 },
-                "llm_stage_log": append_stage_log(state, "filter", "simple"),
+                "llm_stage_log": append_stage_log(
+                    state,
+                    "filter",
+                    "simple",
+                    usage=self._llm.consume_last_call_usage(),
+                ),
             }
         except LLMServiceError as exc:
             logger.error("FilterAgent LLM error", error=str(exc), kind=exc.kind.value)
@@ -182,7 +187,6 @@ estimated_calendar_days, scope_clear, complexity, minimum_price_rub.
             return {
                 **pipeline_error_from_exception(exc, stage="filter"),
                 "relevance_reason": str(exc),
-                "llm_stage_log": append_stage_log(state, "filter", "simple"),
             }
         except Exception as exc:
             logger.error("FilterAgent failed", error=str(exc))
@@ -191,7 +195,6 @@ estimated_calendar_days, scope_clear, complexity, minimum_price_rub.
             return {
                 **pipeline_error_from_exception(exc, stage="filter"),
                 "relevance_reason": f"FilterAgent error: {exc}",
-                "llm_stage_log": append_stage_log(state, "filter", "simple"),
             }
 
 

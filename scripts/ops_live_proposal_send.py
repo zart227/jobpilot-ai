@@ -11,12 +11,12 @@ from typing import Any
 from sqlalchemy import select
 
 from app.config import get_settings
-from app.db.models import Job, Proposal, TelegramPending
+from app.db.models import Job, Proposal, ProposalApprovalSnapshot, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.services.approval_snapshot import proposal_card_is_current, record_proposal_approval
 from app.services.job_pipeline import JobPipelineService
 from app.services.kwork_pause import blocks_kwork_operator_send
-from app.services.proposal_sender import ProposalSender
+from app.services.submission_policy import SUBMISSION_EDIT_EXISTING
 
 
 async def approve_and_send(pending_id: uuid.UUID) -> dict[str, Any]:
@@ -52,8 +52,13 @@ async def approve_and_send(pending_id: uuid.UUID) -> dict[str, Any]:
         if not await proposal_card_is_current(session, pending.id, job, proposal):
             raise RuntimeError("missing or stale approval snapshot — reissue review first")
 
-        if await JobPipelineService().is_job_sent(pending.job_id):
+        snapshot = await session.get(ProposalApprovalSnapshot, pending.id)
+        submission_action = (snapshot.payload or {}).get("submission_action") if snapshot else None
+
+        if await JobPipelineService().is_job_sent(pending.job_id) and submission_action != SUBMISSION_EDIT_EXISTING:
             raise RuntimeError("job already has sent proposal")
+
+        from app.services.proposal_sender import ProposalSender
 
         message_id = pending.message_id or 0
         await record_proposal_approval(

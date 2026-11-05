@@ -8,8 +8,21 @@ import json
 import sys
 
 from app.config import get_settings
-from app.services.kwork_browser import BLOCKED_TITLE, close_browser, launch_browser
+from app.services.kwork_browser import (
+    BLOCKED_TITLE,
+    _has_active_session,
+    close_browser,
+    launch_browser,
+)
 from app.utils.proxy import get_proxy_candidates, mask_proxy
+
+
+def access_probe_proxy_candidates(settings) -> list[str | None]:
+    """Match kwork_browser send path: try direct before rotated proxies."""
+    candidates = list(get_proxy_candidates(settings, "openai"))
+    if None not in candidates:
+        candidates.insert(0, None)
+    return candidates
 
 
 async def _probe_url(page, url: str) -> dict:
@@ -29,21 +42,29 @@ async def main() -> int:
     settings = get_settings()
     listing = settings.kwork_category_url
     sample_project = "https://kwork.ru/projects/3270495"
-    candidates = list(get_proxy_candidates(settings, "openai")) or [None]
+    candidates = access_probe_proxy_candidates(settings)
 
     report: list[dict] = []
+    browser_auth_verified = False
     for proxy in candidates:
         label = mask_proxy(proxy) if proxy else "direct"
         playwright, browser, page = await launch_browser(proxy=proxy)
         try:
             listing_result = await _probe_url(page, listing)
             project_result = await _probe_url(page, sample_project)
+            row_ok = not listing_result["blocked"] and listing_result["want_cards"] > 0
+            session_ok = False
+            if row_ok and not browser_auth_verified:
+                session_ok = await _has_active_session(page)
+                if session_ok:
+                    browser_auth_verified = True
             report.append(
                 {
                     "proxy": label,
                     "listing": listing_result,
                     "sample_project": project_result,
-                    "ok": not listing_result["blocked"] and listing_result["want_cards"] > 0,
+                    "ok": row_ok,
+                    "browser_auth_verified": session_ok,
                 }
             )
         finally:
@@ -51,6 +72,13 @@ async def main() -> int:
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
     any_ok = any(row.get("ok") for row in report)
+    if browser_auth_verified:
+        print("browser_auth_verified=true (active Kwork session)", file=sys.stderr)
+    else:
+        print(
+            "browser_auth_verified=false — re-export KWORK_STORAGE_STATE or log in via export_kwork_session.py",
+            file=sys.stderr,
+        )
     if not any_ok:
         print(
             "\nKwork not reachable for scrape/send from this environment. "

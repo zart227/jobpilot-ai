@@ -123,9 +123,10 @@ async def test_openrouter_auto_selects_free_model_in_request():
             "pricing": {"prompt": "0", "completion": "0", "request": "0", "image": "0"},
         }
     ]
-    response = SimpleNamespace(choices=[SimpleNamespace(
-        finish_reason="stop", message=SimpleNamespace(content="ok")
-    )])
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content="ok"))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
     create = AsyncMock(return_value=response)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
                              close=AsyncMock())

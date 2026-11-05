@@ -50,6 +50,7 @@ from app.services.notification_outbox import deliver_notification_outbox, enqueu
 from app.services.proposal_sender import ProposalSender
 from app.services.reward_system import RewardSystem
 from app.services.send_attempt_service import delivery_blocks_mutation
+from app.services.submission_policy import pending_snapshot_is_edit_existing
 from app.telegram.access import (
     edit_preview_binding,
     edit_preview_matches_callback,
@@ -295,7 +296,34 @@ def format_kwork_skipped_message(
 
     if reason:
         parts.append(f"\n\n<b>Причина:</b> {html.escape(reason)}")
+    if job is not None:
+        context = format_job_decision_context(job)
+        if context:
+            parts.append(f"\n\n{context.rstrip()}")
     return "".join(parts)
+
+
+def format_job_decision_context(job: Job, *, max_audit: int = 3) -> str:
+    """Rejection reasons and recent decision audit for operator visibility (C112)."""
+    lines: list[str] = []
+    if job.relevance_reason:
+        lines.append(f"<b>Отказ/фильтр:</b> {html.escape(job.relevance_reason)}")
+    audit = (job.raw_data or {}).get("decision_audit") or []
+    if audit:
+        tail = audit[-max_audit:]
+        chunks = [
+            f"{html.escape(str(entry.get('action') or ''))}: "
+            f"{html.escape(str(entry.get('reason') or '')[:160])}"
+            for entry in tail
+        ]
+        lines.append(f"<b>Журнал решений:</b> {'; '.join(chunks)}")
+    if job.client_id and job.client:
+        buyer_id = job.client.external_id
+        if buyer_id:
+            lines.append(
+                f"<b>Buyer ID (Kwork):</b> {html.escape(str(buyer_id))}"
+            )
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def format_kwork_paused_message(job: Job | None = None) -> str:
@@ -831,7 +859,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             async with AsyncSessionLocal() as session:
                 proposal = await session.get(Proposal, uuid.UUID(proposal_id))
                 job_for_msg = await session.get(Job, uuid.UUID(job_id))
-            if not proposal or proposal.status != "edited":
+                pending = await session.get(TelegramPending, uuid.UUID(pending_id))
+                allows_edit = pending and await pending_snapshot_is_edit_existing(session, pending.id)
+            if not allows_edit:
                 duplicate_msg = "⚠️ JobPilot AI: по этому заказу отклик уже был отправлен ранее."
                 order_id = _resolve_order_id(job=job_for_msg)
                 if order_id:
@@ -915,8 +945,10 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 await callback.message.answer(format_kwork_paused_message(job))
                 return
 
-            if action in ("approved", "edited") and await JobPipelineService().is_job_sent(
-                pending.job_id
+            if (
+                action in ("approved", "edited")
+                and await JobPipelineService().is_job_sent(pending.job_id)
+                and not await pending_snapshot_is_edit_existing(session, pending.id)
             ):
                 pending.status = "duplicate"
                 await session.commit()
@@ -925,7 +957,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                     await callback.answer("Уже отправлено", show_alert=True)
                 except Exception:
                     pass
-                duplicate_msg = "⚠️ JobPilot AI: по этому заказу отклик уже был отправлен ранее."
+                duplicate_msg = (
+                    "⚠️ JobPilot AI: по этому заказу отклик уже был отправлен ранее."
+                )
                 order_id = _resolve_order_id(job=job)
                 if order_id:
                     duplicate_msg += f"\n№ заказа: {order_id}"

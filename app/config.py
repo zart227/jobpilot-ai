@@ -331,6 +331,11 @@ class Settings(BaseSettings):
         alias="KWORK_OFFER_DISCOUNT_PERCENT",
         description="Bid this % below buyer desired budget (competitive pricing)",
     )
+    kwork_default_payment_type_label: str = Field(
+        default="Безопасная",
+        alias="KWORK_DEFAULT_PAYMENT_TYPE_LABEL",
+        description="Partial label for Kwork payment type on new_offer (must match UI option)",
+    )
     kwork_pause_enabled: bool = Field(
         default=True,
         alias="KWORK_PAUSE_ENABLED",
@@ -455,6 +460,25 @@ class Settings(BaseSettings):
         ge=1,
         alias="LEARNING_MIN_OUTCOMES",
         description="Minimum recorded outcomes before activating learned scoring weights",
+    )
+    learning_min_positive_outcomes: int = Field(
+        default=3,
+        ge=0,
+        alias="LEARNING_MIN_POSITIVE_OUTCOMES",
+        description="Minimum replied+hired outcomes before activating learned weights",
+    )
+    learning_min_hired_outcomes: int = Field(
+        default=1,
+        ge=0,
+        alias="LEARNING_MIN_HIRED_OUTCOMES",
+        description="Minimum hired outcomes before activating learned weights",
+    )
+    learning_max_weight_delta: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        alias="LEARNING_MAX_WEIGHT_DELTA",
+        description="Max absolute per-criterion change vs active/default weights",
     )
     embedding_provider: str = Field(
         default="openai",

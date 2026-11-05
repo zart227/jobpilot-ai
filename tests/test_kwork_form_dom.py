@@ -164,6 +164,44 @@ async def test_hidden_editor_fail_closed(page):
         await _verify_approved_form(page, CONTENT, 8500, 7)
 
 
+async def test_approved_title_and_payment_fields_are_filled(page):
+    title = "Реализация формы — отклик"
+    payment = "Безопасная сделка"
+    await page.evaluate(
+        """() => {
+        const box = document.createElement('div');
+        box.className = 'trumbowyg-box';
+        const extra = document.createElement('div');
+        extra.className = 'trumbowyg-editor';
+        extra.setAttribute('placeholder', 'Введите название заказа');
+        extra.contentEditable = 'true';
+        const hidden = document.createElement('textarea');
+        hidden.name = 'order_title';
+        hidden.hidden = true;
+        box.append(extra, hidden);
+        document.querySelector('form').prepend(box);
+        const pay = document.createElement('div');
+        pay.className = 'offer-payment-type__item';
+        pay.textContent = 'Безопасная сделка';
+        document.querySelector('form').append(pay);
+    }"""
+    )
+    await _fill_offer_form(
+        page,
+        CONTENT,
+        30000,
+        50000,
+        offer_price=8500,
+        duration_days=7,
+        offer_title=title,
+        payment_type_label=payment,
+    )
+    await _verify_approved_form(
+        page, CONTENT, 8500, 7, offer_title=title, payment_type_label=payment
+    )
+    assert await page.evaluate("window.paymentClicked") is True
+
+
 @pytest.mark.parametrize("control", ["payment", "title"])
 async def test_unapproved_optional_fields_are_not_changed_or_submitted(page, control):
     await page.evaluate("""control => {

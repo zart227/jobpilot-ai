@@ -9,14 +9,14 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKLIST = ROOT / "docs" / "remediation-checklists.md"
+CHECKLIST = ROOT / "docs" / "remediation-plan.md"
 
 
 def main() -> int:
     text = CHECKLIST.read_text(encoding="utf-8")
     open_items = [line[6:].strip() for line in text.splitlines() if line.startswith("- [ ]")]
     closed = len(re.findall(r"^- \[x\]", text, re.MULTILINE))
-    print(f"remediation-checklists: {closed} closed, {len(open_items)} open")
+    print(f"remediation-plan: {closed} closed, {len(open_items)} open")
     for item in open_items:
         print(f"  OPEN: {item[:120]}")
     maximum = int(os.environ.get("REMEDIATION_MAX_OPEN", "0"))

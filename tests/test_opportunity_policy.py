@@ -1,5 +1,6 @@
 import pytest
 
+from app.llm.call_usage import LLMCallUsage
 from app.services.opportunity_policy import (
     REVIEW_WEIGHTS,
     client_rejection,
@@ -22,6 +23,16 @@ def test_unproven_or_poor_buyers_rejected(job):
 
 def test_proven_buyer_accepted():
     assert client_rejection({'client_rating': 4.9, 'client_completed_paid_orders': 3}, 4.8, 1) is None
+
+
+def _filter_agent_mock_llm(*, complete_return: str):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    return SimpleNamespace(
+        complete=AsyncMock(return_value=complete_return),
+        consume_last_call_usage=lambda: LLMCallUsage(resolved_model="mock", provider_kind="mock"),
+    )
 
 
 def test_legacy_kwork_statistics_are_not_accepted_as_buyer_block_evidence():
@@ -71,7 +82,6 @@ def test_kwork_buyer_listing_threshold(projects, hired, accepted):
 async def test_kwork_scope_and_minimum_price_must_be_confirmed(hours, days, complexity, price, budget, accepted):
     import json
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     from app.agents.filter_agent import FilterAgent
 
@@ -82,10 +92,11 @@ async def test_kwork_scope_and_minimum_price_must_be_confirmed(hours, days, comp
         developer_excluded_skills='', developer_hourly_rate=50, developer_bio='',
     )
     agent._excluded = []
-    agent._llm = SimpleNamespace(complete=AsyncMock(return_value=json.dumps({
+    agent._llm = _filter_agent_mock_llm(
+        complete_return=json.dumps({
         'relevant': True, 'reason': 'matches', 'estimated_hours': hours, 'scope_clear': True,
         'complexity': complexity, 'minimum_price_rub': price, 'estimated_calendar_days': days,
-    })))
+    }))
     result = await agent.run({'job_data': {
         'platform': 'kwork', 'title': 'Fix Python bug', 'description': 'Fix one bug in Python code', 'budget_max': budget,
         'client_projects_posted': 5, 'client_hire_percent': 50, 'client_stats_source': 'kwork_buyer_block_v1',
@@ -100,7 +111,7 @@ def test_assessed_price_and_one_day_are_bound_to_approval_snapshot():
     from app.services.approval_snapshot import proposal_card_payload
 
     job = SimpleNamespace(
-        id='job', platform='kwork', url='https://example.test', budget_min=1000,
+        id='job', platform='kwork', title='Fix bug', url='https://example.test', budget_min=1000,
         budget_max=2000, budget_currency='RUB',
         raw_data={'opportunity_assessment': {'minimum_price_rub': 700, 'estimated_hours': 2}},
     )
@@ -145,7 +156,10 @@ async def test_kwork_incomplete_or_oversized_description_is_rejected_without_llm
         developer_excluded_skills='', developer_hourly_rate=50, developer_bio='',
     )
     agent._excluded = []
-    agent._llm = SimpleNamespace(complete=AsyncMock())
+    agent._llm = SimpleNamespace(
+        complete=AsyncMock(),
+        consume_last_call_usage=lambda: LLMCallUsage(resolved_model="mock", provider_kind="mock"),
+    )
     result = await agent.run({'job_data': {
         'platform': 'kwork', 'title': 'Fix Python bug', 'description': description,
         'client_projects_posted': 5, 'client_hire_percent': 50, 'client_stats_source': 'kwork_buyer_block_v1',
@@ -163,7 +177,6 @@ def test_review_strategy_prioritizes_ease_over_money():
 async def test_filter_enforces_small_known_scope(hours, clear, accepted):
     import json
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     from app.agents.filter_agent import FilterAgent
 
@@ -174,9 +187,9 @@ async def test_filter_enforces_small_known_scope(hours, clear, accepted):
         developer_excluded_skills='', developer_hourly_rate=50, developer_bio='',
     )
     agent._excluded = []
-    agent._llm = SimpleNamespace(complete=AsyncMock(return_value=json.dumps({
+    agent._llm = _filter_agent_mock_llm(complete_return=json.dumps({
         'relevant': True, 'reason': 'matches', 'estimated_hours': hours, 'scope_clear': clear,
-    })))
+    }))
     result = await agent.run({'job_data': {
         'platform': 'test', 'title': 'Fix Python bug',
         'client_rating': 4.9, 'client_completed_paid_orders': 3,

@@ -68,11 +68,14 @@ async def test_build_conversation_context_uses_cache() -> None:
     ]
     older_fp = _older_turns_fingerprint(turns[:-RECENT_TURNS])
     job.raw_data["inbox_conversation_summary"]["older_turn_fingerprint"] = older_fp
+    job.raw_data["inbox_conversation_summary"]["thread_scope"] = f"kwork:job:{job.id}"
     with patch(
         "app.services.conversation_summary.summarize_turns",
         new=AsyncMock(return_value="should not be called"),
     ) as mock_summarize:
-        context = await build_conversation_context(None, job, turns)
+        context = await build_conversation_context(
+            None, job, turns, thread_scope=f"kwork:job:{job.id}"
+        )
 
     mock_summarize.assert_not_called()
     assert "Обсудили срок и бюджет." in context
@@ -133,6 +136,38 @@ async def test_summary_failure_falls_back_without_cache() -> None:
         context = await build_conversation_context(None, job, turns)
     assert "5" in context or "4" in context
     assert job.raw_data.get("inbox_conversation_summary") is None
+
+
+@pytest.mark.asyncio
+async def test_summary_cache_does_not_reuse_other_thread_scope() -> None:
+    job = Job(
+        id=uuid.uuid4(),
+        platform="kwork",
+        external_id="1",
+        title="Test",
+        description="Desc",
+    )
+    turns = [{"role": "client", "text": str(i)} for i in range(6)]
+    older_fp = _older_turns_fingerprint(turns[:-RECENT_TURNS])
+    job.raw_data = {
+        "inbox_conversation_summary": {
+            "thread_scope": "kwork:thread:a:z:10",
+            "older_turn_count": len(turns[:-RECENT_TURNS]),
+            "older_turn_fingerprint": older_fp,
+            "text": "Summary for thread A",
+        }
+    }
+    with patch(
+        "app.services.conversation_summary.summarize_turns",
+        new=AsyncMock(return_value="Summary for thread B"),
+    ) as mock_summarize:
+        context = await build_conversation_context(
+            None, job, turns, thread_scope="kwork:thread:b:z:10"
+        )
+    mock_summarize.assert_awaited_once()
+    assert "Summary for thread B" in context
+    assert "Summary for thread A" not in context
+    assert job.raw_data["inbox_conversation_summary"]["thread_scope"] == "kwork:thread:b:z:10"
 
 
 @pytest.mark.asyncio

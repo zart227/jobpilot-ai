@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-CHECKLIST = Path(__file__).resolve().parents[1] / "docs" / "remediation-checklists.md"
+CHECKLIST = Path(__file__).resolve().parents[1] / "docs" / "remediation-plan.md"
 
 
 def test_checklist_inventory_preserves_original_115_unique_criteria() -> None:

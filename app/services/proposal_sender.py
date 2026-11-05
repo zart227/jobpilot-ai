@@ -7,6 +7,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
+from app.db.workflow_states import proposal_is_submitted
 from app.services.kwork_browser import (
     is_kwork_connects_limit_error,
     is_kwork_order_closed_error,
@@ -37,18 +38,20 @@ class ProposalSender:
 
             if proposal_id:
                 proposal = await session.get(Proposal, uuid.UUID(proposal_id))
-                if proposal and proposal.status == "sent":
-                    return True
+                return bool(proposal and proposal_is_submitted(proposal.status))
 
             result = await session.execute(
                 select(Proposal.id)
                 .where(
                     Proposal.job_id == job.id,
-                    Proposal.status == "sent",
+                    Proposal.status.in_(("sent", "simulated_sent")),
                 )
                 .limit(1)
             )
             return result.scalar_one_or_none() is not None
+
+    async def _proposal_already_submitted(self, job_id: str, proposal_id: str) -> bool:
+        return await self.is_already_sent(job_id, proposal_id)
 
     async def send(
         self,
@@ -56,13 +59,12 @@ class ProposalSender:
         proposal_id: str,
         content: str,
         *,
-        allow_resubmit: bool = False,
+        allow_resubmit: bool | None = None,
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
         claim, job, proposal = await prepare_proposal_send(
             job_id,
             proposal_id,
             content,
-            allow_resubmit=allow_resubmit,
         )
         if claim.action == "unchanged":
             return True, None, {"offer_action": "unchanged"}
@@ -70,6 +72,10 @@ class ProposalSender:
             return True, None, {"offer_action": "unchanged"}
         if claim.action == "blocked":
             reason = claim.reason or "send_blocked"
+            if reason == "new_offer_after_sent" and await self._proposal_already_submitted(
+                job_id, proposal_id
+            ):
+                return True, None, {"offer_action": "unchanged"}
             return False, reason, {"error_label": reason}
 
         if not job or not proposal or not claim.attempt_id or not claim.claim_token:
@@ -200,6 +206,9 @@ class ProposalSender:
                 float(job.budget_max) if job.budget_max else None,
                 offer_price=approved_payload.get("offer_price"),
                 duration_days=approved_payload.get("duration_days"),
+                submission_action=approved_payload.get("submission_action"),
+                offer_title=approved_payload.get("offer_title"),
+                payment_type_label=approved_payload.get("payment_type_label"),
             )
             debug = dict(debug or {})
             debug["dry_run"] = False

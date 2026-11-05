@@ -88,8 +88,7 @@ async def _stats_compare(base_url: str) -> dict | None:
 def _alembic_head_via_compose() -> dict:
     if os.environ.get("JOBPILOT_SKIP_COMPOSE_CHECKS") == "1":
         return {"skipped": True}
-    proc = subprocess.run(
-        [
+    proc = subprocess.run([
             "docker",
             "compose",
             "exec",
@@ -106,6 +105,7 @@ def _alembic_head_via_compose() -> dict:
         cwd=ROOT,
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         return {"ok": False, "error": "compose postgres query failed"}

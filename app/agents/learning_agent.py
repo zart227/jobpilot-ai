@@ -3,16 +3,18 @@ import json
 from collections import Counter
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db.models import Outcome, Proposal, Reward, ScoringWeight
+from app.db.models import Outcome, Proposal, Reward
 from app.db.session import AsyncSessionLocal
 from app.llm.provider import get_simple_llm_provider
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.agent_state import JobPilotState
 from app.schemas.llm_outputs import parse_learning_output
+from app.services.pipeline_llm_ledger import append_stage_log
 from app.services.reward_constants import REWARD_MAP
+from app.services.scoring_weights_service import replace_active_scoring_weights
 from app.services.scoring_weights_validation import validate_scoring_weights
 
 logger = structlog.get_logger(__name__)
@@ -71,6 +73,12 @@ Analyze patterns and suggest weight adjustments."""
             return {
                 "reward": reward,
                 "learning_notes": json.dumps(payload, ensure_ascii=False),
+                "llm_stage_log": append_stage_log(
+                    state,
+                    "learning",
+                    "simple",
+                    usage=self._llm.consume_last_call_usage(),
+                ),
             }
         except Exception as exc:
             logger.error("LearningAgent failed", error=str(exc))
@@ -106,20 +114,9 @@ Analyze patterns and suggest weight adjustments."""
             "outcome_distribution": dict(platforms),
         }
 
-    async def _outcome_count(self) -> int:
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(select(func.count()).select_from(Outcome))
-            return int(result.scalar() or 0)
-
     async def _persist_weights(self, weights: dict[str, float]) -> None:
         if self._settings.review_first_mode:
             logger.info("LearningAgent skipped weight activation (review_first_mode)")
-            return
-        if await self._outcome_count() < self._settings.learning_min_outcomes:
-            logger.info(
-                "LearningAgent skipped weight activation (insufficient outcomes)",
-                min_required=self._settings.learning_min_outcomes,
-            )
             return
         try:
             normalized = validate_scoring_weights(weights)
@@ -128,16 +125,25 @@ Analyze patterns and suggest weight adjustments."""
             return
 
         async with AsyncSessionLocal() as session:
-            await session.execute(update(ScoringWeight).values(is_active=False))
-            session.add(
-                ScoringWeight(weights=normalized, source="learning_agent", is_active=True)
+            from app.services.learning_weight_activation import should_activate_learned_weights
+
+            ok, reason, validated = await should_activate_learned_weights(
+                session, normalized, self._settings
             )
+            if not ok or validated is None:
+                logger.info(
+                    "LearningAgent skipped weight activation (quality gate)",
+                    reason=reason,
+                )
+                return
+            await replace_active_scoring_weights(session, validated)
             await session.commit()
+            logger.info("LearningAgent activated weights", reason=reason)
 
     async def _store_success_patterns(self, state: JobPilotState, outcome: str) -> None:
         if outcome not in ("replied", "hired"):
             return
-        proposal = state.get("edited_proposal") or state.get("proposal_content", "")
+        proposal = state.get("proposal_content", "")
         proposal_id = str(state.get("proposal_id", "") or "")
         version = state.get("proposal_version", "")
         job = state.get("job_data", {})

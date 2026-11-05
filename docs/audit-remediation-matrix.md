@@ -2,7 +2,7 @@
 
 Reviewed source: [audit-2026-10-14.md](audit-2026-10-14.md); historical baseline: [audit-2026-10-13.md](audit-2026-10-13.md).
 
-Historical finding statuses below are dated and may be stale; see [current audit](audit-2026-11-03-completion.md) and the checklist for current work. Rendering does not rerun tests or approve release.
+Historical finding statuses below are dated and may be stale. Current plan and checklists: [remediation-plan.md](remediation-plan.md). Rendering does not rerun tests or approve release.
 
 | # | P | Статус | Находка | Остаток / evidence |
 | - | - | ------ | ------- | ----------------- |
@@ -35,6 +35,6 @@ Historical finding statuses below are dated and may be stale; see [current audit
 - Findings: **23**
 - By status: {'partial': 14, 'rework': 5, 'done': 4}
 - Historical checklist snapshot: 51/115 confirmed, 64 open.
-- Current checklist markers (not independent evidence): 72/115 closed, 43 open.
+- Current checklist markers (not independent evidence): 98/115 closed, 17 open.
 - Release not accepted. Live/staging criteria cannot be replaced by simulated evidence.
 - Review evidence is dated; update it when code or accepted behavior changes.

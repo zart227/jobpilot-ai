@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 logger = structlog.get_logger(__name__)
 
-EXPECTED_HEAD = "20261103_0009"
+EXPECTED_HEAD = "20261103_0011"
 
 
 def _resolve_database_url() -> str:
@@ -61,8 +61,9 @@ async def run_inventory(database_url: str) -> dict:
             oldest = await conn.execute(
                 text("SELECT MIN(created_at) FROM memory_index_pending")
             )
+            oldest_row = oldest.first()
             report["memory_index_pending_oldest_at"] = (
-                oldest.scalar().isoformat() if oldest.scalar() else None
+                oldest_row[0].isoformat() if oldest_row and oldest_row[0] else None
             )
         else:
             report["memory_index_pending_rows"] = None

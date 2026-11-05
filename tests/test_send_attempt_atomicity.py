@@ -68,6 +68,24 @@ async def test_parallel_initial_claims_have_one_winner_and_no_integrity_error():
     assert sum(item.action == "proceed" for item in result) == 1
 
 
+async def test_known_failed_retry_refreshes_approval_metadata():
+    from app.db.models import SendAttempt
+    from app.db.session import AsyncSessionLocal
+    from app.services.send_attempt_service import claim_send_attempt
+
+    jid, pid = await seed()
+    base = params(jid, pid)
+    refreshed = {**base, "snapshot_metadata": {"approval_event_id": "new", "approved_payload": {"offer_title": "t"}}}
+    async with AsyncSessionLocal() as session:
+        session.add(SendAttempt(**base, status="known_failed"))
+        await session.commit()
+    claim = await claim_send_attempt(**refreshed)
+    assert claim.action == "proceed"
+    async with AsyncSessionLocal() as session:
+        row = await session.scalar(select(SendAttempt).where(SendAttempt.job_id == jid))
+        assert row.snapshot_metadata == refreshed["snapshot_metadata"]
+
+
 async def test_parallel_retry_claims_have_one_winner():
     from app.db.models import SendAttempt
     from app.db.session import AsyncSessionLocal
@@ -428,3 +446,58 @@ async def test_inbox_draft_or_changed_payload_requires_explicit_approval():
             pending_id=pending_id, reply_text="Approved answer", expected_user_id=9
         )
     ).action == "blocked"
+
+
+async def test_post_submit_timeout_error_finalizes_unknown_result():
+    from app.db.models import Job, Proposal, SendAttempt
+    from app.db.send_attempt_states import (
+        ATTEMPT_KIND_PROPOSAL,
+        ATTEMPT_SENDING,
+        ATTEMPT_UNKNOWN_RESULT,
+    )
+    from app.db.session import AsyncSessionLocal
+    from app.services.send_attempt_service import finalize_send_attempt
+
+    jid, pid = uuid.uuid4(), uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    token = uuid.uuid4()
+    async with AsyncSessionLocal() as session:
+        session.add(
+            Job(
+                id=jid,
+                platform="kwork",
+                external_id=f"timeout-{jid}",
+                title="T",
+                description="d",
+                status="approved",
+            )
+        )
+        session.add(
+            Proposal(id=pid, job_id=jid, content="x" * 20, version=1, status="approved")
+        )
+        session.add(
+            SendAttempt(
+                id=attempt_id,
+                kind=ATTEMPT_KIND_PROPOSAL,
+                idempotency_key=f"timeout:{attempt_id}",
+                job_id=jid,
+                proposal_id=pid,
+                snapshot_content="x" * 20,
+                status=ATTEMPT_SENDING,
+                claim_token=token,
+                claim_owner="test",
+            )
+        )
+        await session.commit()
+
+    ok = await finalize_send_attempt(
+        attempt_id,
+        token,
+        success=False,
+        error="Connection timed out after submit click",
+    )
+    assert ok
+    async with AsyncSessionLocal() as session:
+        attempt = await session.get(SendAttempt, attempt_id)
+        assert attempt is not None
+        assert attempt.status == ATTEMPT_UNKNOWN_RESULT

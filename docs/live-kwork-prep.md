@@ -1,13 +1,14 @@
 # Live Kwork — подготовка (единый чеклист)
 
-> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+> **05.11.2026:** счёт только в [remediation-plan.md](remediation-plan.md) (**98/115**, **17** открыто). Этот лист не закрывает критерии. Dry-run не закрывает live.
 
-Remediation-чеклист: **44/115 подтверждено; 71 открыт** (dry-run signoff уже есть). Этот документ — **перед первой реальной отправкой** в UI Kwork.
+Remediation-чеклист: открыты **C109/C110**. Этот документ — **перед первой реальной отправкой** в UI Kwork.
 
 ## 1. Автоматические ворота
 
 ```bash
 make verify
+make -s ops-rollout-readiness
 make audit-status
 ./scripts/staging_drill_automated.sh   # опционально, лог в staging-drill-log.md
 ```
@@ -34,9 +35,9 @@ make audit-status
 
 ```bash
 cp data/live_kwork_signoff.json.example data/live_kwork_signoff.json
-# заполнить: PLATFORM_DRY_RUN=false, order_id, send_attempt_id, флаги true
+# заполнить attestation + artifacts; PLATFORM_DRY_RUN=false только на время одной отправки
 python scripts/validate_live_signoff.py
-./scripts/record_live_kwork_acceptance.sh <order_id> <attempt_uuid> "live UI verified"
+./scripts/record_live_kwork_acceptance.sh
 ```
 
 Журнал опционален (чеклист не закрыт); для аудита продакшена — рекомендуется.

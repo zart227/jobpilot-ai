@@ -399,3 +399,21 @@ class MemoryIndexPending(Base):
     claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     claim_owner: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class OperatorOverrideEvent(Base):
+    """Append-only log of manual operator overrides (API/Telegram)."""
+
+    __tablename__ = "operator_override_events"
+    __table_args__ = (
+        Index("ix_operator_override_events_reference", "reference_type", "reference_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_source: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    reference_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    reference_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

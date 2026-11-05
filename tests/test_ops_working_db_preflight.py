@@ -11,8 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_working_db_preflight_requires_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
@@ -27,8 +26,7 @@ def test_working_db_preflight_ok_when_aligned(monkeypatch):
     monkeypatch.setenv("JOBPILOT_WORKING_DATABASE_URL", os.environ["DATABASE_URL"])
     monkeypatch.setenv("DATABASE_URL", os.environ["DATABASE_URL"])
     monkeypatch.setenv("JOBPILOT_ALLOW_TEST_URL", "1")
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
@@ -46,8 +44,7 @@ def test_working_db_preflight_ok_when_aligned(monkeypatch):
 def test_working_db_preflight_fails_on_mismatch(monkeypatch):
     monkeypatch.setenv("JOBPILOT_WORKING_DATABASE_URL", os.environ["DATABASE_URL"])
     monkeypatch.setenv("DATABASE_URL", os.environ["DATABASE_URL"] + "_mismatch")
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
+    result = subprocess.run([sys.executable, str(ROOT / "scripts" / "ops_working_db_preflight.py")],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

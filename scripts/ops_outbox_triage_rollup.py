@@ -15,25 +15,24 @@ if not os.path.isfile(PY):
 
 
 def _env() -> dict[str, str]:
-    working = os.environ.get("JOBPILOT_WORKING_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    from scripts.ops_database_url import pick_ops_database_url
+
+    working = pick_ops_database_url()
     if not working:
-        print("Set JOBPILOT_WORKING_DATABASE_URL", file=sys.stderr)
+        print("Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL", file=sys.stderr)
         raise SystemExit(2)
     env = {**os.environ, "PYTHONPATH": ROOT, "DATABASE_URL": working}
-    if os.environ.get("JOBPILOT_WORKING_DATABASE_URL"):
-        env["JOBPILOT_WORKING_DATABASE_URL"] = os.environ["JOBPILOT_WORKING_DATABASE_URL"]
-    else:
-        env["JOBPILOT_WORKING_DATABASE_URL"] = working
+    env.pop("JOBPILOT_WORKING_DATABASE_URL", None)
     return env
 
 
 def _run_json(script: str, *args: str) -> dict:
-    proc = subprocess.run(
-        [PY, os.path.join(ROOT, "scripts", script), *args],
+    proc = subprocess.run([PY, os.path.join(ROOT, "scripts", script), *args],
         cwd=ROOT,
         env=_env(),
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode not in (0, 1):
         raise RuntimeError(proc.stderr or proc.stdout or script)

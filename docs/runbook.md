@@ -1,6 +1,6 @@
 # JobPilot AI — операционный runbook
 
-> Перепроверка14.10.2026: актуальный счёт — [remediation-checklists.md](remediation-checklists.md) (**53/115 подтверждено, 62 открыто; релиз не принят**). Dry-run не закрывает live.
+> Актуальный счёт — [remediation-plan.md](remediation-plan.md). Релиз не принят, пока там есть открытые C-ID. Dry-run не закрывает live.
 
 ## Health endpoints
 
@@ -14,14 +14,18 @@ Kubernetes: liveness → `/health`, readiness → `/ready`.
 Перед rollout на working (read-only, без отправок):
 
 ```bash
-export JOBPILOT_WORKING_DATABASE_URL='postgresql+asyncpg://…/jobpilot_ai'
-make -s ops-rollout-readiness   # DB preflight, /ready, ops_metrics, beat schedule
+export JOBPILOT_WORKING_DATABASE_URL='postgresql+asyncpg://…/jobpilot_ai'   # или localhost DATABASE_URL из .env
+make -s ops-rollout-readiness   # через OPS_DB_URL (localhost override при WORKING=@postgres:); отказ *_test
 make -s ops-remediation-preflight   # preflight + readiness + outbox triage JSON
 make -s ops-outbox-triage       # NA rollup — ручной triage при needs_attention > 0
 ./scripts/readiness_smoke.sh
 ```
 
 ## Миграции
+
+**Docker Compose:** только контейнер `api` выполняет `alembic upgrade head` при старте (`JOBPILOT_SKIP_DB_MIGRATE=0`). Worker, beat и telegram-bot пропускают migrate (`JOBPILOT_SKIP_DB_MIGRATE=1`) и ждут `api`. Параллельные upgrade защищены PostgreSQL advisory lock в `alembic/env.py`.
+
+**Rollout вручную:** один вызов migrate на окружение (`scripts/init_db.py`, `production_rollout.sh`, или `alembic upgrade head`), не из каждого процесса одновременно.
 
 1. Остановить beat и workers (чтобы не было конкурирующих DDL): `docker compose stop celery-beat celery-worker`
 2. `python scripts/migration_preflight.py` на **копии** production БД ([upgrade-existing-db.md](upgrade-existing-db.md); дубли jobs/clients/proposals — исправить вручную до UNIQUE)
@@ -36,14 +40,18 @@ make -s ops-outbox-triage       # NA rollup — ручной triage при needs
 ## unknown_result (внешняя отправка)
 
 1. Найти attempt: `GET /stats` (auth) → `send_attempts.unknown_result` или SQL по `send_attempts.status = 'unknown_result'`.
-2. Автоматическая read-only сверка: `POST /send-attempts/{attempt_id}/reconcile` (auth). Inbox — поиск текста в thread Kwork; proposal — проверка страницы проекта (или `dry_run` metadata).
-3. При `outcome=confirmed` attempt переходит в `confirmed_sent` без повторной отправки. При `inconclusive` — ручной разбор, не слепой retry.
-4. Если `not_found` — новая версия/approval и новый idempotency key через обычный flow.
-5. Commit failure после успеха на площадке оставляет `unknown_result` (`commit_failed_after_platform_success`); повтор approve не шлёт снова до сверки.
+2. Исторические строки **`commit_failed_after_platform_success: simulated`** (окт. 2025): без повторной отправки — `PYTHONPATH=. python scripts/ops_reconcile_legacy_simulated_unknown.py` (dry-run), затем с **`JOBPILOT_OPERATOR_LEGACY_SIMULATED_UNKNOWN=1`** и **`--apply`** только на working `jobpilot_ai` после review списка.
+3. Прочие `unknown_result` — read-only reconcile или ручной разбор; blind resubmit запрещён.
+4. Автоматическая read-only сверка: `POST /send-attempts/{attempt_id}/reconcile` (auth). Inbox — поиск текста в thread Kwork; proposal live — owner review (payload-specific receipt).
+5. При `outcome=confirmed` attempt переходит в `confirmed_sent` без повторной отправки. При `inconclusive` — ручной разбор, не слепой retry.
+6. Если `not_found` — новая версия/approval и новый idempotency key через обычный flow.
+7. Commit failure после успеха на площадке оставляет `unknown_result`; повтор approve не шлёт снова до сверки.
 
 ## Recovery notification outbox
 
-- Pending с большим `oldest_pending_age_seconds` в `/stats`: проверить Telegram token, сеть, логи `deliver_notification_outbox`.
+- Pending с большим `oldest_pending_age_seconds` в `/stats` → `ops.notification_outbox`: проверить Telegram token, сеть, логи `deliver_notification_outbox`.
+- `jobs.oldest_retryable_age_seconds` растёт при застрявших `retryable_error` — beat/worker, LLM provider, `processing_next_attempt_at`.
+- `last_success` (`confirmed_external_send_at`, `notification_outbox_sent_at`) — ориентир последней подтверждённой внешней отправки и доставки outbox; не заменяет сверку `unknown_result`.
 - `needs_attention` — ручной разбор `last_error`, затем сброс статуса или повтор по политике в `docs/inbox-outbox-policy.md`. Read-only: `make -s ops-outbox-triage` (JSON rollup), `ops_outbox_triage_markdown_bundle.py` → файл для оператора, `ops_working_db_preflight.py`, детали — `docs/operator-outbox-needs-attention.md`.
 
 ## Recovery processing jobs
@@ -66,7 +74,7 @@ JOBPILOT_DRILL_DB=jobpilot_ai_drill ./scripts/restore_postgres_drill.sh ./backup
 
 ## Remediation / live Kwork
 
-Автоматические gates: `make verify` (см. актуальный счёт в [remediation-checklists.md](remediation-checklists.md)). Отдельная live-приёмка: [owner-live-checklist-one-pager.md](owner-live-checklist-one-pager.md). Backlog: [remediation-progress.md](remediation-progress.md).
+Автоматические gates: `make verify` (счёт в [remediation-plan.md](remediation-plan.md)). Отдельная live-приёмка не заменяет план: [owner-live-checklist-one-pager.md](owner-live-checklist-one-pager.md). Журнал: [remediation-progress.md](remediation-progress.md).
 
 ## Staging drills (backlog)
 

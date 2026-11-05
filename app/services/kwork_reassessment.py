@@ -6,18 +6,25 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 
 from app.config import Settings, get_settings
-from app.db.models import Job, Proposal
+from app.db.models import Job, Proposal, SendAttempt
+from app.db.send_attempt_states import (
+    ATTEMPT_CONFIRMED_SENT,
+    ATTEMPT_NEEDS_ATTENTION,
+    ATTEMPT_SENDING,
+    ATTEMPT_UNKNOWN_RESULT,
+)
 from app.db.session import AsyncSessionLocal
+from app.db.workflow_states import JOB_STATUS_SENT, PROPOSAL_STATUS_SENT
+from app.services.delivery_scope import is_live_confirmed_send_attempt
 from app.services.job_freshness import append_decision_audit, stale_generation_reason
 from app.services.opportunity_policy import (
     kwork_assessment_rejection,
     kwork_job_facts,
     kwork_opportunity_fingerprint,
 )
-from app.services.send_attempt_service import delivery_blocks_mutation
 
 MAX_SOURCE_AGE = timedelta(minutes=15)
 
@@ -35,10 +42,33 @@ def _fresh_source(value: Any) -> bool:
         return False
 
 
+async def _live_delivery_blocks_reassessment(session, job_id: uuid.UUID) -> bool:
+    rows = (
+        await session.scalars(
+            select(SendAttempt).where(
+                SendAttempt.job_id == job_id,
+                SendAttempt.status.in_(
+                    (
+                        ATTEMPT_SENDING,
+                        ATTEMPT_UNKNOWN_RESULT,
+                        ATTEMPT_NEEDS_ATTENTION,
+                        ATTEMPT_CONFIRMED_SENT,
+                    )
+                ),
+            )
+        )
+    ).all()
+    for row in rows:
+        if row.status == ATTEMPT_CONFIRMED_SENT and not is_live_confirmed_send_attempt(row):
+            continue
+        return True
+    return False
+
+
 async def _block_reason(session, job: Job, settings: Settings) -> str | None:
     if job.platform != 'kwork':
         return 'not_kwork'
-    if job.status in ('sent', 'sending') or job.processing_claim_token:
+    if job.status in (JOB_STATUS_SENT, 'sending') or job.processing_claim_token:
         return 'protected_or_processing'
     if stale_generation_reason(job, settings):
         return 'job_expired_or_stale'
@@ -46,9 +76,9 @@ async def _block_reason(session, job: Job, settings: Settings) -> str | None:
         return 'source_refresh_required'
     sent = await session.scalar(select(Proposal.id).where(
         Proposal.job_id == job.id,
-        or_(Proposal.status == 'sent', Proposal.sent_at.is_not(None)),
+        Proposal.status == PROPOSAL_STATUS_SENT,
     ).limit(1))
-    if sent or await delivery_blocks_mutation(session, job_id=job.id, include_confirmed=True):
+    if sent or await _live_delivery_blocks_reassessment(session, job.id):
         return 'delivery_requires_resolution'
     return None
 
@@ -106,5 +136,18 @@ async def reassess_kwork_job(
         job.raw_data = {**raw, 'opportunity_assessment': assessment}
         append_decision_audit(job, action='reassessed',
                               reason='accepted' if relevant else 'rejected', source='operator')
+        from app.services.operator_override_journal import record_operator_override
+
+        await record_operator_override(
+            session,
+            action="reassess_opportunity",
+            actor_source="operator",
+            reference_type="job",
+            reference_id=job.id,
+            detail={
+                "outcome": "accepted" if relevant else "rejected",
+                "assessment_id": assessment.get("assessment_id"),
+            },
+        )
         await session.commit()
     return {'status': 'accepted' if relevant else 'rejected', 'assessment_id': assessment['assessment_id']}

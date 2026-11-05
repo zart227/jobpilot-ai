@@ -11,13 +11,30 @@ from app.db.session import AsyncSessionLocal
 from app.db.workflow_states import (
     JOB_STATUS_FILTERED,
     JOB_STATUS_SCORED,
+    PROPOSAL_SUBMITTED_STATUSES,
     job_allows_pipeline_persist,
+    job_is_submitted,
+    proposal_is_submitted,
 )
 from app.memory.qdrant_store import get_memory_store
 from app.schemas.job import NormalizedJob
 from app.services.send_attempt_service import delivery_blocks_mutation
 
 logger = structlog.get_logger(__name__)
+
+
+def _transition_job_status(job: Job, new_status: str) -> None:
+    from app.db.status_transitions import allows_job_processing_transition
+
+    if not allows_job_processing_transition(job.status, new_status):
+        logger.warning(
+            "Rejected job processing status transition",
+            job_id=str(job.id),
+            previous=job.status,
+            new_status=new_status,
+        )
+        return
+    job.status = new_status
 
 
 async def _upsert_kwork_client(session, info):
@@ -203,7 +220,7 @@ class JobPipelineService:
                 select(Proposal.id)
                 .where(
                     Proposal.job_id == job_id,
-                    Proposal.status == "sent",
+                    Proposal.status.in_(PROPOSAL_SUBMITTED_STATUSES),
                 )
                 .limit(1)
             )
@@ -233,10 +250,10 @@ class JobPipelineService:
 
             sent_proposal = await session.scalar(
                 select(Proposal.id)
-                .where(Proposal.job_id == job_id, Proposal.status == "sent")
+                .where(Proposal.job_id == job_id, Proposal.status.in_(PROPOSAL_SUBMITTED_STATUSES))
                 .limit(1)
             )
-            if job.status == "sent" or sent_proposal is not None:
+            if job_is_submitted(job.status) or sent_proposal is not None:
                 logger.info("JobPilot AI skip pipeline: job already sent", job_id=str(job_id))
                 return None
 
@@ -284,13 +301,13 @@ class JobPipelineService:
                     reason=str(state.get("relevance_reason") or "not relevant"),
                     source=str(state.get("filter_source") or "pipeline"),
                 )
-                job.status = JOB_STATUS_FILTERED
+                _transition_job_status(job, JOB_STATUS_FILTERED)
             elif state.get("score") is not None and state.get("score") >= threshold:
-                job.status = JOB_STATUS_SCORED
+                _transition_job_status(job, JOB_STATUS_SCORED)
             elif state.get("score") is not None:
-                job.status = JOB_STATUS_FILTERED
+                _transition_job_status(job, JOB_STATUS_FILTERED)
             else:
-                job.status = JOB_STATUS_FILTERED
+                _transition_job_status(job, JOB_STATUS_FILTERED)
 
             job.processing_claim_owner = None
             job.processing_claim_token = None
@@ -326,7 +343,7 @@ class JobPipelineService:
                 session.add(proposal)
                 await session.flush()
                 proposal_id = proposal.id
-                job.status = "pending_approval"
+                _transition_job_status(job, "pending_approval")
                 settings = get_settings()
                 try:
                     target_chat = int(settings.telegram_admin_chat_id)
@@ -404,7 +421,7 @@ class JobPipelineService:
             if not job:
                 return None
 
-            if job.status == "sent" or await delivery_blocks_mutation(
+            if job_is_submitted(job.status) or await delivery_blocks_mutation(
                 session, job_id=job_id, include_confirmed=True
             ):
                 return None
@@ -422,7 +439,9 @@ class JobPipelineService:
                 if proposal
                 else None
             )
-            if current_revision != original_revision or (proposal and proposal.status == "sent"):
+            if current_revision != original_revision or (
+                proposal and proposal_is_submitted(proposal.status)
+            ):
                 logger.info("Discarding stale proposal regeneration", job_id=str(job_id))
                 return None
             if proposal:
@@ -442,7 +461,7 @@ class JobPipelineService:
                 )
                 session.add(proposal)
 
-            job.status = "pending_approval"
+            _transition_job_status(job, "pending_approval")
             await session.flush()
             proposal_id = proposal.id
             await session.commit()

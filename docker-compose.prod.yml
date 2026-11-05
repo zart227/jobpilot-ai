@@ -1,24 +1,29 @@
 # Production overrides: no --reload, restart policies, image-only app code.
 # Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+# !override replaces dev bind mounts (./app, alembic, scripts) with data-only.
 
 services:
     api:
         command: uvicorn app.main:app --host 0.0.0.0 --port 8000
         restart: unless-stopped
-        volumes:
+        environment:
+            APP_ENV: production
+        volumes: !override
             - ./data:/app/data
 
     celery-worker:
         restart: unless-stopped
-        volumes:
+        volumes: !override
             - ./data:/app/data
+            - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro
 
     celery-beat:
         restart: unless-stopped
-        volumes:
+        volumes: !override
             - ./data:/app/data
 
     telegram-bot:
         restart: unless-stopped
-        volumes:
+        volumes: !override
             - ./data:/app/data
+            - /home/arthur/vfs-visa-bot/output/proxy-lists:/app/proxy-lists:ro

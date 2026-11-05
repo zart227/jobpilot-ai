@@ -67,8 +67,11 @@ def test_format_client_message_alert_needs_context() -> None:
         msg,
         needs_context=True,
         candidate_job_count=3,
+        inbound_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     )
     assert "Нужен выбор заказа" in text
+    assert "bind-job" in text
+    assert "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in text
 
 
 def test_unknown_project_does_not_claim_two_matching_jobs() -> None:

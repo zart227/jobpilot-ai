@@ -3,6 +3,7 @@ import uuid
 import pytest
 
 from app.db.outcome_states import (
+    allows_transition,
     default_event_key,
     validate_outcome_status,
 )
@@ -22,3 +23,9 @@ def test_default_event_key_stable() -> None:
     assert default_event_key(job_id, proposal_id, "hired") != default_event_key(
         job_id, proposal_id, "replied"
     )
+
+
+def test_allows_transition_blocks_obvious_downgrade() -> None:
+    assert allows_transition("replied", "hired") is True
+    assert allows_transition("hired", "ignored") is False
+    assert allows_transition(None, "replied") is True

@@ -32,8 +32,7 @@ def test_generation_attempts_parser(meta, expected):
 def test_inventory_requires_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
@@ -46,8 +45,7 @@ def test_inventory_requires_database_url(monkeypatch):
 @pytest.mark.skipif(os.environ.get("JOBPILOT_INTEGRATION_TESTS") != "1", reason="isolated DB required")
 def test_inventory_json_shape(monkeypatch):
     monkeypatch.setenv("JOBPILOT_WORKING_DATABASE_URL", os.environ["DATABASE_URL"])
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

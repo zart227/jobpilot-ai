@@ -75,7 +75,10 @@ async def test_proposal_send_dry_run_records_confirmed_sent(platform_dry_run) ->
     async with AsyncSessionLocal() as session:
         proposal = await session.get(Proposal, proposal_id)
         assert proposal is not None
-        assert proposal.status == "sent"
+        assert proposal.status == "simulated_sent"
+        job = await session.get(Job, job_id)
+        assert job is not None
+        assert job.status == "simulated_sent"
         result = await session.execute(
             select(SendAttempt).where(
                 SendAttempt.proposal_id == proposal_id,

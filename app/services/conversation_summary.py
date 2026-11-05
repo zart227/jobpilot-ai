@@ -43,15 +43,25 @@ def _older_turns_fingerprint(turns: list[dict[str, str]]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _normalize_thread_scope(thread_scope: str | None) -> str:
+    return (thread_scope or "").strip()
+
+
+def _cache_matches_scope(cached: dict, thread_scope: str | None) -> bool:
+    return _normalize_thread_scope(cached.get("thread_scope")) == _normalize_thread_scope(thread_scope)
+
+
 def _set_summary_cache(
     job: Job,
     *,
+    thread_scope: str | None,
     older_turn_count: int,
     older_turn_fingerprint: str,
     text: str,
 ) -> None:
     raw = dict(job.raw_data or {})
     raw[SUMMARY_CACHE_KEY] = {
+        "thread_scope": _normalize_thread_scope(thread_scope),
         "older_turn_count": older_turn_count,
         "older_turn_fingerprint": older_turn_fingerprint,
         "text": text.strip(),
@@ -92,6 +102,8 @@ async def build_conversation_context(
     session,
     job: Job,
     turns: list[dict[str, str]],
+    *,
+    thread_scope: str | None = None,
 ) -> str:
     if not turns:
         return "(ранее сообщений не было)"
@@ -106,8 +118,10 @@ async def build_conversation_context(
     recent = turns[-RECENT_TURNS:]
     older_fp = _older_turns_fingerprint(older)
     cached = _get_summary_cache(job)
+    summary = ""
     if (
-        cached.get("older_turn_count") == len(older)
+        _cache_matches_scope(cached, thread_scope)
+        and cached.get("older_turn_count") == len(older)
         and cached.get("older_turn_fingerprint") == older_fp
         and cached.get("text")
     ):
@@ -121,6 +135,7 @@ async def build_conversation_context(
             if summary:
                 _set_summary_cache(
                     job,
+                    thread_scope=thread_scope,
                     older_turn_count=len(older),
                     older_turn_fingerprint=older_fp,
                     text=summary,

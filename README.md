@@ -1,6 +1,6 @@
 # JobPilot AI
 
-> Статус30.10.2026: remediation не завершена (51/115 подтверждено, 64 открыто). См. [повторный аудит](docs/audit-2026-10-14.md) и [минимальный запуск](docs/remediation-plan.md#минимальный-запуск-в-работу-30102026). Dry-run signoff не означает live-приёмку.
+> **Статус 05.11.2026:** remediation **не завершена** (**111/115** подтверждено, **4** открыто). Единственный источник: [план и чеклисты](docs/remediation-plan.md). Dry-run / simulation signoff **не** означает live-приёмку или release approval.
 
 AI-powered freelance automation system for a single developer. JobPilot AI scrapes job boards, filters and scores opportunities with AI, generates personalized proposals, routes them through Telegram for human approval, sends approved proposals, handles client chat, and learns from outcomes.
 
@@ -47,7 +47,9 @@ Edit `.env` and set:
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` — if using those providers
 - `CURSOR_API_KEY` + `LLM_PROVIDER=cursor` — [Cursor SDK](https://cursor.com/docs/sdk/python) (recommended)
 - `TELEGRAM_BOT_TOKEN` — from [@BotFather](https://t.me/BotFather)
-- `TELEGRAM_ADMIN_CHAT_ID` — your Telegram user/chat ID
+- `TELEGRAM_ADMIN_CHAT_ID` — allowed chat (private chat ID or group ID)
+- `TELEGRAM_ADMIN_USER_ID` — **required in groups**; in private chat must match your user ID
+- `API_AUTH_TOKEN` — required for network API data/control routes (`/jobs`, `/stats`, `/scrape/trigger`, …)
 - `DEVELOPER_*` — your profile for proposal generation
 - Scraper URLs and credentials (Kwork optional)
 
@@ -67,29 +69,32 @@ docker compose up --build
 
 Services:
 
-| Service       | Port | Description                                       |
-| ------------- | ---- | ------------------------------------------------- |
-| api           | 8000 | FastAPI REST API                                  |
+| Service       | Port | Description                                              |
+| ------------- | ---- | -------------------------------------------------------- |
+| api           | 8000 | FastAPI REST API                                         |
 | postgres      | 5434 | Structured data (host `127.0.0.1:5434` → container 5432) |
-| redis         | 6379 | Celery broker                                     |
-| qdrant        | 6333 | Vector memory                                     |
-| celery-worker | —    | Scraping + pipeline jobs                          |
-| celery-beat   | —    | Periodic scraping                                 |
-| telegram-bot  | —    | Approval UI                                       |
+| redis         | 6379 | Celery broker                                            |
+| qdrant        | 6333 | Vector memory                                            |
+| celery-worker | —    | Scraping + pipeline jobs                                 |
+| celery-beat   | —    | Periodic scraping                                        |
+| telegram-bot  | —    | Approval UI                                              |
 
 ### Remediation & release gates
 
-Automated remediation checklists are documented in [docs/remediation-closeout.md](docs/remediation-closeout.md). Before a permitted live Kwork send:
+Automated remediation checklists are in [docs/remediation-plan.md](docs/remediation-plan.md). Before a permitted live Kwork send:
 
 ```bash
-make verify        # checklist + audit + unit tests
-make autonomous    # full local run: ruff, 176 pytest, drills, rollout smoke
-make audit-status  # regenerate docs/audit-remediation-matrix.md
-make drill         # staging drills: audit, preflight, cursor-bridge policy, /ready
-make redis-drill   # stop redis → /ready 503 → recover (local compose)
-make dependency-drill  # same for postgres
-make rollout       # preflight + alembic + smoke (on DB copy / staging)
+make verify           # checklist gates + audit matrix + unit pytest (see remediation_verify.sh)
+make secret-scan      # tracked-files secret patterns (C015)
+make autonomous       # full local remediation script (integration opt-in via env)
+make audit-status     # regenerate docs/audit-remediation-matrix.md
+make drill            # staging drills: audit, preflight, cursor-bridge policy, /ready
+make redis-drill      # stop redis → /ready 503 → recover (local compose)
+make dependency-drill # same for postgres
+make rollout          # preflight + alembic + smoke (on DB copy / staging)
 ```
+
+Release is **not** accepted while checklist items remain open (`REMEDIATION_MAX_OPEN=0 make checklist-gate` must fail until remediation is complete).
 
 Integration tests must use a separate PostgreSQL database whose name ends in
 `_test`. Set `DATABASE_URL` explicitly, and set `REDIS_URL`, `CELERY_BROKER_URL`
@@ -115,9 +120,13 @@ Operational docs: [docs/runbook.md](docs/runbook.md), [docs/ops-logging-policy.m
 
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8000/stats
-curl -X POST http://localhost:8000/scrape/trigger
+curl http://localhost:8000/ready
+# Data/control routes require API_AUTH_TOKEN (503 if token unset, 401 if wrong):
+curl -H "Authorization: Bearer $API_AUTH_TOKEN" http://localhost:8000/stats
+curl -H "Authorization: Bearer $API_AUTH_TOKEN" -X POST http://localhost:8000/scrape/trigger
 ```
+
+Kwork listing pause (connects budget): `KWORK_PAUSE_ENABLED`, `KWORK_PAUSE_AUTO`, `KWORK_PAUSE_CHECK_INTERVAL_HOURS` — see `.env.example`.
 
 ### 4. Telegram workflow
 
@@ -160,18 +169,18 @@ If bridge stops, restart: `python scripts/run_cursor_bridge.py` then `docker com
 
 ## API Endpoints
 
-| Method | Path                 | Description               |
-| ------ | -------------------- | ------------------------- |
-| GET    | `/health`            | Liveness (no deps)        |
-| GET    | `/ready`             | Readiness (Postgres, Redis; Qdrant optional) |
-| GET    | `/jobs`              | List jobs                 |
-| GET    | `/jobs/{id}`         | Job details               |
-| POST   | `/jobs/{id}/process` | Re-run pipeline for job   |
-| POST   | `/scrape/trigger`    | Manual scrape             |
-| POST   | `/chat`              | Client reply → ChatAgent  |
-| POST   | `/outcomes/{id}`     | Record outcome + learning |
-| GET    | `/stats`             | System statistics         |
-| POST   | `/send-attempts/{id}/reconcile` | Read-only reconcile after `unknown_result` (auth) |
+| Method | Path                            | Description                                  |
+| ------ | ------------------------------- | -------------------------------------------- |
+| GET    | `/health`                       | Liveness (no deps)                           |
+| GET    | `/ready`                        | Readiness (Postgres, Redis; Qdrant optional) |
+| GET    | `/jobs`                         | List jobs (**auth**)                         |
+| GET    | `/jobs/{id}`                    | Job details (**auth**)                       |
+| POST   | `/jobs/{id}/process`            | Re-run pipeline (**auth**)                   |
+| POST   | `/scrape/trigger`               | Manual scrape (**auth**)                     |
+| POST   | `/chat`                         | Client reply → ChatAgent (**auth**)          |
+| POST   | `/outcomes/{id}`                | Record outcome + learning (**auth**)         |
+| GET    | `/stats`                        | System statistics (**auth**)                 |
+| POST   | `/send-attempts/{id}/reconcile` | Reconcile after `unknown_result` (**auth**)  |
 
 ## Reward System
 
@@ -186,12 +195,12 @@ LearningAgent adjusts scoring weights and stores successful proposals in Qdrant.
 
 ## Scrapers
 
-| Platform | `ENABLED_SCRAPERS` | Status |
-| -------- | ------------------ | ------ |
-| Kwork | `kwork` | Supported (Playwright listing + optional login) |
-| Generic | `generic` | Configurable CSS selectors via `GENERIC_SCRAPER_*` |
-| Upwork | `upwork` | Experimental — may require manual fixes |
-| FL.ru | `fl_ru` | Experimental — may require manual fixes |
+| Platform | `ENABLED_SCRAPERS` | Status                                             |
+| -------- | ------------------ | -------------------------------------------------- |
+| Kwork    | `kwork`            | Supported (Playwright listing + optional login)    |
+| Generic  | `generic`          | Configurable CSS selectors via `GENERIC_SCRAPER_*` |
+| Upwork   | `upwork`           | Experimental — may require manual fixes            |
+| FL.ru    | `fl_ru`            | Experimental — may require manual fixes            |
 
 ## Adding a Scraper
 
@@ -231,7 +240,6 @@ MIT
 
 `OLLAMA_MODEL=nemotron-3-nano:30b` используется для фильтрации, обучения и сводок переписки. `OLLAMA_SCORING_MODEL=gpt-oss:120b` используется для оценки заказов. Отклики, ответы клиентам и правки текстов используют основной `LLM_PROVIDER=openai` и существующий `OPENAI_MODEL`. При исчерпании лимита Ollama оценка переключается на `OPENAI_MODEL`, рутина на `OPENAI_SIMPLE_MODEL`, если включён `OLLAMA_AUTO_FALLBACK`. После изменения настроек перезапустите приложение и Celery workers.
 
-
 ### OpenRouter и бесплатные модели
 
 Для бесплатной фильтрации, обучения и сводок задайте в `.env`:
@@ -247,10 +255,10 @@ OPENROUTER_FALLBACK_TO_OLLAMA=true
 
 **Режимы выбора модели**
 
-| Значение | Поведение |
-| -------- | --------- |
-| `auto` или `openrouter/free` | Сервис запрашивает `GET /api/v1/models`, выбирает модель с **нулевыми prompt и completion** в `pricing` (остальные поля pricing, если присутствуют, тоже должны быть 0) и достаточным text-контекстом. Список кэшируется (`OPENROUTER_MODELS_CACHE_SECONDS`). |
-| Явный id (`vendor/model:free`) | Модель передаётся в API как есть; авто-проверка цены не выполняется — ответственность оператора. |
+| Значение                       | Поведение                                                                                                                                                                                                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auto` или `openrouter/free`   | Сервис запрашивает `GET /api/v1/models`, выбирает модель с **нулевыми prompt и completion** в `pricing` (остальные поля pricing, если присутствуют, тоже должны быть 0) и достаточным text-контекстом. Список кэшируется (`OPENROUTER_MODELS_CACHE_SECONDS`). |
+| Явный id (`vendor/model:free`) | Модель передаётся в API как есть; авто-проверка цены не выполняется — ответственность оператора.                                                                                                                                                              |
 
 Суффикс `:free` **не** считается доказательством бесплатности в автоматическом режиме.
 

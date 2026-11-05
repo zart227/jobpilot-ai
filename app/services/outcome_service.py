@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from app.db.models import Job, Outcome, Proposal, Reward, SendAttempt
 from app.db.outcome_states import (
     ALL_OUTCOME_STATUSES,
+    allows_transition,
     default_event_key,
     validate_outcome_status,
 )
@@ -23,6 +24,17 @@ from app.services.conversation_context_service import (
 from app.services.reward_constants import REWARD_MAP
 
 logger = structlog.get_logger(__name__)
+
+LEARNING_REQUIRES_SENT_SNAPSHOT = frozenset({"replied", "hired"})
+
+
+@dataclass(frozen=True)
+class SentProposalLearningContext:
+    proposal_id: uuid.UUID | None
+    content: str | None
+    version: int | None
+    confirmed_sent: bool
+
 
 
 @dataclass
@@ -46,15 +58,31 @@ async def latest_outcome_status(session, job_id: uuid.UUID) -> str | None:
     return str(row) if row else None
 
 
+async def _existing_outcome_for_stage(
+    session,
+    *,
+    job_id: uuid.UUID,
+    proposal_id: uuid.UUID | None,
+    status: str,
+) -> Outcome | None:
+    query = select(Outcome).where(Outcome.job_id == job_id, Outcome.status == status)
+    if proposal_id is None:
+        query = query.where(Outcome.proposal_id.is_(None))
+    else:
+        query = query.where(Outcome.proposal_id == proposal_id)
+    result = await session.execute(query.limit(1))
+    return result.scalar_one_or_none()
+
+
 async def sent_proposal_for_learning(
     session,
     proposal_id: uuid.UUID | None,
-) -> tuple[uuid.UUID | None, str, int | None]:
+) -> SentProposalLearningContext:
     if not proposal_id:
-        return None, "", None
+        return SentProposalLearningContext(None, None, None, False)
     proposal = await session.get(Proposal, proposal_id)
     if not proposal:
-        return None, "", None
+        return SentProposalLearningContext(None, None, None, False)
 
     attempt_result = await session.execute(
         select(SendAttempt)
@@ -66,9 +94,14 @@ async def sent_proposal_for_learning(
         .limit(1)
     )
     attempt = attempt_result.scalar_one_or_none()
-    if attempt:
-        return proposal_id, attempt.snapshot_content, attempt.snapshot_version
-    return proposal_id, proposal.content or "", proposal.version
+    if not attempt or not (attempt.snapshot_content or "").strip():
+        return SentProposalLearningContext(proposal_id, None, None, False)
+    return SentProposalLearningContext(
+        proposal_id,
+        attempt.snapshot_content,
+        attempt.snapshot_version,
+        True,
+    )
 
 
 async def build_learning_state(
@@ -85,13 +118,24 @@ async def build_learning_state(
             return {}
         state = {"job_id": str(job_id), "job_data": {"platform": job.platform}}
 
-    pid, content, version = await sent_proposal_for_learning(session, proposal_id)
-    if pid:
-        state["proposal_id"] = str(pid)
-    if content:
-        state["proposal_content"] = content
-    if version is not None:
-        state["proposal_version"] = version
+    ctx = await sent_proposal_for_learning(session, proposal_id)
+    if status in LEARNING_REQUIRES_SENT_SNAPSHOT:
+        if not ctx.confirmed_sent or not ctx.content or ctx.version is None or not ctx.proposal_id:
+            logger.warning(
+                "Learning skipped: confirmed send snapshot required for outcome",
+                job_id=str(job_id),
+                status=status,
+                proposal_id=str(proposal_id) if proposal_id else None,
+            )
+            return {}
+        state["proposal_id"] = str(ctx.proposal_id)
+        state["proposal_content"] = ctx.content
+        state["proposal_version"] = ctx.version
+    elif ctx.confirmed_sent and ctx.content and ctx.proposal_id:
+        state["proposal_id"] = str(ctx.proposal_id)
+        state["proposal_content"] = ctx.content
+        if ctx.version is not None:
+            state["proposal_version"] = ctx.version
     state["outcome_status"] = status
     return state
 
@@ -105,14 +149,23 @@ async def record_outcome(
     notes: str | None = None,
     event_key: str | None = None,
     allow_internal: bool = False,
+    allow_correction: bool = False,
 ) -> OutcomeRecordResult:
     normalized = validate_outcome_status(status, allow_internal=allow_internal)
     if normalized not in ALL_OUTCOME_STATUSES:
         raise ValueError(f"unsupported outcome status: {status}")
 
-    key = (event_key or default_event_key(str(job_id), str(proposal_id) if proposal_id else None, normalized)).strip()
+    default_key = default_event_key(
+        str(job_id), str(proposal_id) if proposal_id else None, normalized
+    )
+    key = (event_key or default_key).strip()
     if not key:
         raise ValueError("event_key is required")
+
+    if not allow_correction:
+        previous = await latest_outcome_status(session, job_id)
+        if not allows_transition(previous, normalized):
+            raise ValueError(f"outcome transition not allowed: {previous} -> {normalized}")
 
     existing = await session.execute(select(Outcome).where(Outcome.event_key == key))
     prior = existing.scalar_one_or_none()
@@ -124,6 +177,22 @@ async def record_outcome(
             outcome_id=prior.id,
             event_key=key,
             status=prior.status,
+        )
+
+    stage_prior = await _existing_outcome_for_stage(
+        session,
+        job_id=job_id,
+        proposal_id=proposal_id,
+        status=normalized,
+    )
+    if stage_prior:
+        return OutcomeRecordResult(
+            created=False,
+            duplicate=True,
+            reward=int(stage_prior.reward or 0),
+            outcome_id=stage_prior.id,
+            event_key=stage_prior.event_key,
+            status=stage_prior.status,
         )
 
     reward_value = REWARD_MAP.get(normalized, 0)
@@ -186,6 +255,7 @@ async def record_outcome_and_learn(
     notes: str | None = None,
     event_key: str | None = None,
     allow_internal: bool = False,
+    allow_correction: bool = False,
     run_learning: bool = True,
 ) -> OutcomeRecordResult:
     from app.agents.learning_agent import LearningAgent
@@ -198,6 +268,7 @@ async def record_outcome_and_learn(
         notes=notes,
         event_key=event_key,
         allow_internal=allow_internal,
+        allow_correction=allow_correction,
     )
     await session.commit()
 

@@ -20,6 +20,15 @@
 
 Перед запуском карточка должна быть заново получена scraper и сохранена не более 15 минут назад, с подтверждёнными показателями покупателя и полным описанием. Старая дата создания/истекший срок, уже отправленный заказ, активная обработка или неопределённая отправка блокируют операцию. Если текущий scrape не нашёл карточку, команда не считает старую запись свежей.
 
+**Обновление listing (03.11):** если заказ уже не на текущих страницах категории, используйте fallback со страницы проекта:
+
+```bash
+DATABASE_URL='postgresql+asyncpg://…/jobpilot_ai' \
+  python scripts/ops_refresh_kwork_job_listing.py JOB_UUID --apply
+```
+
+Скрипт не вызывает LLM и не шлёт Telegram. После `--apply` при `assessment_stale` / `assessment_required` — `reassess_kwork_job.py`, затем `/rereview` или `ops_queue_review_reissue.py` (см. [operator-review-reissue.md](operator-review-reissue.md)). Проверка «можно ли откликнуться» на Kwork без отправки: `scripts/ops_probe_kwork_projects.py PROJECT_ID …`.
+
 После явной установки `DATABASE_URL` и проверки подключённого LLM операционная команда выглядит так:
 
 ```bash

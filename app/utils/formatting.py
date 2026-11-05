@@ -162,6 +162,15 @@ def sanitize_proposal_text(text: str) -> str:
 
 KWORK_MIN_OFFER_CHARS = 150
 KWORK_MAX_OFFER_CHARS = 2000
+KWORK_OFFER_TITLE_MAX = 80
+
+
+def normalize_kwork_offer_title(title: str) -> str:
+    """Single-line offer title for Kwork new_offer forms (shown in Telegram snapshot)."""
+    text = re.sub(r"\s+", " ", (title or "").strip())
+    if len(text) < 5:
+        text = (text or "Отклик на заказ")[:KWORK_OFFER_TITLE_MAX]
+    return text[:KWORK_OFFER_TITLE_MAX]
 
 KWORK_GENERIC_PHRASES = (
     "имею большой опыт",

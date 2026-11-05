@@ -249,7 +249,12 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
                 "proposal_content": parsed["proposal"],
                 "execution_plan": parsed["execution_plan"],
                 "timeline": parsed["timeline"],
-                "llm_stage_log": append_stage_log(state, "proposal", "main"),
+                "llm_stage_log": append_stage_log(
+                    state,
+                    "proposal",
+                    "main",
+                    usage=self._llm.consume_last_call_usage(),
+                ),
             }
         except Exception as exc:
             logger.error("ProposalAgent failed", error=str(exc))
@@ -260,7 +265,6 @@ Write a completely unique {"Kwork offer" if is_kwork else "proposal"} for this s
                 "proposal_content": "",
                 "execution_plan": "",
                 "timeline": "",
-                "llm_stage_log": append_stage_log(state, "proposal", "main"),
             }
 
     def _parse_response(self, response: str) -> dict:

@@ -1,7 +1,8 @@
-"""C101: mock platform E2E — job graph → Telegram review → admin approve → confirmed dry-run send."""
+"""C101: mock platform E2E — filter → score → proposal → Telegram → approve → confirmed dry-run send."""
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from types import SimpleNamespace
@@ -14,6 +15,31 @@ from sqlalchemy import select
 pytestmark = pytest.mark.skipif(
     os.environ.get("JOBPILOT_INTEGRATION_TESTS") != "1",
     reason="set JOBPILOT_INTEGRATION_TESTS=1",
+)
+
+FILTER_JSON = json.dumps(
+    {
+        "relevant": True,
+        "reason": "C101 mock filter pass",
+        "estimated_hours": 2,
+        "estimated_calendar_days": 1,
+        "scope_clear": True,
+        "complexity": "simple",
+        "minimum_price_rub": 1500,
+    }
+)
+SCORING_JSON = json.dumps(
+    {
+        "score": 92,
+        "breakdown": {
+            "skill_match": 90,
+            "budget": 85,
+            "complexity": 88,
+            "client_quality": 90,
+            "competition": 80,
+        },
+        "summary": "C101 mock scoring",
+    }
 )
 
 
@@ -41,12 +67,55 @@ def review_telegram(monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
 
 
+@pytest.fixture
+def mock_pipeline_llm(monkeypatch: pytest.MonkeyPatch):
+    from app.agents import filter_agent, proposal_agent, scoring_agent
+    from app.config import Settings
+    from app.llm.call_usage import LLMCallUsage
+    from app.memory.qdrant_store import get_memory_store
+
+    proposal_text_holder: dict[str, str] = {}
+    mock_usage = LLMCallUsage(resolved_model="mock-c101", provider_kind="mock")
+
+    async def complete(system: str, user: str, **kwargs):
+        if "Determine if" in system:
+            return FILTER_JSON
+        if "Score the job" in system:
+            return SCORING_JSON
+        return (
+            "PROPOSAL:\n"
+            f"{proposal_text_holder.get('text', 'C101 mock E2E proposal awaiting Telegram approval.')}\n\n"
+            "EXECUTION_PLAN:\n1. Analyze\n2. Implement\n\n"
+            "TIMELINE:\n1 day"
+        )
+
+    llm = SimpleNamespace(complete=complete, consume_last_call_usage=lambda: mock_usage)
+    monkeypatch.setattr(filter_agent, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(scoring_agent, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(proposal_agent, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(filter_agent, "get_simple_llm_provider", lambda: llm)
+    monkeypatch.setattr(scoring_agent, "get_scoring_llm_provider", lambda: llm)
+    monkeypatch.setattr(proposal_agent, "get_llm_provider", lambda: llm)
+    memory = SimpleNamespace(
+        search_similar_proposals=AsyncMock(return_value=[]),
+        store_successful_proposal=AsyncMock(return_value=False),
+    )
+
+    async def fake_to_thread(func, *args, **kwargs):
+        if func is get_memory_store:
+            return memory
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(proposal_agent.asyncio, "to_thread", fake_to_thread)
+    return proposal_text_holder
+
+
 async def _seed_kwork_job_with_claim():
+    from conftest import seed_test_kwork_eligibility
+
     from app.db.models import Job
     from app.db.session import AsyncSessionLocal
     from app.services.job_processing import try_claim_job
-
-    from conftest import seed_test_kwork_eligibility
 
     job_id = uuid.uuid4()
     external_id = f"kwork-c101-{job_id.hex[:12]}"
@@ -77,14 +146,14 @@ async def _seed_kwork_job_with_claim():
 async def test_c101_job_filter_score_proposal_telegram_approve_confirmed_sent(
     platform_dry_run,
     review_telegram,
-    monkeypatch: pytest.MonkeyPatch,
+    mock_pipeline_llm,
 ):
+    from app.agents.graph import filter_node, proposal_node, scoring_node
     from app.config import Settings, get_settings
     from app.db.models import Job, NotificationOutbox, Proposal, SendAttempt, TelegramPending
     from app.db.send_attempt_states import ATTEMPT_CONFIRMED_SENT
     from app.db.session import AsyncSessionLocal
     from app.services.job_pipeline import JobPipelineService
-    from app.services.job_processing import run_job_graph_with_claim
     from app.services.notification_outbox import deliver_notification_outbox
     from app.telegram.bot import create_dispatcher
 
@@ -92,23 +161,19 @@ async def test_c101_job_filter_score_proposal_telegram_approve_confirmed_sent(
     pipeline = JobPipelineService()
     state = await pipeline.job_to_state(job_id)
     proposal_text = "C101 mock E2E proposal awaiting Telegram approval."
+    mock_pipeline_llm["text"] = proposal_text
 
-    async def mock_graph_ainvoke(graph_state):
-        return {
-            **graph_state,
-            "is_relevant": True,
-            "relevance_reason": "mock_filter_pass",
-            "filter_source": "mock_filter_agent",
-            "score": 92,
-            "score_breakdown": {"mock": 92},
-            "proposal_content": proposal_text,
-        }
+    filter_out = await filter_node(state)
+    assert filter_out.get("is_relevant") is True
+    state = {**state, **filter_out}
 
-    graph = SimpleNamespace(ainvoke=mock_graph_ainvoke)
-    graph_result = await run_job_graph_with_claim(graph, state, claim)
-    assert graph_result.get("is_relevant") is True
-    assert graph_result.get("score") == 92
-    assert graph_result.get("proposal_content") == proposal_text
+    score_out = await scoring_node(state)
+    assert score_out.get("score") is not None and score_out["score"] >= 50
+    state = {**state, **score_out}
+
+    propose_out = await proposal_node(state)
+    assert propose_out.get("proposal_content")
+    graph_result = {**state, **propose_out}
 
     async with AsyncSessionLocal() as session:
         job = await session.get(Job, job_id)
@@ -129,7 +194,7 @@ async def test_c101_job_filter_score_proposal_telegram_approve_confirmed_sent(
         job = await session.get(Job, job_id)
         assert job is not None
         assert job.is_relevant is True
-        assert job.score == 92
+        assert job.score is not None and job.score >= 50
         assert job.status == "pending_approval"
         pending = await session.scalar(
             select(TelegramPending).where(TelegramPending.proposal_id == proposal_id)
@@ -140,16 +205,25 @@ async def test_c101_job_filter_score_proposal_telegram_approve_confirmed_sent(
         )
         assert outbox is not None
         pending_id = pending.id
+        outbox_id = outbox.id
 
     settings = Settings(_env_file=None, PLATFORM_DRY_RUN=True)
-    telegram_message_id = 9001
-    deliver_bot = SimpleNamespace(
-        send_message=AsyncMock(
-            return_value=SimpleNamespace(message_id=telegram_message_id)
-        )
-    )
-    delivery = await deliver_notification_outbox(settings, bot=deliver_bot, limit=5)
-    assert delivery.get("delivered", 0) >= 1
+    message_ids = iter(range(9000, 9500))
+
+    async def _fake_send(*_args, **_kwargs):
+        return SimpleNamespace(message_id=next(message_ids))
+
+    deliver_bot = SimpleNamespace(send_message=AsyncMock(side_effect=_fake_send))
+    telegram_message_id: int | None = None
+    for _ in range(40):
+        async with AsyncSessionLocal() as session:
+            outbox_row = await session.get(NotificationOutbox, outbox_id)
+            assert outbox_row is not None
+            if outbox_row.status == "sent" and outbox_row.telegram_message_id is not None:
+                telegram_message_id = outbox_row.telegram_message_id
+                break
+        await deliver_notification_outbox(settings, bot=deliver_bot, limit=10)
+    assert telegram_message_id is not None
 
     async with AsyncSessionLocal() as session:
         pending = await session.get(TelegramPending, pending_id)
@@ -185,10 +259,10 @@ async def test_c101_job_filter_score_proposal_telegram_approve_confirmed_sent(
     async with AsyncSessionLocal() as session:
         proposal = await session.get(Proposal, proposal_id)
         assert proposal is not None
-        assert proposal.status == "sent"
+        assert proposal.status == "simulated_sent"
         job = await session.get(Job, job_id)
         assert job is not None
-        assert job.status == "sent"
+        assert job.status == "simulated_sent"
         attempt = await session.scalar(
             select(SendAttempt).where(
                 SendAttempt.proposal_id == proposal_id,

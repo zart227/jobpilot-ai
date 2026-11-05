@@ -30,5 +30,5 @@ fi
 echo ""
 echo "Manual steps still required (checklist):"
 echo "  - docs/kwork-live-acceptance.md"
-echo "  - docs/remediation-checklists.md (сквозная приёмка требует отдельного review критериев и live evidence)"
-echo "  - Record date, test order id, and results in remediation-checklists journal"
+echo "  - docs/remediation-plan.md (сквозная приёмка — критерии этого файла, не отдельный чеклист)"
+echo "  - Record date, test order id, and results in docs/remediation-plan.md"

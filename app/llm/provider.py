@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, PermissionDeniedError
 
 from app.config import Settings, get_settings
+from app.llm.call_usage import LLMCallUsage, usage_from_openai_compat_usage
 from app.llm.errors import LLMErrorKind, LLMServiceError, classify_llm_error
 from app.llm.model_catalog import (
     ModelTask,
@@ -33,6 +34,17 @@ logger = structlog.get_logger(__name__)
 
 
 class LLMProvider(ABC):
+    def __init__(self) -> None:
+        self._last_call_usage: LLMCallUsage | None = None
+
+    def consume_last_call_usage(self) -> LLMCallUsage | None:
+        usage = self._last_call_usage
+        self._last_call_usage = None
+        return usage
+
+    def _set_last_call_usage(self, usage: LLMCallUsage | None) -> None:
+        self._last_call_usage = usage
+
     @abstractmethod
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         pass
@@ -46,6 +58,7 @@ class CursorProvider(LLMProvider):
     """LLM provider backed by Cursor SDK (Agent.prompt one-shot)."""
 
     def __init__(self, settings: Settings) -> None:
+        super().__init__()
         self._settings = settings
 
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
@@ -89,6 +102,7 @@ class CursorProvider(LLMProvider):
 
 class OpenAIProvider(LLMProvider):
     def __init__(self, settings: Settings, *, model: str | None = None) -> None:
+        super().__init__()
         self._settings = settings
         self._model = model or settings.openai_model
 
@@ -126,6 +140,10 @@ class OpenAIProvider(LLMProvider):
                     temperature=temperature,
                 )
                 text = getattr(response, "output_text", None)
+                usage = usage_from_openai_compat_usage(
+                    self._model, "openai", getattr(response, "usage", None)
+                )
+                self._set_last_call_usage(usage)
                 if text is None:
                     return ""
                 return text if isinstance(text, str) else str(text)
@@ -174,6 +192,7 @@ class OpenRouterProvider(LLMProvider):
     ) -> None:
         if not settings.openrouter_api_key.strip():
             raise ValueError("OPENROUTER_API_KEY is required when using OpenRouter")
+        super().__init__()
         self._settings = settings
         self._model = model or settings.openrouter_model
         self._task = task
@@ -197,9 +216,10 @@ class OpenRouterProvider(LLMProvider):
         if is_auto_model_name(self._model):
             updates["ollama_model"] = "auto"
         fallback_settings = self._settings.model_copy(update=updates)
-        return await OllamaProvider(
-            fallback_settings, task=self._task,
-        ).complete(system_prompt, user_prompt, **kwargs)
+        ollama = OllamaProvider(fallback_settings, task=self._task)
+        text = await ollama.complete(system_prompt, user_prompt, **kwargs)
+        self._set_last_call_usage(ollama.consume_last_call_usage())
+        return text
 
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         # Free-model limits are shared across proxies; do not rotate on 429.
@@ -237,6 +257,9 @@ class OpenRouterProvider(LLMProvider):
                 content = choice.message.content
                 if choice.finish_reason == "length" or not content or not content.strip():
                     raise LLMServiceError(LLMErrorKind.SERVER, "OpenRouter returned incomplete text", True)
+                self._set_last_call_usage(
+                    usage_from_openai_compat_usage(model, "openrouter", response.usage)
+                )
                 return content
             except APIStatusError as exc:
                 if exc.status_code == 404 and attempt == 0 and is_auto_model_name(self._model):
@@ -293,6 +316,7 @@ class OllamaProvider(LLMProvider):
         fallback_model: str | None = None,
         task: ModelTask = ModelTask.SIMPLE,
     ) -> None:
+        super().__init__()
         self._settings = settings
         self._model = model or settings.ollama_model
         self._fallback_model = fallback_model or settings.openai_simple_model
@@ -375,6 +399,21 @@ class OllamaProvider(LLMProvider):
             model=model,
             proxy=mask_proxy(proxy) if proxy else None,
         )
+        prompt = getattr(response, "prompt_eval_count", None)
+        completion = getattr(response, "eval_count", None)
+        total = None
+        if prompt is not None and completion is not None:
+            total = int(prompt) + int(completion)
+        self._set_last_call_usage(
+            LLMCallUsage(
+                resolved_model=model,
+                provider_kind="ollama",
+                prompt_tokens=int(prompt) if prompt is not None else None,
+                completion_tokens=int(completion) if completion is not None else None,
+                total_tokens=total,
+                cost_usd=0.0,
+            )
+        )
         return content
 
     def _can_fallback_to_openai(self) -> bool:
@@ -394,11 +433,10 @@ class OllamaProvider(LLMProvider):
             model=model,
             reason=reason,
         )
-        return await OpenAIProvider(self._settings, model=model).complete(
-            system_prompt,
-            user_prompt,
-            **kwargs,
-        )
+        openai = OpenAIProvider(self._settings, model=model)
+        text = await openai.complete(system_prompt, user_prompt, **kwargs)
+        self._set_last_call_usage(openai.consume_last_call_usage())
+        return text
 
     async def complete(self, system_prompt: str, user_prompt: str, **kwargs: Any) -> str:
         snapshot = await get_ollama_usage(self._settings)
@@ -496,6 +534,7 @@ class OllamaProvider(LLMProvider):
 
 class AnthropicProvider(LLMProvider):
     def __init__(self, settings: Settings) -> None:
+        super().__init__()
         self._settings = settings
         self._model = ChatAnthropic(
             api_key=settings.anthropic_api_key,

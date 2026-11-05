@@ -13,8 +13,7 @@ SCRIPT = ROOT / "scripts" / "ops_rollout_readiness.py"
 def test_rollout_readiness_requires_working_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("JOBPILOT_WORKING_DATABASE_URL", raising=False)
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT), "JOBPILOT_SKIP_COMPOSE_CHECKS": "1"},
@@ -46,7 +45,7 @@ def test_readiness_issues_when_alembic_behind_head():
             "ok": False,
             "at_head": False,
             "alembic_version": "20261102_0008",
-            "expected_head": "20261103_0009",
+            "expected_head": "20261103_0011",
         },
         metrics={"notification_outbox": {"needs_attention": 3}},
         stats={
@@ -139,8 +138,7 @@ def test_rollout_readiness_json_shape(monkeypatch):
     monkeypatch.setenv("JOBPILOT_ALLOW_TEST_URL", "1")
     monkeypatch.setenv("JOBPILOT_SKIP_COMPOSE_CHECKS", "1")
 
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--base-url", "http://127.0.0.1:8000"],
+    result = subprocess.run([sys.executable, str(SCRIPT), "--base-url", "http://127.0.0.1:8000"],
         check=False,
         cwd=ROOT,
         env={**os.environ, "PYTHONPATH": str(ROOT)},

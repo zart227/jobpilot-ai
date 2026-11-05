@@ -122,23 +122,29 @@ async def _finalize_memory_index_failure(
 async def recover_stale_memory_index_claims(settings: Settings | None = None) -> int:
     settings = settings or get_settings()
     now = datetime.now(UTC)
+    recovered = 0
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(MemoryIndexPending).where(
+            select(MemoryIndexPending)
+            .where(
                 MemoryIndexPending.claim_expires_at.is_not(None),
                 MemoryIndexPending.claim_expires_at < now,
             )
+            .with_for_update()
         )
         rows = list(result.scalars().all())
         for row in rows:
+            if row.claim_expires_at is None or row.claim_expires_at >= now:
+                continue
             row.claim_token = None
             row.claim_expires_at = None
             row.claim_owner = None
-        if rows:
+            recovered += 1
+        if recovered:
             await session.commit()
         else:
             await session.rollback()
-        return len(rows)
+        return recovered
 
 
 async def process_memory_index_queue(limit: int = 25) -> dict[str, int]:

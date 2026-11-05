@@ -8,10 +8,9 @@ SCRIPT = ROOT / "scripts/mark_live_checklist_complete.sh"
 
 def test_mark_live_dry_run_does_not_modify_checklist(live_signoff_artifacts):
     path, _ = live_signoff_artifacts
-    checklist = ROOT / "docs/remediation-checklists.md"
+    checklist = ROOT / "docs/remediation-plan.md"
     before = checklist.read_bytes()
-    result = subprocess.run(
-        [str(SCRIPT), "--dry-run"],
+    result = subprocess.run([str(SCRIPT), "--dry-run"],
         cwd=ROOT,
         env={**os.environ, "JOBPILOT_LIVE_SIGNOFF_PATH": str(path)},
         capture_output=True,
@@ -27,10 +26,9 @@ def test_mark_live_dry_run_does_not_modify_checklist(live_signoff_artifacts):
 def test_simulated_signoff_cannot_close_live_items(tmp_path):
     path = tmp_path / "signoff.json"
     path.write_text('{"schema_version":2,"mode":"simulation","ui_matches_db":true}')
-    checklist = ROOT / "docs/remediation-checklists.md"
+    checklist = ROOT / "docs/remediation-plan.md"
     before = checklist.read_bytes()
-    result = subprocess.run(
-        [str(SCRIPT)],
+    result = subprocess.run([str(SCRIPT)],
         cwd=ROOT,
         env={**os.environ, "JOBPILOT_LIVE_SIGNOFF_PATH": str(path)},
         capture_output=True,

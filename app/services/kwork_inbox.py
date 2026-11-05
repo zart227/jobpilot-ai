@@ -43,6 +43,9 @@ from app.services.kwork_api import (
 from app.services.kwork_conversation import (
     is_from_client as _is_from_client,
 )
+from app.services.kwork_conversation import (
+    platform_message_id,
+)
 from app.services.kwork_job_match import find_kwork_job_for_message
 from app.services.notification_outbox import deliver_notification_outbox, enqueue_notification
 from app.services.send_attempt_service import (
@@ -194,6 +197,7 @@ async def _generate_inbox_reply(
     thread_messages: list[dict[str, Any]] | None = None,
     my_username: str = "",
     my_user_id: int | None = None,
+    client_message_id: str | None = None,
 ) -> tuple[str, str]:
     thread = thread_messages
     if not thread and username:
@@ -207,6 +211,7 @@ async def _generate_inbox_reply(
             thread_messages=thread,
             my_username=my_username,
             my_user_id=my_user_id,
+            client_message_id=client_message_id,
             proposal=proposal,
         )
 
@@ -228,6 +233,7 @@ def format_client_message_alert(
     chat_reply: str = "",
     needs_context: bool = False,
     candidate_job_count: int = 0,
+    inbound_id: str | None = None,
 ) -> str:
     username = html.escape(msg.username)
     text = html.escape(sanitize_proposal_text(msg.text))
@@ -267,6 +273,12 @@ def format_client_message_alert(
             f"\n⚠️ <b>Нужен выбор заказа</b>: {reason}"
             "Черновик не привязан к конкретному заказу — уточните проект вручную."
         )
+        if inbound_id:
+            safe_id = html.escape(inbound_id)
+            lines.append(
+                f"\n<b>Привязка (API):</b> POST /inbound/{safe_id}/bind-job, "
+                f"затем POST /inbound/{safe_id}/reprocess (с API token)."
+            )
 
     if chat_intent and chat_intent not in ("none", "error"):
         lines.append(f"\n<b>Интент:</b> {html.escape(chat_intent)}")
@@ -477,6 +489,44 @@ INBOUND_GENERATION_LEASE_SECONDS = 900
 INBOUND_GENERATION_MAX_ATTEMPTS = 5
 
 
+def _identity_ambiguity_idempotency_key(entry: dict[str, Any]) -> str:
+    payload = "|".join(str(entry.get(key, "")) for key in ("reason", "user_id", "timestamp"))
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:24]
+    return f"inbox_identity_ambiguity:{digest}"
+
+
+async def _enqueue_identity_ambiguity_ops_alerts(
+    session,
+    settings: Settings,
+    entries: list[dict[str, Any]],
+) -> None:
+    chat = settings.telegram_admin_chat_id
+    if not chat or not entries:
+        return
+    for entry in entries:
+        key = _identity_ambiguity_idempotency_key(entry)
+        reason = html.escape(str(entry.get("reason") or "unknown"))
+        user_id = html.escape(str(entry.get("user_id") or ""))
+        ts = entry.get("timestamp")
+        ts_line = f"\nВремя (Kwork): {html.escape(str(ts))}" if ts is not None else ""
+        alert_text = (
+            "⚠️ Kwork inbox: неоднозначная идентичность сообщения.\n"
+            f"Пользователь user_id={user_id}{ts_line}\n"
+            f"Причина: {reason}\n"
+            "Сообщение не обработано автоматически. См. operator-inbox-identity.md"
+        )
+        ref_id = uuid.uuid5(uuid.NAMESPACE_OID, key)
+        await enqueue_notification(
+            kind="ops_alert",
+            idempotency_key=key,
+            chat_id=int(chat),
+            payload={"alert_text": alert_text},
+            reference_type="inbox_identity_ambiguity",
+            reference_id=ref_id,
+            session=session,
+        )
+
+
 async def _enqueue_generation_exhausted_operator_alert(
     session,
     inbound: InboundMessage,
@@ -638,6 +688,101 @@ async def _defer_inbound_retry(message_key: str, token: str, *, target_chat: int
         await session.commit()
 
 
+def _parse_bound_job_id(inbound: InboundMessage | None) -> uuid.UUID | None:
+    if inbound is None:
+        return None
+    raw = inbound.raw_metadata or {}
+    value = raw.get("operator_bound_job_id")
+    if not value:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except ValueError:
+        return None
+
+
+async def _bound_job_id_for_message_key(session, message_key: str) -> uuid.UUID | None:
+    inbound = await session.scalar(
+        select(InboundMessage).where(
+            InboundMessage.platform == "kwork",
+            InboundMessage.message_key == message_key,
+        )
+    )
+    return _parse_bound_job_id(inbound)
+
+
+async def bind_inbound_to_job(session, inbound_id: uuid.UUID, job_id: uuid.UUID) -> bool:
+    """Operator-selected job for ambiguous inbox context (needs_context)."""
+    from app.services.kwork_job_match import best_proposal_for_reply
+
+    inbound = await session.get(InboundMessage, inbound_id, with_for_update=True)
+    if inbound is None or inbound.platform != "kwork":
+        return False
+    job = await session.get(Job, job_id)
+    if job is None or job.platform != "kwork":
+        return False
+    meta = dict(inbound.raw_metadata or {})
+    meta["operator_bound_job_id"] = str(job_id)
+    meta["operator_bound_at"] = datetime.now(UTC).isoformat()
+    inbound.raw_metadata = meta
+    proposal = await best_proposal_for_reply(session, job_id)
+    if inbound.inbox_pending_id:
+        pending = await session.get(TelegramInboxPending, inbound.inbox_pending_id)
+        if pending and pending.status not in ("sent", "simulated_sent", "superseded"):
+            pending.job_id = job_id
+            pending.proposal_id = proposal.id if proposal else None
+    if inbound.interaction_id:
+        interaction = await session.get(Interaction, inbound.interaction_id)
+        if interaction:
+            interaction.job_id = job_id
+            interaction.proposal_id = proposal.id if proposal else None
+            im = dict(interaction.metadata_ or {})
+            im["needs_context"] = False
+            im["bound_job_id"] = str(job_id)
+            interaction.metadata_ = im
+    from app.services.operator_override_journal import record_operator_override
+
+    await record_operator_override(
+        session,
+        action="bind_inbound_job",
+        actor_source="api_token",
+        reference_type="inbound_message",
+        reference_id=inbound_id,
+        detail={"job_id": str(job_id), "kwork_user_id": inbound.kwork_user_id},
+    )
+    await session.flush()
+    return True
+
+
+async def operator_reprocess_inbound_after_bind(session, inbound_id: uuid.UUID) -> bool:
+    """After bind, reset inbound for a fresh generation pass using the bound job."""
+    inbound = await session.get(InboundMessage, inbound_id, with_for_update=True)
+    if inbound is None or inbound.platform != "kwork":
+        return False
+    if not _parse_bound_job_id(inbound):
+        return False
+    if inbound.inbox_pending_id:
+        pending = await session.get(TelegramInboxPending, inbound.inbox_pending_id)
+        if pending and pending.status == "pending":
+            pending.status = "superseded"
+    inbound.inbox_pending_id = None
+    inbound.interaction_id = None
+    inbound.status = "received"
+    meta = dict(inbound.raw_metadata or {})
+    for key in (
+        "generation_attempts",
+        "generation_claim_token",
+        "generation_claim_until",
+        "generation_retry_after",
+        "generation_exhausted_notified_at",
+    ):
+        meta.pop(key, None)
+    meta["operator_reprocess_at"] = datetime.now(UTC).isoformat()
+    inbound.raw_metadata = meta
+    await session.flush()
+    return True
+
+
 async def requeue_inbound_for_review(session, inbound_id: uuid.UUID) -> bool:
     """Requeue a failed inbound explicitly; never alter already-created reviews."""
     inbound = await session.get(InboundMessage, inbound_id, with_for_update=True)
@@ -673,10 +818,12 @@ async def _persist_inbound_bundle(
     if claim_token is None:
         return None
     async with AsyncSessionLocal() as session:
+        bound_job_id = await _bound_job_id_for_message_key(session, message_key)
         match = await find_kwork_job_for_message(
             session,
             username=msg.username,
             project_id=project_id,
+            bound_job_id=bound_job_id,
         )
         needs_context = match.needs_context
         job = match.job if not needs_context else None
@@ -699,6 +846,7 @@ async def _persist_inbound_bundle(
                 thread_messages=msg.thread,
                 my_username=my_username,
                 my_user_id=my_user_id,
+                client_message_id=platform_message_id(msg.raw),
             )
         except Exception as exc:
             logger.warning("ChatAgent failed for inbox message", error=str(exc))
@@ -712,7 +860,10 @@ async def _persist_inbound_bundle(
         if inbound is None or not _claim_is_current(inbound, claim_token):
             return None
         match = await find_kwork_job_for_message(
-            session, username=msg.username, project_id=project_id,
+            session,
+            username=msg.username,
+            project_id=project_id,
+            bound_job_id=_parse_bound_job_id(inbound),
         )
         needs_context = match.needs_context
         job = match.job if not needs_context else None
@@ -776,6 +927,7 @@ async def _persist_inbound_bundle(
             chat_reply=chat_reply,
             needs_context=needs_context,
             candidate_job_count=len(match.candidate_jobs),
+            inbound_id=str(inbound.id),
         )
         pending_id = str(pending.id)
         await enqueue_notification(
@@ -1340,6 +1492,11 @@ async def check_kwork_inbox(
         )
         if state.identity_ambiguities:
             logger.warning("Kwork inbox identity requires manual review", count=len(state.identity_ambiguities))
+            async with AsyncSessionLocal() as alert_session:
+                await _enqueue_identity_ambiguity_ops_alerts(
+                    alert_session, settings, state.identity_ambiguities
+                )
+                await alert_session.commit()
 
         if first_run and new_messages:
             for msg in new_messages:

@@ -137,6 +137,110 @@ class KworkScraper(BaseScraper):
             logger.error("Kwork scraper: no route could load listing (IP/session block)")
         return self._finalize_job_list([])
 
+    async def refresh_one_from_listing(self, target_external_id: str) -> NormalizedJob | None:
+        """Find one project on the public listing and return a fresh NormalizedJob snapshot."""
+        from app.services.kwork_browser import BLOCKED_TITLE, close_browser, launch_browser
+        from app.services.kwork_pause import get_kwork_pause_reason, is_kwork_paused
+        from app.utils.proxy import get_proxy_candidates, mask_proxy
+
+        if is_kwork_paused():
+            logger.info("Kwork refresh skipped: pause", reason=get_kwork_pause_reason())
+            return None
+
+        settings = get_settings()
+        candidates = list(get_proxy_candidates(settings, "openai"))
+        if None not in candidates:
+            candidates.insert(0, None)
+
+        target = target_external_id.strip()
+        for proxy in candidates:
+            label = mask_proxy(proxy) if proxy else "direct"
+            playwright = browser = None
+            try:
+                playwright, browser, page = await launch_browser(proxy=proxy)
+                if settings.kwork_scrape_login and self._email and self._password:
+                    try:
+                        await self._login(page)
+                    except Exception as exc:
+                        logger.warning("Kwork login skipped for refresh", error=str(exc))
+                job = await self.refresh_one_from_listing_page(page, target)
+                if job:
+                    logger.info(
+                        "Kwork listing refresh matched project",
+                        external_id=target,
+                        proxy=label,
+                    )
+                    return job
+                title = await page.title()
+                if BLOCKED_TITLE in title:
+                    logger.warning("Kwork listing blocked during refresh", proxy=label)
+            except Exception as exc:
+                logger.error("Kwork refresh failed", proxy=label, error=str(exc))
+            finally:
+                if playwright is not None and browser is not None:
+                    await close_browser(playwright, browser)
+        return None
+
+    async def refresh_one_from_listing_page(self, page: Any, target_external_id: str) -> NormalizedJob | None:
+        target = target_external_id.strip()
+        for page_num in range(1, self._max_pages + 1):
+            url = self._page_url(page_num)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                break
+            try:
+                await page.wait_for_selector(".want-card", timeout=20000)
+            except Exception:
+                break
+            await page.wait_for_timeout(1500)
+            cards = page.locator(".want-card")
+            count = await cards.count()
+            if count == 0:
+                break
+            for i in range(count):
+                job = await self._extract_kwork_card(cards.nth(i), page)
+                if job and job.external_id == target:
+                    return job
+        return None
+
+    async def normalized_from_project_view(
+        self,
+        page: Any,
+        *,
+        url: str,
+        external_id: str,
+        title: str,
+        description: str,
+        budget_min: float | None,
+        budget_max: float | None,
+        budget_currency: str,
+        skills: list[str],
+        deadline: datetime | None,
+        client: ClientInfo | None,
+    ) -> NormalizedJob:
+        """Refresh listing_observed_at (and description when readable) from the project page."""
+        view_url = url.rstrip("/")
+        if not view_url.endswith("/view"):
+            view_url = f"{view_url}/view"
+        await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(1500)
+        fresh_desc = await self._fetch_detail_description(page, view_url) or description
+        return NormalizedJob(
+            platform=self.platform,
+            external_id=external_id,
+            title=title,
+            description=fresh_desc,
+            budget_min=budget_min,
+            budget_max=budget_max,
+            budget_currency=budget_currency,
+            skills=skills,
+            deadline=deadline,
+            url=url,
+            client=client,
+            raw_data={"source": "kwork.ru", "listing_observed_at": datetime.now(UTC).isoformat()},
+        )
+
     def _page_url(self, page_num: int) -> str:
         base = self._category_url
         if page_num <= 1:

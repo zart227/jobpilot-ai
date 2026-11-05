@@ -232,7 +232,7 @@ async def test_c102_inbound_edit_telegram_fsm_approve_confirmed_reply(
     async with AsyncSessionLocal() as session:
         pending = await session.get(TelegramInboxPending, pending_uuid)
         assert pending is not None
-        assert pending.status == "sent"
+        assert pending.status == "simulated_sent"
         assert pending.draft_reply == "Срок 3 рабочих дня, старт завтра."
         outbound = await session.scalar(
             select(func.count())

@@ -39,7 +39,13 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
     get_settings.cache_clear()
     from sqlalchemy import func, select, text
 
-    from app.db.models import Job, NotificationOutbox, SendAttempt, TelegramPending
+    from app.db.models import (
+        Job,
+        NotificationOutbox,
+        ProposalApprovalSnapshot,
+        SendAttempt,
+        TelegramPending,
+    )
     from app.db.session import AsyncSessionLocal
     from app.services.embedding_index_signature import SIGNATURE_KEY
     from app.services.kwork_pause import (
@@ -47,6 +53,7 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
         get_kwork_pause_reason,
         is_kwork_offers_paused,
     )
+    from app.services.opportunity_policy import kwork_job_assessment_rejection
 
     async with AsyncSessionLocal() as session:
         pending_cards = await session.scalar(
@@ -57,6 +64,23 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
             .select_from(NotificationOutbox)
             .where(NotificationOutbox.status == "pending")
         )
+        pending_review_ready = 0
+        pending_stale_assessment = 0
+        pending_rows = (
+            await session.scalars(
+                select(TelegramPending).where(TelegramPending.status == "pending")
+            )
+        ).all()
+        for tp in pending_rows:
+            job = await session.get(Job, tp.job_id)
+            gate = None
+            if job and job.platform == "kwork":
+                gate = await kwork_job_assessment_rejection(session, job) or "pass"
+            snap = await session.get(ProposalApprovalSnapshot, tp.id) is not None
+            if gate == "assessment_stale":
+                pending_stale_assessment += 1
+            if gate == "pass" and snap and tp.message_id is not None:
+                pending_review_ready += 1
         outbox_needs_attention = await session.scalar(
             select(func.count())
             .select_from(NotificationOutbox)
@@ -87,6 +111,8 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
     return {
         "alembic": revision or "?",
         "telegram_pending_cards": int(pending_cards or 0),
+        "telegram_pending_review_ready": pending_review_ready,
+        "telegram_pending_assessment_stale": pending_stale_assessment,
         "outbox_pending": int(outbox_pending or 0),
         "outbox_needs_attention": int(outbox_needs_attention or 0),
         "jobs_embedding_signature": int(jobs_with_embedding_signature or 0),
@@ -131,6 +157,8 @@ def main() -> int:
             [
                 f"Alembic (working): {db['alembic']}",
                 f"Telegram pending cards: {db['telegram_pending_cards']}",
+                f"Pending review-ready (gate pass + snapshot + msg_id): {db['telegram_pending_review_ready']}",
+                f"Pending blocked assessment_stale: {db['telegram_pending_assessment_stale']}",
                 f"Outbox pending: {db['outbox_pending']}",
                 f"Outbox needs_attention (manual triage): {db['outbox_needs_attention']}",
                 f"Jobs with embedding signature: {db['jobs_embedding_signature']}",

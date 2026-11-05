@@ -8,7 +8,7 @@ import asyncio
 import sys
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 
 async def _list_recent(limit: int) -> None:
@@ -30,19 +30,16 @@ async def _list_recent(limit: int) -> None:
 
 
 async def _activate(weight_id: uuid.UUID) -> int:
-    from app.db.models import ScoringWeight
     from app.db.session import AsyncSessionLocal
-    from app.services.scoring_weights_validation import validate_scoring_weights
+    from app.services.scoring_weights_service import activate_scoring_weight_row
 
     async with AsyncSessionLocal() as session:
-        target = await session.get(ScoringWeight, weight_id)
-        if target is None:
-            print(f"Not found: {weight_id}", file=sys.stderr)
+        try:
+            await activate_scoring_weight_row(session, weight_id)
+            await session.commit()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
             return 1
-        validate_scoring_weights(target.weights)
-        await session.execute(update(ScoringWeight).values(is_active=False))
-        target.is_active = True
-        await session.commit()
     print(f"Activated scoring_weights {weight_id}")
     return 0
 

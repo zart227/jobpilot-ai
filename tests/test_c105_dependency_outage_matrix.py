@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 # Each row: dependency, failure/recovery scenario, primary test module (integration or unit).
@@ -57,3 +59,40 @@ def test_c105_dependency_outage_evidence_catalog_covers_required_deps():
             assert (ROOT / path.split("#")[0]).is_file()
         else:
             assert (ROOT / path).is_file()
+
+
+AUTOMATED_EVIDENCE_PATHS = tuple(
+    path for _dep, _scenario, path in DEPENDENCY_OUTAGE_EVIDENCE if not path.startswith("docs/")
+)
+
+
+def test_c105_automated_outage_recovery_evidence_pytest_green():
+    """Run every automated C105 evidence module (not manual compose drill log)."""
+    import os
+    import subprocess
+    import sys
+
+    if os.environ.get("JOBPILOT_INTEGRATION_TESTS") != "1":
+        pytest.skip("integration DB/Redis required for C105 evidence bundle")
+
+    env = os.environ.copy()
+    env_path = ROOT / ".jobpilot_integration_test.env"
+    if env_path.is_file():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env.setdefault(key, value)
+    env["JOBPILOT_INTEGRATION_TESTS"] = "1"
+    env.setdefault("API_RATE_LIMIT_ENABLED", "false")
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", *AUTOMATED_EVIDENCE_PATHS],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stdout[-4000:] + proc.stderr[-2000:]

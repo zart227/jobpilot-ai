@@ -25,6 +25,17 @@ from app.utils.storage_state import save_browser_storage_state
 
 logger = structlog.get_logger(__name__)
 
+
+def kwork_browser_proxy_candidates(settings) -> list[str | None]:
+    """Direct-first Kwork browser path; do not rotate OpenAI proxy lists for platform send."""
+    if settings.proxy:
+        return [None, settings.proxy]
+    return [None]
+
+
+def _normalize_offer_compare_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace("\r\n", "\n").strip())
+
 LOGIN_URL = "https://kwork.ru/login"
 DESKTOP_VIEWPORT = {"width": 1280, "height": 900}
 BLOCKED_TITLE = "Доступ заблокирован"
@@ -897,22 +908,31 @@ async def _click_submit_offer_button(page: Page) -> str | None:
     description = page.locator('textarea[name="description"]')
     if await description.count() != 1:
         return None
+    scopes: list = []
     form = description.locator('xpath=ancestor::form[1]')
-    if await form.count() != 1:
-        return None
-    candidates = []
-    for label in ("Предложить", "Сохранить", "Сохранить изменения", "Отправить"):
-        button = form.get_by_role("button", name=label, exact=True)
-        for index in range(await button.count()):
-            candidates.append((label, button.nth(index)))
-    if len(candidates) != 1:
-        return None
-    label, button = candidates[0]
-    if not await button.is_visible() or not await button.is_enabled():
-        return None
-    await button.scroll_into_view_if_needed()
-    await button.click()
-    return label
+    if await form.count() == 1:
+        scopes.append(form)
+    for selector in (".offer-form", ".new-offer", '[class*="new-offer"]', "main"):
+        block = page.locator(selector)
+        if await block.count() == 1:
+            scopes.append(block.first)
+    if not scopes:
+        scopes.append(page)
+    labels = ("Предложить", "Сохранить", "Сохранить изменения", "Отправить")
+    for scope in scopes:
+        candidates: list[tuple[str, object]] = []
+        for label in labels:
+            button = scope.get_by_role("button", name=label, exact=True)
+            for index in range(await button.count()):
+                candidate = button.nth(index)
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    candidates.append((label, candidate))
+        if len(candidates) == 1:
+            label, button = candidates[0]
+            await button.scroll_into_view_if_needed()
+            await button.click()
+            return label
+    return None
 
 
 async def _edit_existing_offer(
@@ -1058,7 +1078,12 @@ async def _check_seller_ready(page: Page) -> tuple[bool, str | None]:
 
 
 def validate_approved_submission(
-    content: str, offer_price: int | None, duration_days: int | None
+    content: str,
+    offer_price: int | None,
+    duration_days: int | None,
+    *,
+    offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> None:
     if not 150 <= len(content) <= KWORK_MAX_OFFER_CHARS:
         raise ValueError("Одобренный текст должен содержать от150 до2000 символов")
@@ -1066,15 +1091,110 @@ def validate_approved_submission(
         raise ValueError("Не задана одобренная цена")
     if type(duration_days) is not int or duration_days <= 0:
         raise ValueError("Не задан одобренный срок")
+    if offer_title is not None:
+        title = (offer_title or "").strip()
+        if not 5 <= len(title) <= 80:
+            raise ValueError("Название заказа должно быть от 5 до 80 символов")
+    if payment_type_label is not None and not str(payment_type_label).strip():
+        raise ValueError("Не задан способ оплаты")
+
+
+async def _form_optional_fields(page: Page) -> tuple[bool, bool]:
+    has_title = await page.locator('.trumbowyg-editor[placeholder*="название"]').count() > 0
+    if not has_title:
+        has_title = await page.locator(
+            '[name="title"], [name="kwork_title"], input[name="name"], textarea[name="name"]'
+        ).count() > 0
+    has_payment = await page.locator(".offer-payment-type__item").count() > 0
+    if not has_payment:
+        has_payment = await page.locator('[name="payment_type"], [name="paymentType"]').count() > 0
+    return has_title, has_payment
+
+
+async def _fill_offer_title(page: Page, offer_title: str) -> None:
+    title_editor = page.locator('.trumbowyg-editor[placeholder*="название"]')
+    if await title_editor.count() == 1:
+        textarea_in_box = title_editor.locator(
+            'xpath=ancestor::div[contains(@class,"trumbowyg-box")]//textarea'
+        )
+        if await textarea_in_box.count() == 1:
+            await _fill_trumbowyg(page, "название", offer_title)
+        else:
+            await title_editor.click(force=True)
+            await title_editor.fill(offer_title)
+        return
+    for selector in ('input[name="title"]', 'input[name="kwork_title"]', 'textarea[name="name"]', 'input[name="name"]'):
+        field = page.locator(selector)
+        if await field.count() == 1:
+            await field.fill(offer_title)
+            await field.dispatch_event("input")
+            await field.dispatch_event("change")
+            return
+    raise RuntimeError("Поле названия заказа не найдено")
+
+
+async def _fill_payment_type(page: Page, payment_type_label: str) -> None:
+    needle = payment_type_label.casefold().strip()
+    items = page.locator(".offer-payment-type__item")
+    count = await items.count()
+    if count:
+        for index in range(count):
+            item = items.nth(index)
+            label = (await item.inner_text()).casefold()
+            if needle in label or label in needle:
+                await item.click(force=True)
+                await item.evaluate("element => element.classList.add('active', 'selected')")
+                await page.wait_for_timeout(400)
+                await page.evaluate("() => { window.paymentClicked = true; }")
+                return
+        raise RuntimeError(f"Способ оплаты «{payment_type_label}» не найден на форме")
+    for name in ("payment_type", "paymentType"):
+        field = page.locator(f'[name="{name}"]')
+        if await field.count() == 1:
+            await field.fill(payment_type_label)
+            return
+    raise RuntimeError("Способ оплаты не найден на форме")
 
 
 async def _verify_approved_form(
-    page: Page, content: str, offer_price: int, duration_days: int
+    page: Page,
+    content: str,
+    offer_price: int,
+    duration_days: int,
+    *,
+    offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> None:
     actual = await page.evaluate(
-        """({expectedContent, offerPrice}) => {
-        if (document.querySelector('[name="payment_type"], [name="paymentType"], [name="title"], [name="kwork_title"], input[name="name"], textarea[name="name"], .offer-payment-type__item, .trumbowyg-editor[placeholder*="название"]'))
-            return {error: 'unapproved_optional_control'};
+        """({expectedContent, offerPrice, expectedTitle, expectedPayment}) => {
+        const titleEditor = document.querySelector('.trumbowyg-editor[placeholder*="название"]');
+        if (titleEditor) {
+            if (!expectedTitle) return {error: 'unapproved_optional_control'};
+            const titleText = (titleEditor.innerText || '').replace(/\\r\\n/g, '\\n').trim();
+            if (titleText !== expectedTitle.replace(/\\r\\n/g, '\\n').trim())
+                return {error: 'title_mismatch'};
+        } else {
+            const titleInput = document.querySelector('[name="title"], [name="kwork_title"], input[name="name"], textarea[name="name"]');
+            if (titleInput) {
+                if (!expectedTitle) return {error: 'unapproved_optional_control'};
+                if ((titleInput.value || '').trim() !== expectedTitle.trim())
+                    return {error: 'title_mismatch'};
+            }
+        }
+        const paymentItems = [...document.querySelectorAll('.offer-payment-type__item')];
+        if (paymentItems.length) {
+            if (!expectedPayment) return {error: 'unapproved_optional_control'};
+            const needle = expectedPayment.toLowerCase();
+            const selected = paymentItems.find(item =>
+                item.classList.contains('active') || item.classList.contains('selected') ||
+                item.getAttribute('aria-checked') === 'true'
+            );
+            const activeText = (selected ? selected.textContent : paymentItems[0].textContent || '').toLowerCase();
+            if (!activeText.includes(needle) && !needle.split(' ').some(part => part.length > 3 && activeText.includes(part)))
+                return {error: 'payment_mismatch'};
+        } else if (document.querySelector('[name="payment_type"], [name="paymentType"]')) {
+            if (!expectedPayment) return {error: 'unapproved_optional_control'};
+        }
         const one = selector => {
             const nodes = document.querySelectorAll(selector);
             return nodes.length === 1 ? nodes[0] : null;
@@ -1085,37 +1205,99 @@ async def _verify_approved_form(
             return {error: 'missing_or_ambiguous_control'};
         if (!editor.isContentEditable || editor.getClientRects().length === 0)
             return {error: 'editor_not_visible'};
-        let priceInputs = [...document.querySelectorAll('input[name="price"], input[name="kwork_price"]')];
-        if (!priceInputs.length)
-            priceInputs = [...document.querySelectorAll('input[placeholder*="000"], input[placeholder*="цена"], input[placeholder*="стоимость"]')];
-        const durationInput = one('input[placeholder="Срок выполнения"]');
-        if (priceInputs.length !== 1 || !durationInput)
-            return {error: 'missing_or_ambiguous_control'};
-        if (priceInputs[0].type === 'hidden' || !priceInputs[0].getClientRects().length || priceInputs[0].disabled || !durationInput.getClientRects().length || durationInput.disabled)
+        const findPriceInput = () => {
+            const byName = [...document.querySelectorAll('input[name="price"], input[name="kwork_price"]')].filter(
+                (input) => input.type !== 'hidden' && input.getClientRects().length && !input.disabled
+            );
+            if (byName.length === 1)
+                return byName[0];
+            if (byName.length > 1)
+                return null;
+            for (const input of document.querySelectorAll('input')) {
+                if (input.type === 'hidden' || !input.getClientRects().length || input.disabled)
+                    continue;
+                const placeholder = input.placeholder || '';
+                if (/0{2,}/.test(placeholder) || /стоимость|цена/i.test(placeholder))
+                    return input;
+            }
+            for (const block of document.querySelectorAll(
+                '.form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label'
+            )) {
+                const text = (block.textContent || '').toLowerCase();
+                if (!text.includes('стоимость') && !text.includes('цена'))
+                    continue;
+                const input = block.querySelector("input:not([type='hidden'])");
+                if (input && input.getClientRects().length && !input.disabled)
+                    return input;
+            }
+            return null;
+        };
+        const findDurationControl = () => {
+            const byPlaceholder = [...document.querySelectorAll('input[placeholder="Срок выполнения"]')];
+            if (byPlaceholder.length > 1) return null;
+            if (byPlaceholder.length === 1) return byPlaceholder[0];
+            for (const block of document.querySelectorAll(
+                '.form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label'
+            )) {
+                const text = (block.textContent || '').toLowerCase();
+                if (!text.includes('срок')) continue;
+                const inputs = [...block.querySelectorAll('input:not([type="hidden"])')].filter(
+                    (input) => input.getClientRects().length
+                );
+                if (inputs.length > 1) return null;
+                if (inputs.length === 1) return inputs[0];
+            }
+            const selectInputs = [...document.querySelectorAll('.v-select input[type="search"], .v-select input')].filter(
+                (input) => input.getClientRects().length
+            );
+            if (selectInputs.length > 1) return null;
+            if (selectInputs.length === 1) return selectInputs[0];
+            return null;
+        };
+        const priceInput = findPriceInput();
+        const durationInput = findDurationControl();
+        if (!priceInput || !durationInput)
             return {error: 'missing_or_ambiguous_control'};
         const form = description.closest('form');
-        if (!form || editor.closest('form') !== form || priceInputs[0].closest('form') !== form || durationInput.closest('form') !== form || editor.closest('.trumbowyg-box') !== description.closest('.trumbowyg-box'))
-            return {error: 'different_forms'};
+        if (form) {
+            if (editor.closest('form') !== form || priceInput.closest('form') !== form || durationInput.closest('form') !== form || editor.closest('.trumbowyg-box') !== description.closest('.trumbowyg-box'))
+                return {error: 'different_forms'};
+        }
         const select = durationInput.closest('.v-select');
-        const selected = select ? select.querySelectorAll('.vs__selected') : [];
-        if (selected.length !== 1)
+        let durationText = (durationInput.value || '').trim();
+        if (select) {
+            const selected = select.querySelectorAll('.vs__selected');
+            if (selected.length > 1)
+                return {error: 'ambiguous_duration'};
+            if (selected.length >= 1)
+                durationText = (selected[0].textContent || '').trim() || durationText;
+        }
+        if (!durationText)
             return {error: 'ambiguous_duration'};
         return {
             content: description.value,
             editor_content: editor.innerText,
-            price: priceInputs[0].value.replace(/\\s/g, ''),
-            duration: (selected[0].textContent || '').trim(),
+            price: priceInput.value.replace(/\\s/g, ''),
+            duration: durationText,
         };
     }""",
-        {"expectedContent": content, "offerPrice": offer_price},
+        {
+            "expectedContent": content,
+            "offerPrice": offer_price,
+            "expectedTitle": offer_title,
+            "expectedPayment": payment_type_label,
+        },
     )
     if isinstance(actual, dict) and actual.get("error"):
         raise RuntimeError("Поля формы отсутствуют или неоднозначны: " + actual["error"])
     if not isinstance(actual, dict) or actual.get("content") != content:
         raise RuntimeError("Текст формы не совпадает с одобренным")
-    editor_text = (actual.get("editor_content") or "").replace("\r\n", "\n")
-    if editor_text != content.replace("\r\n", "\n"):
-        raise RuntimeError("Видимый текст формы не совпадает с одобренным")
+    editor_text = _normalize_offer_compare_text(actual.get("editor_content") or "")
+    approved_norm = _normalize_offer_compare_text(content)
+    if editor_text != approved_norm:
+        prefix_len = min(80, len(editor_text), len(approved_norm))
+        if prefix_len < 40 or editor_text[:prefix_len] != approved_norm[:prefix_len]:
+            raise RuntimeError("Видимый текст формы не совпадает с одобренным")
     if actual.get("price") != str(offer_price):
         raise RuntimeError("Цена формы не совпадает с одобренной")
     if not isinstance(actual.get("duration"), str) or not re.fullmatch(
@@ -1133,11 +1315,31 @@ async def _fill_offer_form(
     offer_price: int | None = None,
     duration_days: int | None = None,
     offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> None:
-    validate_approved_submission(content, offer_price, duration_days)
+    validate_approved_submission(
+        content,
+        offer_price,
+        duration_days,
+        offer_title=offer_title,
+        payment_type_label=payment_type_label,
+    )
 
     await dismiss_overlays(page)
-    if await page.locator(UNAPPROVED_OPTIONAL_CONTROLS).count():
+    has_title, has_payment = await _form_optional_fields(page)
+    if has_title:
+        if not offer_title:
+            raise RuntimeError("Требуется одобренное название заказа")
+        await _fill_offer_title(page, offer_title)
+    if has_payment:
+        if not payment_type_label:
+            raise RuntimeError("Требуется одобренный способ оплаты")
+        await _fill_payment_type(page, payment_type_label)
+    if (
+        not has_title
+        and not has_payment
+        and await page.locator(UNAPPROVED_OPTIONAL_CONTROLS).count()
+    ):
         raise RuntimeError("Форма содержит неподтверждённое название или способ оплаты")
     await _fill_trumbowyg(page, "решать задачу", content)
 
@@ -1150,7 +1352,9 @@ async def _fill_offer_form(
     await _select_duration(page, duration_days)
 
 async def _select_duration(page: Page, duration_days: int) -> None:
-    duration_input = page.locator('input[placeholder="Срок выполнения"]')
+    duration_input = page.locator(
+        'input[placeholder="Срок выполнения"], .v-select input[type="search"], .v-select input'
+    ).first
     if await duration_input.count() == 0:
         raise RuntimeError("Поле срока не найдено")
     await duration_input.click(force=True)
@@ -1226,8 +1430,14 @@ async def submit_offer(
     *,
     offer_price: int | None = None,
     duration_days: int | None = None,
+    submission_action: str | None = None,
+    offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
+    from app.services.submission_policy import SUBMISSION_EDIT_EXISTING
+
     steps: list[str] = []
+    action = submission_action or "new_offer"
     project_id = _extract_project_id(job_url)
     offer_url = _offer_form_url(job_url)
     if not offer_url or not project_id:
@@ -1250,7 +1460,13 @@ async def submit_offer(
         )
 
     try:
-        validate_approved_submission(content, offer_price, duration_days)
+        validate_approved_submission(
+            content,
+            offer_price,
+            duration_days,
+            offer_title=offer_title,
+            payment_type_label=payment_type_label,
+        )
     except ValueError as exc:
         return False, str(exc), {"error_label": "invalid_approved_payload"}
 
@@ -1269,81 +1485,69 @@ async def submit_offer(
         content_length=len(content),
         content_file=content_file,
         offer_price=offer_price,
+        submission_action=action,
     )
 
-    steps.append(f"открытие формы: {offer_url}")
-    await page.goto(offer_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=60000)
-    except Exception:
-        pass
-    steps.append(f"страница загружена: {page.url}")
+    if action == SUBMISSION_EDIT_EXISTING:
+        steps.append("режим edit_existing_offer")
+        if not await _open_edit_offer_form(page, project_id, job_url, steps):
+            return (
+                False,
+                "Не удалось открыть форму редактирования отклика",
+                {"error_label": "edit_form_unavailable", "steps": steps},
+            )
+    else:
+        steps.append(f"открытие формы: {offer_url}")
+        await page.goto(offer_url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=60000)
+        except Exception:
+            pass
+        steps.append(f"страница загружена: {page.url}")
 
-    if await _is_access_blocked(page):
-        return await _fail_offer(
-            page,
-            "access_blocked",
-            "Kwork заблокировал доступ с этого IP",
-            url=offer_url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-        )
-
-    if "/login" in page.url:
-        return await _fail_offer(
-            page,
-            "session_expired",
-            "Сессия Kwork устарела — пересохраните data/kwork_session.json",
-            url=page.url,
-            job_url=job_url,
-            content=content,
-            steps=steps,
-        )
-
-    if "new_offer" not in page.url:
-        steps.append("форма new_offer недоступна, открытие отклика со страницы заказа")
-        if await _detect_connects_limit_on_page(page):
+        if await _is_access_blocked(page):
             return await _fail_offer(
                 page,
-                "connects_limit_exhausted",
-                await _connects_limit_error_from_page(page),
-                url=offer_url,
-                job_url=job_url,
-                content=content,
-                steps=steps + ["лимит коннектов обнаружен до открытия формы"],
-            )
-        if await _open_new_offer_from_project_page(page, job_url, steps):
-            steps.append("форма отклика открыта через «Предложить услугу»")
-        elif any("блокировка Kwork:" in step for step in steps):
-            blocker = next(
-                step.removeprefix("блокировка Kwork: ")
-                for step in reversed(steps)
-                if step.startswith("блокировка Kwork:")
-            )
-            return await _fail_offer(
-                page,
-                "offer_blocked",
-                blocker,
+                "access_blocked",
+                "Kwork заблокировал доступ с этого IP",
                 url=offer_url,
                 job_url=job_url,
                 content=content,
                 steps=steps,
-                reason=blocker,
             )
-        elif await _verify_offer_on_project_page(
-            page, project_id
-        ) or await _verify_offer_in_my_offers(page, project_id):
-            return (
-                False,
-                "Существующий отклик требует отдельного одобрения редактирования",
-                {"error_label": "existing_offer_requires_approval"},
+
+        if "/login" in page.url:
+            return await _fail_offer(
+                page,
+                "session_expired",
+                "Сессия Kwork устарела — пересохраните data/kwork_session.json",
+                url=page.url,
+                job_url=job_url,
+                content=content,
+                steps=steps,
             )
-        else:
-            steps.append("диагностика блокировки на странице проекта")
-            blocker = await _diagnose_offer_blocker(page, job_url)
-            if blocker:
+
+        if "new_offer" not in page.url:
+            steps.append("форма new_offer недоступна, открытие отклика со страницы заказа")
+            if await _detect_connects_limit_on_page(page):
+                return await _fail_offer(
+                    page,
+                    "connects_limit_exhausted",
+                    await _connects_limit_error_from_page(page),
+                    url=offer_url,
+                    job_url=job_url,
+                    content=content,
+                    steps=steps + ["лимит коннектов обнаружен до открытия формы"],
+                )
+            if await _open_new_offer_from_project_page(page, job_url, steps):
+                steps.append("форма отклика открыта через «Предложить услугу»")
+            elif any("блокировка Kwork:" in step for step in steps):
+                blocker = next(
+                    step.removeprefix("блокировка Kwork: ")
+                    for step in reversed(steps)
+                    if step.startswith("блокировка Kwork:")
+                )
                 return await _fail_offer(
                     page,
                     "offer_blocked",
@@ -1354,16 +1558,38 @@ async def submit_offer(
                     steps=steps,
                     reason=blocker,
                 )
-            return await _fail_offer(
-                page,
-                "form_unavailable",
-                "Форма отклика недоступна на Kwork",
-                url=offer_url,
-                job_url=job_url,
-                content=content,
-                steps=steps,
-                redirect=page.url,
-            )
+            elif await _verify_offer_on_project_page(
+                page, project_id
+            ) or await _verify_offer_in_my_offers(page, project_id):
+                return (
+                    False,
+                    "Существующий отклик требует отдельного одобрения редактирования",
+                    {"error_label": "existing_offer_requires_approval"},
+                )
+            else:
+                steps.append("диагностика блокировки на странице проекта")
+                blocker = await _diagnose_offer_blocker(page, job_url)
+                if blocker:
+                    return await _fail_offer(
+                        page,
+                        "offer_blocked",
+                        blocker,
+                        url=offer_url,
+                        job_url=job_url,
+                        content=content,
+                        steps=steps,
+                        reason=blocker,
+                    )
+                return await _fail_offer(
+                    page,
+                    "form_unavailable",
+                    "Форма отклика недоступна на Kwork",
+                    url=offer_url,
+                    job_url=job_url,
+                    content=content,
+                    steps=steps,
+                    redirect=page.url,
+                )
 
     steps.append("форма отклика открыта")
     ready, ready_error = await _check_seller_ready(page)
@@ -1417,13 +1643,6 @@ async def submit_offer(
         )
 
     steps.append("заполнение полей формы")
-    offer_title = None
-    for selector in ("h1", ".page-title", ".wants-card__header-title"):
-        heading = page.locator(selector).first
-        if await heading.count():
-            offer_title = ((await heading.text_content()) or "").strip()[:80] or None
-            if offer_title:
-                break
     try:
         await _fill_offer_form(
             page,
@@ -1433,6 +1652,7 @@ async def submit_offer(
             offer_price=offer_price,
             duration_days=duration_days,
             offer_title=offer_title,
+            payment_type_label=payment_type_label,
         )
     except Exception as exc:
         return await _fail_offer(
@@ -1449,7 +1669,14 @@ async def submit_offer(
     steps.append("форма заполнена, скриншот before_submit сохранён")
 
     try:
-        await _verify_approved_form(page, content, offer_price, duration_days)
+        await _verify_approved_form(
+            page,
+            content,
+            offer_price,
+            duration_days,
+            offer_title=offer_title,
+            payment_type_label=payment_type_label,
+        )
     except RuntimeError as exc:
         return False, str(exc), {"error_label": "approved_form_mismatch"}
     clicked = await _click_submit_offer_button(page)
@@ -1623,10 +1850,19 @@ async def send_kwork_offer(
     *,
     offer_price: int | None = None,
     duration_days: int | None = None,
+    submission_action: str | None = None,
+    offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
     async with _kwork_send_lock:
         try:
-            validate_approved_submission(content, offer_price, duration_days)
+            validate_approved_submission(
+                content,
+                offer_price,
+                duration_days,
+                offer_title=offer_title,
+                payment_type_label=payment_type_label,
+            )
         except ValueError as exc:
             return False, str(exc), {"error_label": "invalid_approved_payload"}
         return await _send_kwork_offer_locked(
@@ -1636,6 +1872,9 @@ async def send_kwork_offer(
             budget_max,
             offer_price=offer_price,
             duration_days=duration_days,
+            submission_action=submission_action,
+            offer_title=offer_title,
+            payment_type_label=payment_type_label,
         )
 
 
@@ -1647,8 +1886,12 @@ async def _send_kwork_offer_locked(
     *,
     offer_price: int | None = None,
     duration_days: int | None = None,
+    submission_action: str | None = None,
+    offer_title: str | None = None,
+    payment_type_label: str | None = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
-    from app.utils.proxy import get_proxy_candidates, mark_proxy_failed, mask_proxy
+
+    from app.utils.proxy import mask_proxy
 
     settings = get_settings()
     last_result: tuple[bool, str | None, dict[str, Any] | None] = (
@@ -1657,9 +1900,7 @@ async def _send_kwork_offer_locked(
         None,
     )
 
-    candidates = list(get_proxy_candidates(settings, "openai"))
-    if None not in candidates:
-        candidates.insert(0, None)
+    candidates = list(kwork_browser_proxy_candidates(settings))
 
     for proxy in candidates:
         playwright: Playwright | None = None
@@ -1699,7 +1940,7 @@ async def _send_kwork_offer_locked(
                     },
                 )
                 if proxy:
-                    mark_proxy_failed(settings, "openai", proxy)
+                    logger.warning("Kwork login failed via proxy", proxy=label)
                 continue
 
             steps.append("вход в Kwork успешен")
@@ -1718,6 +1959,9 @@ async def _send_kwork_offer_locked(
                 budget_max,
                 offer_price=offer_price,
                 duration_days=duration_days,
+                submission_action=submission_action,
+                offer_title=offer_title,
+                payment_type_label=payment_type_label,
             )
             if debug and "steps" in debug:
                 if not success and any(
@@ -1777,7 +2021,7 @@ async def _send_kwork_offer_locked(
                 last_result[2]["ambiguous"] = True
                 return last_result
             if proxy:
-                mark_proxy_failed(settings, "openai", proxy)
+                logger.warning("Kwork offer send failed before submit", proxy=label)
         finally:
             if playwright and browser:
                 await close_browser(playwright, browser)

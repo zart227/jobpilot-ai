@@ -1,10 +1,10 @@
 # Разрешённая проверка на Kwork (чеклист)
 
-> Перепроверка14.10.2026: **44/115 подтверждено,71 открыт; приёмка не завершена.** Актуальные [аудит](audit-2026-10-14.md) и [план](remediation-plan.md) имеют приоритет. Dry-run не закрывает live. Auto-close/restore/rollout helpers требуют исправлений R15/R16 до использования на действующей системе.
+> **05.11.2026:** это не отдельный план. Счёт и критерии — [remediation-plan.md](remediation-plan.md) (**98/115**, **17** открыто). Dry-run не закрывает live.
 
 Использовать **только** после закрытия dry-run в CI и явного решения владельца проекта.
 
-[remediation-checklists.md](remediation-checklists.md) **44/115 подтверждено; 71 открыт** (dry-run signoff). Пункты `- [ ]` ниже — **живая** проверка в UI; что ещё не сделано в коде/опсе: [remediation-progress.md § Остаток работ](remediation-progress.md).
+Пункты ниже — живая проверка UI для **C110** в [remediation-plan.md](remediation-plan.md). Они не добавляют критерии и не заменяют план.
 
 ## Перед стартом
 
@@ -27,14 +27,14 @@
 ## После проверки
 
 ```bash
-./scripts/record_live_kwork_acceptance.sh <order_id> <send_attempt_uuid> "краткий итог"
-./scripts/mark_live_checklist_complete.sh   # после validate_live_signoff.py OK
+./scripts/record_live_kwork_acceptance.sh        # validate only (R15)
+./scripts/mark_live_checklist_complete.sh        # после validate_live_signoff.py OK; не ставит [x]
 ```
 
 - [ ] `send_attempts.status = confirmed_sent` совпадает с UI Kwork
 - [ ] `snapshot_content` совпадает с отправленным текстом
 - [ ] Повтор approve/callback **не** создаёт вторую отправку
-- [ ] Запись в [remediation-checklists.md](remediation-checklists.md) § сквозная приёмка (дата, заказ, результат)
+- [ ] **Вручную** `[x]` только **C110** в [remediation-plan.md](remediation-plan.md) после совпадения UI с snapshot (дата, заказ, результат)
 
 ## Откат
 

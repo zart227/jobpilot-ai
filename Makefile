@@ -26,27 +26,31 @@ close-live:
 audit-status:
 	$(PY) scripts/audit_remediation_status.py --write docs/audit-remediation-matrix.md
 
+OPS_DB_URL = $(shell DATABASE_URL="$$DATABASE_URL" JOBPILOT_WORKING_DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_database_url.py 2>/dev/null)
+
 ops-snapshot:
-	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_remediation_snapshot.py
+	@test -n "$(OPS_DB_URL)" || (echo "Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_remediation_snapshot.py
 
 ops-outbox-triage:
-	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
+	@test -n "$(OPS_DB_URL)" || (echo "Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
 
 ops-outbox-triage-md:
-	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_markdown_bundle.py
+	@test -n "$(OPS_DB_URL)" || (echo "Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_markdown_bundle.py
 
 ops-rollout-readiness:
-	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
+	@test -n "$(OPS_DB_URL)" || (echo "Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	@case "$(OPS_DB_URL)" in *\_test) echo "Refusing *_test for rollout readiness; point URL at jobpilot_ai (see .env.example)" >&2; exit 2;; esac
+	DATABASE_URL="$(OPS_DB_URL)" JOBPILOT_WORKING_DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
 
 ops-remediation-preflight:
-	@test -n "$$JOBPILOT_WORKING_DATABASE_URL" || (echo "Set JOBPILOT_WORKING_DATABASE_URL to jobpilot_ai" >&2; exit 2)
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_working_db_preflight.py
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
-	DATABASE_URL="$$JOBPILOT_WORKING_DATABASE_URL" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
+	@test -n "$(OPS_DB_URL)" || (echo "Set JOBPILOT_WORKING_DATABASE_URL or DATABASE_URL to jobpilot_ai" >&2; exit 2)
+	@case "$(OPS_DB_URL)" in *\_test) echo "Refusing *_test for remediation preflight; point URL at jobpilot_ai" >&2; exit 2;; esac
+	DATABASE_URL="$(OPS_DB_URL)" JOBPILOT_WORKING_DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_working_db_preflight.py
+	DATABASE_URL="$(OPS_DB_URL)" JOBPILOT_WORKING_DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_rollout_readiness.py
+	DATABASE_URL="$(OPS_DB_URL)" JOBPILOT_WORKING_DATABASE_URL="$(OPS_DB_URL)" PYTHONPATH=. $(PY) scripts/ops_outbox_triage_rollup.py --json
 
 rollout:
 	./scripts/production_rollout.sh

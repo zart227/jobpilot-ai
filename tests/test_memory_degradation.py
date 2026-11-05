@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.config import Settings
+from app.llm.call_usage import LLMCallUsage
 
 
 def unavailable():
@@ -33,7 +34,10 @@ async def clear_memory_index_queue_for_integration():
 async def test_proposal_generation_without_qdrant(monkeypatch):
     from app.agents import proposal_agent
 
-    llm = SimpleNamespace(complete=AsyncMock(return_value='PROPOSAL:\nI can fix the issue.'))
+    llm = SimpleNamespace(
+        complete=AsyncMock(return_value='PROPOSAL:\nI can fix the issue.'),
+        consume_last_call_usage=lambda: LLMCallUsage(resolved_model="mock", provider_kind="mock"),
+    )
     monkeypatch.setattr(proposal_agent, 'get_settings', lambda: Settings(_env_file=None))
     monkeypatch.setattr(proposal_agent, 'get_llm_provider', lambda: llm)
     monkeypatch.setattr(proposal_agent, 'get_memory_store', unavailable)
@@ -61,7 +65,10 @@ async def test_learning_result_survives_unavailable_qdrant(monkeypatch):
     response = json.dumps({'weights': {'skill_match': .3, 'budget': .2, 'complexity': .15,
                                        'client_quality': .2, 'competition': .15},
                            'insights': [], 'top_platforms': []})
-    llm = SimpleNamespace(complete=AsyncMock(return_value=response))
+    llm = SimpleNamespace(
+        complete=AsyncMock(return_value=response),
+        consume_last_call_usage=lambda: LLMCallUsage(resolved_model="mock", provider_kind="mock"),
+    )
     monkeypatch.setattr(learning_agent, 'get_settings', lambda: Settings(_env_file=None))
     monkeypatch.setattr(learning_agent, 'get_simple_llm_provider', lambda: llm)
     monkeypatch.setattr(learning_agent, 'get_memory_store', unavailable)
@@ -85,7 +92,10 @@ async def test_learning_queues_patterns_when_qdrant_init_fails(monkeypatch):
     response = json.dumps({'weights': {'skill_match': .3, 'budget': .2, 'complexity': .15,
                                        'client_quality': .2, 'competition': .15},
                            'insights': [], 'top_platforms': []})
-    llm = SimpleNamespace(complete=AsyncMock(return_value=response))
+    llm = SimpleNamespace(
+        complete=AsyncMock(return_value=response),
+        consume_last_call_usage=lambda: LLMCallUsage(resolved_model="mock", provider_kind="mock"),
+    )
     monkeypatch.setattr(learning_agent, 'get_settings', lambda: Settings(_env_file=None))
     monkeypatch.setattr(learning_agent, 'get_simple_llm_provider', lambda: llm)
     monkeypatch.setattr(learning_agent, 'get_memory_store', unavailable)
@@ -101,6 +111,7 @@ async def test_learning_queues_patterns_when_qdrant_init_fails(monkeypatch):
         assert count >= 1
 
 
+@pytest.mark.skipif(os.environ.get('JOBPILOT_INTEGRATION_TESTS') != '1', reason='isolated DB required')
 async def test_edit_record_survives_unavailable_qdrant(monkeypatch):
     from sqlalchemy import func, select
 
@@ -110,6 +121,9 @@ async def test_edit_record_survives_unavailable_qdrant(monkeypatch):
 
     job_id, proposal_id = uuid.uuid4(), uuid.uuid4()
     async with AsyncSessionLocal() as session:
+        before_pending = int(
+            await session.scalar(select(func.count(MemoryIndexPending.id))) or 0
+        )
         session.add(Job(id=job_id, platform='fake', external_id=str(job_id), title='t', description='d'))
         await session.flush()
         session.add(Proposal(id=proposal_id, job_id=job_id, content='Original', version=1))
@@ -122,8 +136,10 @@ async def test_edit_record_survives_unavailable_qdrant(monkeypatch):
     async with AsyncSessionLocal() as session:
         saved = await session.scalar(select(ProposalEdit).where(ProposalEdit.proposal_id == proposal_id))
         assert saved and saved.instruction == 'shorten'
-        pending = await session.scalar(select(func.count(MemoryIndexPending.id)))
-        assert pending == 1
+        after_pending = int(
+            await session.scalar(select(func.count(MemoryIndexPending.id))) or 0
+        )
+        assert after_pending == before_pending + 1
 
 
 async def test_proposal_llm_failure_is_retryable_processing_error(monkeypatch):

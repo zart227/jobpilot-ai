@@ -14,8 +14,7 @@ def test_generator_refuses_working_database_before_connecting():
     env = dict(os.environ, JOBPILOT_INTEGRATION_TESTS="1",
                DATABASE_URL="postgresql+asyncpg://test:unused@127.0.0.1:1/production",
                PLATFORM_DRY_RUN="false")
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
+    result = subprocess.run([sys.executable, str(SCRIPT)],
         cwd=ROOT,
         env=env,
         capture_output=True,
