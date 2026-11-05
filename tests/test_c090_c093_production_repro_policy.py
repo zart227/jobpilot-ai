@@ -45,27 +45,38 @@ def test_prod_compose_app_services_only_mount_data() -> None:
 def test_merged_prod_compose_has_no_app_source_bind_mounts() -> None:
     if not shutil.which("docker"):
         pytest.skip("docker CLI not available")
-    env_file = ROOT / ".env"
-    if not env_file.is_file():
-        env_file = ROOT / ".env.example"
-    cmd = [
-        "docker",
-        "compose",
-        "--env-file",
-        str(env_file),
-        "-f",
-        "docker-compose.yml",
-        "-f",
-        "docker-compose.prod.yml",
-        "config",
-    ]
-    proc = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    env_path = ROOT / ".env"
+    created_env = False
+    if not env_path.is_file():
+        env_path.write_text((ROOT / ".env.example").read_text(encoding="utf-8"), encoding="utf-8")
+        created_env = True
+    bridge = ROOT / "data" / "cursor_bridge.env"
+    created_bridge = False
+    if not bridge.is_file():
+        bridge.parent.mkdir(parents=True, exist_ok=True)
+        bridge.write_text("# CI/prod compose config probe\n", encoding="utf-8")
+        created_bridge = True
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "docker-compose.yml",
+                "-f",
+                "docker-compose.prod.yml",
+                "config",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        if created_env:
+            env_path.unlink(missing_ok=True)
+        if created_bridge:
+            bridge.unlink(missing_ok=True)
     assert proc.returncode == 0, proc.stderr
     assert "source: ./app" not in proc.stdout
     assert "target: /app/app" not in proc.stdout
