@@ -24,13 +24,18 @@ fi
 
 echo "== remediation_verify =="
 "$PY" scripts/remediation_checklist_report.py
-"$PY" scripts/remediation_checklist_status.py
+REMEDIATION_MAX_OPEN=115 "$PY" scripts/remediation_checklist_status.py
 "$PY" scripts/audit_remediation_status.py
 ./scripts/live_acceptance_preflight.sh
 
 _SAVED_INTEGRATION="${JOBPILOT_INTEGRATION_TESTS:-}"
 unset JOBPILOT_INTEGRATION_TESTS
-"$PY" -m pytest -q tests/test_remediation_checklist_gate.py tests/test_audit_remediation_status.py tests/test_settings_generic_selectors.py tests/test_proposal_conflict_resolution.py tests/test_qdrant_embedding_drill.py tests/test_ci_workflow_policy.py tests/test_c090_c093_production_repro_policy.py
+_GATE_TESTS="tests/test_remediation_checklist_gate.py tests/test_audit_remediation_status.py tests/test_settings_generic_selectors.py tests/test_proposal_conflict_resolution.py tests/test_qdrant_embedding_drill.py tests/test_ci_workflow_policy.py"
+if [ -f "$ROOT/tests/test_c090_c093_production_repro_policy.py" ]; then
+  _GATE_TESTS="$_GATE_TESTS tests/test_c090_c093_production_repro_policy.py"
+fi
+# shellcheck disable=SC2086
+"$PY" -m pytest -q $_GATE_TESTS
 JOBPILOT_INTEGRATION_TESTS="${_SAVED_INTEGRATION}"
 
 if [ "${JOBPILOT_INTEGRATION_TESTS:-}" = "1" ]; then

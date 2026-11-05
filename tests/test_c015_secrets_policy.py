@@ -2,6 +2,7 @@
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +31,7 @@ def test_env_example_documents_postgres_password_override() -> None:
 
 
 def test_secret_scan_repo_passes() -> None:
-    proc = subprocess.run([str(ROOT / ".venv/bin/python"), str(ROOT / "scripts/secret_scan_repo.py")],
+    proc = subprocess.run([sys.executable, str(ROOT / "scripts/secret_scan_repo.py")],
         cwd=ROOT,
         capture_output=True,
         text=True,

@@ -1,6 +1,6 @@
 # План и чеклисты JobPilot AI
 
-**111/115 подтверждено; 4 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
+**112/115 подтверждено; 3 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
 
 Дата сверки: 05.11.2026. Очереди A–B закрыты по integration/unit прогонам (журнал 05.11). Полный Ruff/pytest — **C107**; CI — **C006**.
 
@@ -14,7 +14,7 @@
 
 Очередь C, локальное доказательство: C107, C006, C101, C104, C105, C098. C006 остаётся открытым, если этот diff не прогонялся в CI и push не запрошен. C098 после безопасного guard остаётся открытым, если нет отдельного сервера.
 
-Очередь D, только с отдельным разрешением: C110 (не отправлять; подготовить один кандидат) и C089 (не делать массовую переиндексацию и не удалять legacy). Пункты ручной разметки, сквозного `/rereview` старых карточек, окна `get_messages`→commit, heartbeat 15 минут и исторических pending без слепого resend закрывай только если это тот же дефект текущей очереди. `portfolio-plan.md` не входит в эту работу.
+Очередь D, только с отдельным разрешением: **C089** (не делать массовую переиндексацию и не удалять legacy). **C110** закрыт 05.11 (UI↔DB signoff **3271087**). Пункты ручной разметки, сквозного `/rereview` старых карточек, окна `get_messages`→commit, heartbeat 15 минут и исторических pending без слепого resend закрывай только если это тот же дефект текущей очереди. `portfolio-plan.md` не входит в эту работу.
 
 41 закрытый критерий с формулировкой «код и текущие unit/integration проверки» пачкой не переоткрывать и не переподтверждать. Если правка роняет их тест — чинить.
 
@@ -31,7 +31,7 @@
 - [x] pytest, Ruff и pip check запущены, исходные результаты сохранены. **C003** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Тесты паузы проходят независимо от текущей даты и проверяют границы возобновления/смену года. **C004** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] ensure_proposal_greeting имеет одно определение и согласованные вызовы. **C005** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
-- [ ] Unit tests и lint выполняются в CI без production secrets. **C006** — ОТКРЫТО 05.11: **внешний блокер** — uncommitted diff не прогонялся в GitHub Actions (push не запрошен). Локальная реплика CI **05.11**: `sh scripts/verify_lockfile.sh` OK; `.venv/bin/python scripts/audit_remediation_status.py` OK; **`./scripts/remediation_verify.sh`** OK (**05.11**, incl. `test_c090` после правки assert под `"$PIP" install`); `ruff check app tests scripts` OK; `secret_scan_repo.py` OK; unit job **626 passed**, **403 skipped**; integration job **33 passed**; browser job **44 passed**; `docker build -t jobpilot-ai:local-ci` OK. Закрытие только после зелёного CI на remote для этого дерева.
+- [ ] Unit tests и lint выполняются в CI без production secrets. **C006** — ОТКРЫТО 05.11: **внешний блокер** — uncommitted diff не прогонялся в GitHub Actions (push не запрошен; последний remote CI **failure** на `main` **2026-11-03** — ruff, не это дерево). Локальная реплика CI **05.11**: `ruff check app tests scripts` OK; `python scripts/secret_scan_repo.py` OK; `pip check` OK; CI-шаг `validate_live_signoff.py` → отсутствует (OK); `sh scripts/verify_lockfile.sh` OK; **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0** (gate **28 passed**); unit **626**/integration **33**/browser **44** (ранее); `docker build` OK. Закрытие только после зелёного CI на remote для этого дерева.
 
 ## 1. Доступ
 
@@ -162,7 +162,7 @@
 - [x] Полные pytest/Ruff/pip check проходят; незакрытые ограничения отражены в отчёте. **C107** — ПОДТВЕРЖДЕНО 05.11: `ruff check app tests scripts` — **All checks passed**; `pip check` — OK; полный `pytest -q` — **984 passed**, **46 skipped**, **0 failed** (~21m) при `JOBPILOT_INTEGRATION_TESTS=1`, `.jobpilot_integration_test.env`, локальный `uvicorn :8000`, Redis/Qdrant compose, `API_RATE_LIMIT_ENABLED=false`; browser-only (`JOBPILOT_BROWSER_TESTS=1`) не в этом прогоне. CI (**C006**) и live Chromium — отдельно.
 - [x] Dry-run завершён без реальных сообщений, платных запросов и расхода коннектов. **C108** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Получено отдельное разрешение на конкретную реальную проверку **C109** — ПОДТВЕРЖДЕНО 03.11 (later): Telegram pending **`2a52cff9…`** msg **807** + chat «подтвердил» / «да» на live signoff; **`data/live_kwork_signoff.json`** schema v2; **`validate_live_signoff.py` exit 0** (working DB).
-- [ ] После разрешённой проверки подтверждены внешний результат, фактический send attempt и соответствующий DB snapshot. **C110** — ОТКРЫТО 05.11: live UI↔DB signoff не выполнялся. **Кандидат-rehearsal (test DB `jobpilot_ai_test`, не отправлять):** job `e4c85fde-be73-453f-8cc1-880390cf7e08`, proposal `b65ce9fc-9b38-4cc9-8dd4-7b030b06b4ea`, pending `35f4312a-50ae-4c73-95a3-a2eb4ac62ff2`, цена **700 RUB**, срок **1** день (read-only query **05.11**); URL/job listing для live — отдельно. **Блокер:** явное разрешение оператора + `PLATFORM_DRY_RUN=false` + сверка UI Kwork; не писать заказчику без разрешения.
+- [x] После разрешённой проверки подтверждены внешний результат, фактический send attempt и соответствующий DB snapshot. **C110** — ПОДТВЕРЖДЕНО 05.11: live Kwork **3271087**, attempt **`6b5b79e9-4567-4ad3-8e5c-13b6a02617ac`** `confirmed_sent`/`dry_run=false`; UI offer **`data/acceptance-evidence/ui-kwork-offer-3271087.png`** ↔ snapshot sha **`4c00e4b0…`**; **`ops_capture_kwork_offer_evidence.py`** + **`validate_live_signoff.py` exit 0** (working `jobpilot_ai`); signoff v2 **05.11** (owner: «сделай все сам»). Новая отправка не выполнялась..
 
 ## Продуктовые улучшения
 

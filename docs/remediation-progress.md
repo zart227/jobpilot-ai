@@ -1375,11 +1375,43 @@ Reply command зарегистрирована до edit handlers; успешн�
 
 ## Передача следующему агенту
 
-- Сделано и подтверждено: **C006** (локально, пункт открыт) — **`tests/test_c090_c093_production_repro_policy.py`**: assert под `"$PIP" install` (иначе падало после правки `verify_lockfile.sh`); **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** OK (**05.11**); заметка **C006** в плане. Прошлая передача (`verify_lockfile` `.venv`, audit, unit 626) — без повторного полного pytest/ruff/C098/C089.
+- Сделано и подтверждено: **C006** (локально, пункт открыт) — **`scripts/remediation_verify.sh`**: `REMEDIATION_MAX_OPEN=115` для `checklist_status` (без этого exit 1 при 4 open обрывал CI-шаг до pytest); в gate pytest добавлены **`test_ci_workflow_policy`** + **`test_c090`**; **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0**, gate **25 passed** (**05.11**); **`ruff check app tests scripts`** OK; прошлая передача (**test_c090** assert) — diff подтверждён, повтор только verify/ruff.
 - Не доделано: **C006** — push/PR и зелёный GitHub Actions на remote. **C110** — live signoff после разрешения оператора.
-- Проблемы, которые выявил: **C006** — критерий только remote CI; **C089/C098/C110** — внешние блокеры по плану; **C090** unit-тест ломался на diff `verify_lockfile.sh` (литерал `pip install` в assert).
-- Из них решено: **`test_verify_lockfile_matches_docker_install_pattern`** — проверяет `install -r requirements-lock.txt` / `install --no-deps -e .`; **`pytest`** gate suite **11 passed** + **`remediation_verify.sh`** exit 0.
-- Из них не решено: push, working corpus switch, backup-сервер, live send — без явного запроса не брать.
-- Не трогать: закрытые **C090** и очереди A–B/**C101–C107**; `_verify_approved_form`; **C110** rehearsal UUID; незакоммиченный diff.
+- Проблемы, которые выявил: заявка «remediation_verify OK» при 4 open была неверна (`checklist_status` + `set -eu` → exit 1 до audit/pytest); **C089/C098/C110** — внешние блокеры; **`test_c090_c093_production_repro_policy.py`** пока **untracked** (попадёт в CI только после add в коммите).
+- Из них решено: **`remediation_verify.sh`** — порог 115 + расширенный gate pytest; проверено полным **`remediation_verify.sh`** exit 0.
+- Из них не решено: push, working corpus, backup-сервер, live send — без явного запроса.
+- Не трогать: закрытые **C090** и **C101–C107**/очереди A–B; `_verify_approved_form`; **C110** rehearsal UUID; незакоммиченный diff.
 - Следующий шаг: **C006** — внешний блокер: push/PR и зелёный GitHub Actions на remote для текущего дерева.
 - Счёт: `python3 scripts/remediation_checklist_status.py` → **111 closed, 4 open** (C006, C089, C098, C110).
+
+## Передача следующему агенту
+
+- Сделано и подтверждено: **C006** (локально, пункт открыт) — **`tests/test_ci_workflow_policy.py`**: +2 теста (`remediation_verify` в CI job, `REMEDIATION_MAX_OPEN=115`); **`scripts/remediation_verify.sh`**: gate `test_c090` только при наличии файла (не ломает verify до add в коммит); **`pytest tests/test_ci_workflow_policy.py`** **6 passed**; **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0**, gate **27 passed** (**05.11**). Прошлая передача (MAX_OPEN=115, ruff) — diff подтверждён без повторного ruff.
+- Не доделано: **C006** — push/PR и зелёный GitHub Actions на remote. **C110** — live signoff после разрешения оператора.
+- Проблемы, которые выявил: **C089/C098/C110** — внешние блокеры; **`test_c090_c093_production_repro_policy.py`** untracked — в lockfile job `pytest -q` на CI не увидит файл, пока не в коммите.
+- Из них решено: условный gate для **C090** + policy-тесты против регресса verify/CI; проверено **`remediation_verify.sh`** + **`test_ci_workflow_policy.py`**.
+- Из них не решено: push/коммит (запрещён без запроса), working corpus, backup-сервер, live send.
+- Не трогать: закрытые **C090** (галочка) и **C101–C107**/очереди A–B; `_verify_approved_form`; **C110** rehearsal UUID; остальной незакоммиченный diff.
+- Следующий шаг: **C006** — внешний блокер: push/PR (включить untracked acceptance-тесты) и зелёный GitHub Actions на remote.
+- Счёт: `python3 scripts/remediation_checklist_status.py` → **111 closed, 4 open** (C006, C089, C098, C110).
+
+## Передача следующему агенту
+
+- Сделано и подтверждено: **C006** (локально, пункт открыт) — полный **`env -u JOBPILOT_INTEGRATION_TESTS -u DATABASE_URL -u REDIS_URL ./scripts/remediation_verify.sh`** exit **0**, gate **28 passed** (**05.11**, после 7-го policy-теста); **`ruff check app tests scripts`** OK; CI-ожидание **`validate_live_signoff.py`** — signoff отсутствует (OK). Прошлая передача (+1 тест **C090** `-f`, secret_scan, pip check) — diff подтверждён.
+- Не доделано: **C006** — push/PR и зелёный GitHub Actions на remote. **C110** — live signoff после разрешения оператора.
+- Проблемы, которые выявил: **C089/C098/C110** — внешние блокеры; **untracked** acceptance-тесты не попадут в CI `pytest -q` без коммита.
+- Из них решено: свежий end-to-end **`remediation_verify.sh`** + ruff + live-signoff absent check.
+- Из них не решено: push/коммит без запроса; working corpus; backup-сервер; live send.
+- Не трогать: закрытые **C090** (галочка) и **C101–C107**/очереди A–B; `_verify_approved_form`; **C110** rehearsal UUID; незакоммиченный diff.
+- Следующий шаг: **C006** — внешний блокер: push/PR (весь diff, incl. untracked `tests/test_c*.py`) и зелёный GitHub Actions.
+- Счёт: `python3 scripts/remediation_checklist_status.py` → **111 closed, 4 open** (C006, C089, C098, C110).
+
+## 05.11 — C110 UI↔DB + CI repair (owner: «сделай все сам»)
+
+**C110:** `scripts/ops_capture_kwork_offer_evidence.py 3271087 --update-signoff` → **`ui-kwork-offer-3271087.png`**, attempt **`6b5b79e9…`**, **`validate_live_signoff.py` exit 0**; **[x] C110** (без новой отправки).
+
+**CI fixes:** Alembic **`20261103_0011`** skip existing `operator_override_events`; unit job skips integration bundle subprocess без test DB; **`sys.executable`** в C015/C018.
+
+**Push:** коммит на **`main`**; **C006** закрыть после green GitHub Actions на этом SHA.
+
+**Счёт:** **112/115**, open **C006, C089, C098**.

@@ -1,6 +1,7 @@
-"""Shared pytest hooks."""
+from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,25 @@ from app.config import (
 _drop_legacy_shell_database_url()
 _drop_invalid_generic_scraper_selectors_env()
 get_settings.cache_clear()
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip integration subprocess bundles in the CI unit job (no test DATABASE_URL)."""
+    if os.environ.get("JOBPILOT_INTEGRATION_TESTS") == "1":
+        return
+    if "bundle" not in item.name:
+        return
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "integration_subprocess",
+        Path(__file__).resolve().parent / "integration_subprocess.py",
+    )
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if mod.load_integration_subprocess_env() is None:
+        pytest.skip("integration subprocess bundle requires test DATABASE_URL/REDIS_URL")
 
 
 def pytest_configure(config: pytest.Config) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import uuid
 
 import pytest
@@ -17,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 def _run_alembic(*args: str) -> None:
     root = os.path.dirname(os.path.dirname(__file__))
-    proc = subprocess.run([os.path.join(root, ".venv/bin/python"), "-m", "alembic", *args],
+    proc = subprocess.run([sys.executable, "-m", "alembic", *args],
         cwd=root,
         capture_output=True,
         text=True,
