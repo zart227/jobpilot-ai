@@ -20,8 +20,6 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     """Skip integration subprocess bundles in the CI unit job (no test DATABASE_URL)."""
     if os.environ.get("JOBPILOT_INTEGRATION_TESTS") == "1":
         return
-    if "bundle" not in item.name:
-        return
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -31,8 +29,17 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    if mod.load_integration_subprocess_env() is None:
+    if mod.load_integration_subprocess_env() is not None:
+        return
+    if "bundle" in item.name or "drill" in item.name:
         pytest.skip("integration subprocess bundle requires test DATABASE_URL/REDIS_URL")
+    module_file = Path(getattr(item.module, "__file__", "") or "")
+    if (
+        module_file.name.startswith("test_c")
+        and "acceptance" in module_file.name
+        and "evidence_modules_present" not in item.name
+    ):
+        pytest.skip("C acceptance subprocess requires test DATABASE_URL/REDIS_URL")
 
 
 def pytest_configure(config: pytest.Config) -> None:

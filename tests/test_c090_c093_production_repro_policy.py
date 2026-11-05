@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 PROD = (ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
@@ -42,17 +44,23 @@ def test_prod_compose_app_services_only_mount_data() -> None:
 
 def test_merged_prod_compose_has_no_app_source_bind_mounts() -> None:
     if not shutil.which("docker"):
-        return
+        pytest.skip("docker CLI not available")
+    env_file = ROOT / ".env"
+    if not env_file.is_file():
+        env_file = ROOT / ".env.example"
+    cmd = [
+        "docker",
+        "compose",
+        "--env-file",
+        str(env_file),
+        "-f",
+        "docker-compose.yml",
+        "-f",
+        "docker-compose.prod.yml",
+        "config",
+    ]
     proc = subprocess.run(
-        [
-            "docker",
-            "compose",
-            "-f",
-            "docker-compose.yml",
-            "-f",
-            "docker-compose.prod.yml",
-            "config",
-        ],
+        cmd,
         cwd=ROOT,
         capture_output=True,
         text=True,
