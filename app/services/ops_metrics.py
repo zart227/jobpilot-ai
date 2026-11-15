@@ -15,6 +15,8 @@ from app.db.send_attempt_states import (
     ATTEMPT_KNOWN_FAILED,
     ATTEMPT_UNKNOWN_RESULT,
 )
+
+UNKNOWN_RESULT_PREVIEW_LIMIT = 8
 from app.db.workflow_states import JOB_STATUS_PERMANENT_ERROR
 
 
@@ -159,6 +161,34 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
         select(func.max(NotificationOutbox.sent_at)).where(NotificationOutbox.status == "sent")
     )
 
+    unknown_preview_rows = await session.execute(
+        select(SendAttempt, Job)
+        .outerjoin(Job, SendAttempt.job_id == Job.id)
+        .where(SendAttempt.status == ATTEMPT_UNKNOWN_RESULT)
+        .order_by(
+            SendAttempt.finished_at.desc().nulls_last(),
+            SendAttempt.created_at.desc(),
+        )
+        .limit(UNKNOWN_RESULT_PREVIEW_LIMIT)
+    )
+    unknown_result_previews: list[dict[str, Any]] = []
+    for attempt, job in unknown_preview_rows.all():
+        platform = attempt.platform_response or {}
+        unknown_result_previews.append(
+            {
+                "attempt_id": str(attempt.id),
+                "job_id": str(attempt.job_id) if attempt.job_id else None,
+                "order_id": job.external_id if job else None,
+                "title": (job.title or "")[:120] if job else None,
+                "finished_at": (
+                    attempt.finished_at.isoformat() if attempt.finished_at else None
+                ),
+                "last_error": (attempt.last_error or "")[:500] or None,
+                "error_label": platform.get("error_label"),
+                "ambiguous": platform.get("ambiguous"),
+            }
+        )
+
     total_jobs_count = int(total_jobs.scalar() or 0)
     confirmed_send_jobs_count = int(confirmed_send_jobs.scalar() or 0)
     last_confirmed_at = last_confirmed_send.scalar()
@@ -175,6 +205,7 @@ async def collect_ops_metrics(session: AsyncSession) -> dict[str, Any]:
             "unknown_result": int(unknown_attempts.scalar() or 0),
             "known_failed": int(known_failed_attempts.scalar() or 0),
             "sending": int(sending_attempts.scalar() or 0),
+            "unknown_result_previews": unknown_result_previews,
         },
         "jobs": {
             "total": total_jobs_count,

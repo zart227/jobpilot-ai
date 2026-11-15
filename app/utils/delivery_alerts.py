@@ -2,6 +2,11 @@
 
 import html
 
+from app.utils.delivery_errors import (
+    SEND_ATTEMPT_BLOCK_REASONS,
+    format_proposal_send_block_message,
+)
+
 
 def format_inbox_send_failure(
     username: str,
@@ -12,11 +17,16 @@ def format_inbox_send_failure(
     lines = [
         f"❌ <b>Не удалось отправить ответ</b> клиенту {html.escape(username)}.",
     ]
-    detail = error or blocked_reason
+    reason = blocked_reason or ""
+    detail = error
+    if blocked_reason in SEND_ATTEMPT_BLOCK_REASONS:
+        detail = format_proposal_send_block_message(blocked_reason, last_error=error)
+    elif not detail and blocked_reason:
+        detail = blocked_reason
     if detail:
         lines.append(f"\n<b>Причина:</b> {html.escape(detail)}")
     reason_lower = (blocked_reason or error or "").lower()
-    if "unknown" in reason_lower or reason_lower == "send_blocked":
+    if blocked_reason == "unknown_result" or "неопредел" in (detail or "").lower():
         lines.append(
             "\n\n⚠️ <b>Неопределённый результат</b>: сообщение могло уйти на Kwork. "
             "Проверьте переписку вручную перед повторной отправкой."

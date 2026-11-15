@@ -7,6 +7,16 @@ from app.llm.ollama_free_usage import (
 )
 
 
+def test_payg_settings_page_omits_free_plan():
+    from app.llm.ollama_free_usage import settings_omits_free_plan
+
+    html = '''<details id="settings-account-menu"><span>a@example.test</span></details>
+    <section id="usage-cost-report"></section>'''
+    assert settings_omits_free_plan(html) is True
+    assert settings_omits_free_plan(html + '<div id="free-plan-models"></div>') is False
+    assert settings_omits_free_plan('<html>Sign in</html>') is False
+
+
 def test_extracts_only_labelled_free_usage_list():
     html = '''<ul><li><a>paid-model</a></li></ul>
     <div id="free-plan-models"><div>Free usage credits can be used with the following cloud models:</div>
@@ -14,6 +24,28 @@ def test_extracts_only_labelled_free_usage_list():
     <li><a href="/library/gemma4">gemma4:31b</a></li></ul></div>
     <ul><li><a>later-paid-model</a></li></ul>'''
     assert parse_free_usage_model_list(html) == ['gpt-oss:20b', 'gemma4:31b']
+
+
+def test_extracts_inline_free_usage_links():
+    html = '''
+    <div id="free-plan-models" class="rounded-xl">
+    Free usage covers <a href="/library/beam">beam</a>, <a href="/library/gpt-oss:20b">gpt-oss:20b</a>.
+    <a href="/upgrade">Upgrade</a> to use any cloud model.
+    </div>'''
+    assert parse_free_usage_model_list(html) == ['beam', 'gpt-oss:20b']
+    models, quota = parse_free_usage_entitlement(html)
+    assert models == ['beam', 'gpt-oss:20b']
+    assert quota == 0.0
+
+
+def test_inline_format_excludes_model_with_single_retirement_warning():
+    html = '''
+    <div id="free-plan-models">
+    Free usage covers <a href="/library/gpt-oss:20b">gpt-oss:20b</a>,
+    <a href="/library/nemotron-3-nano:30b">nemotron-3-nano:30b</a>.
+    </div>
+    <p>Модель nemotron-3-nano:30b будет снята с производства через 1 день.</p>'''
+    assert parse_free_usage_entitlement(html) == (['gpt-oss:20b'], 0.0)
 
 
 @pytest.mark.parametrize('html', [

@@ -243,6 +243,50 @@ async def test_ollama_cloud_auto_uses_current_entitlement_and_excludes_retired()
 
 
 @pytest.mark.asyncio
+async def test_ollama_payg_auto_stays_on_cheap_models():
+    from app.llm.model_catalog import invalidate_ollama_catalog
+
+    invalidate_ollama_catalog()
+    cfg = settings(OLLAMA_BASE_URL='https://ollama.com', OLLAMA_SESSION_COOKIE='cookie', OLLAMA_AID='aid')
+    records = [{'name': 'kimi-k3'}, {'name': 'gpt-oss:20b'}, {'name': 'gemma4:31b'}]
+    html = '''<details id="settings-account-menu"><span>same@example.test</span></details>
+    <section id="usage-cost-report"></section>'''
+
+    def handler(request):
+        if request.url.path == '/settings':
+            return httpx.Response(200, text=html)
+        if request.url.path == '/api/me':
+            return httpx.Response(200, json={'Email': 'same@example.test'})
+        return httpx.Response(200, json={'capabilities': ['completion'], 'model_info': {'x.context_length': 8192}})
+
+    original = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return original(transport=httpx.MockTransport(handler))
+
+    with patch('app.llm.model_catalog.fetch_ollama_models', AsyncMock(return_value=records)), \
+         patch('app.llm.model_catalog.httpx.AsyncClient', side_effect=client_factory):
+        assert await resolve_ollama_model(cfg, 'auto', task=ModelTask.SIMPLE) == 'gpt-oss:20b'
+
+
+@pytest.mark.asyncio
+async def test_ollama_cloud_unrecognized_page_is_retryable():
+    from app.llm.model_catalog import invalidate_ollama_catalog
+
+    invalidate_ollama_catalog()
+    cfg = settings(OLLAMA_BASE_URL='https://ollama.com', OLLAMA_SESSION_COOKIE='cookie', OLLAMA_AID='aid')
+    original = httpx.AsyncClient
+
+    def client_factory(**kwargs):
+        return original(transport=httpx.MockTransport(lambda request: httpx.Response(200, text='<html></html>')))
+
+    with patch('app.llm.model_catalog.httpx.AsyncClient', side_effect=client_factory):
+        with pytest.raises(LLMServiceError, match='entitlement is unavailable') as caught:
+            await resolve_ollama_model(cfg, 'auto', task=ModelTask.SIMPLE)
+    assert caught.value.retryable is True
+
+
+@pytest.mark.asyncio
 async def test_ollama_cloud_auto_does_not_follow_expired_session_redirect():
     from app.llm.model_catalog import invalidate_ollama_catalog
 

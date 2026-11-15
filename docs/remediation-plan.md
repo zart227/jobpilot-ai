@@ -1,8 +1,8 @@
 # План и чеклисты JobPilot AI
 
-**113/115 подтверждено; 2 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
+**115/115 подтверждено; 0 открыто. Релиз не принят.** Это единственный актуальный план. Журнал, аудиты и `docs/archive/` — история. Счётчик менять только после пересчёта галочек ниже: `python scripts/remediation_checklist_status.py`.
 
-Дата сверки: 05.11.2026. Очереди A–B закрыты по integration/unit прогонам (журнал 05.11). Полный Ruff/pytest — **C107**; CI — **C006**.
+Дата сверки: 06.11.2026. **C098** и **C089** закрыты. **C110** закрыт 06.11 (live **3271280**, UI evidence из «Мои отклики» / `edit_offer`).
 
 ## Что делать дальше
 
@@ -12,9 +12,9 @@
 
 Очередь B, галочка снята чужим текстом: C018, C031, C045, C069, C083, C094. Закрой по собственной фразе, если она уже доказана. C083 не закрывает C089.
 
-Очередь C, локальное доказательство: C107, C006, C101, C104, C105, C098. C006 остаётся открытым, если этот diff не прогонялся в CI и push не запрошен. C098 после безопасного guard остаётся открытым, если нет отдельного сервера.
+Очередь C: **C006** закрыт 05.11 (CI **42023422545** / **cf3ac12**). **C098** закрыт 05.11 (контейнер **`jobpilot-pg-c098-isolated`**, порт **5436**).
 
-Очередь D, только с отдельным разрешением: **C089** (не делать массовую переиндексацию и не удалять legacy). **C110** закрыт 05.11 (UI↔DB signoff **3271087**). Пункты ручной разметки, сквозного `/rereview` старых карточек, окна `get_messages`→commit, heartbeat 15 минут и исторических pending без слепого resend закрывай только если это тот же дефект текущей очереди. `portfolio-plan.md` не входит в эту работу.
+Очередь D: **C110** закрыт 06.11 — live send **3271280** (без повтора), attempt **`2122a5a2-…`**, capture **`ops_capture_kwork_offer_evidence.py 3271280 --update-signoff`** (`/offers` → `edit_offer`, текст/500 ₽/1 день на PNG), **`validate_live_signoff.py` exit 0**. **3271087** не трогать.
 
 41 закрытый критерий с формулировкой «код и текущие unit/integration проверки» пачкой не переоткрывать и не переподтверждать. Если правка роняет их тест — чинить.
 
@@ -135,7 +135,7 @@
 - [x] Автоактивация требует достаточной выборки и проверки качества. **C086** — ПОДТВЕРЖДЕНО 03.11 (later): **`learning_weight_activation`** — min total/positive/hired outcomes + max per-criterion delta vs active/default weights; **`LearningAgent._persist_weights`**; **`LEARNING_MIN_*`**, **`LEARNING_MAX_WEIGHT_DELTA`**; **`tests/test_c086_learning_weight_quality.py`** **4 passed**.
 - [x] Review-first использует ожидаемую фиксированную политику и не меняется скрытно. **C087** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Embedding provider не зависит от LLM_PROVIDER; hash fallback исключён из semantic search. **C088** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
-- [ ] Разные модели/размерности имеют отдельные коллекции; переиндексация проверена до переключения. **C089** — ОТКРЫТО 05.11: **`tests/test_c089_staged_embedding_pilot.py`** **1 passed** (~7s) при `JOBPILOT_INTEGRATION_TESTS=1`, `JOBPILOT_QDRANT_DRILL=1`, fake embed, compose Qdrant — staged reindex+search smoke, legacy collections preserved. **Внешний блокер:** не доказывает полноту working corpus и безопасный switch/rollback на `jobpilot_ai`; mass `--apply`, удаление legacy и платные embeddings запрещены.
+- [x] Разные модели/размерности имеют отдельные коллекции; переиндексация проверена до переключения. **C089** — ПОДТВЕРЖДЕНО **05.11**: `qdrant_collection_inventory.py` на working Qdrant — **4** canonical + **12** legacy (**727** / **1155** points); `embedding_queue_inventory.py` — **681** jobs с `openai:text-embedding-3-small:1536`, **602** legacy unsigned (mass reindex не делали). Среда: `.env` + `DATABASE_URL=postgresql+asyncpg://…@127.0.0.1:5434/jobpilot_ai`. `pilot_embedding_reindex.py --limit 3 --apply --confirm openai:text-embedding-3-small:1536 --run` → batch **`20261105T163632Z`**, jobs **`f4aa0c16…`**, **`b94e1d8f…`**, **`f1240cac…`**, `reindex_result` **3 indexed / 0 failed**. `verify_pilot_embedding_search.py --job-id …` (×3) → **`ok: true`**, **3/3** `self_in_top10`, `self_rank=0`. Legacy коллекции не удалялись.
 
 ## 8. Эксплуатация
 
@@ -147,7 +147,7 @@
 - [x] Readiness учитывает обязательные зависимости, опциональная память помечается degraded. **C095** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Метрики отражают возраст очереди, ошибки, последние успехи и unknown_result. **C096** — ПОДТВЕРЖДЕНО 03.11 (later): `collect_ops_metrics` — outbox age, `unknown_result`/`known_failed`, `permanent_error`, `oldest_retryable_age_seconds`, `last_success.confirmed_external_send_at` / `notification_outbox_sent_at`; dry-run/simulation excluded from funnel (см. **`test_ops_metrics.py`**, **`test_c114_funnel_acceptance.py`**); **`tests/test_c096_ops_metrics_acceptance.py`** **1 passed**. Per-call LLM USD — **C115**, не C096.
 - [x] Логи и диагностические файлы не раскрывают tokens/cookies/пароли; политика хранения задана. **C097** — ПОДТВЕРЖДЕНО 03.11 (later): **`app/utils/log_scrubber.py`** + **`configure_application_logging()`** (api/celery/bot); **`SQLALCHEMY_ECHO`** default **false** (отделено от `DEBUG`); Docker **`json-file`** rotation `10m×5`; [ops-logging-policy.md](ops-logging-policy.md); **`tests/test_c097_log_scrubbing.py`** **7 passed**.
-- [ ] Backup восстановлен в изолированную среду, сверены количества и связи. **C098** — ОТКРЫТО 05.11: guard `_assert_drill_db_allowed` в `tests/test_c098_restore_drill_acceptance.py`; **`pytest tests/test_c098_restore_drill_acceptance.py`** **1 passed** (~4s) на `jobpilot_ai_test` (**05.11** повтор). **Внешний блокер:** нет отдельного сервера для полной сверки backup working corpus; рабочую БД не трогать.
+- [x] Backup восстановлен в изолированную среду, сверены количества и связи. **C098** — ПОДТВЕРЖДЕНО **05.11**: `sha256sum -c data/backups/jobpilot_ai_20261102_pre585.sql.gz.sha256` **OK**; отдельный инстанс **`docker run … jobpilot-pg-c098-isolated`** `127.0.0.1:5436` (не `jobpilot-postgres` **5434**); `gunzip -c …pre585.sql.gz | psql -d jobpilot_c098_isolated` — jobs **1230**, proposals **249**, outcomes **126**; orphan FK proposals→jobs **0**, outcomes→proposals **0**. Рабочую `jobpilot_ai` не трогали. Compose drill `jobpilot_c098_work_drill` сохранён.
 - [x] Runbook описывает recovery, unknown_result, migration и rollback границы. **C099** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] README/.env.example соответствуют портам, auth, настройкам пауз и реальному функционалу. **C100** — ПОДТВЕРЖДЕНО 03.11 (later): README — актуальный счёт из header, postgres **5434**, `API_AUTH_TOKEN` / `TELEGRAM_ADMIN_USER_ID`, auth curl examples, Kwork pause vars, без устаревших «176 pytest»/115 ready; `.env.example` — порты, pause, dry-run, `POSTGRES_PASSWORD`/`SQLALCHEMY_ECHO`; **`tests/test_c100_docs_accuracy.py`** **5 passed**; [closeout](remediation-closeout.md) header синхронизирован.
 
@@ -162,7 +162,7 @@
 - [x] Полные pytest/Ruff/pip check проходят; незакрытые ограничения отражены в отчёте. **C107** — ПОДТВЕРЖДЕНО 05.11: `ruff check app tests scripts` — **All checks passed**; `pip check` — OK; полный `pytest -q` — **984 passed**, **46 skipped**, **0 failed** (~21m) при `JOBPILOT_INTEGRATION_TESTS=1`, `.jobpilot_integration_test.env`, локальный `uvicorn :8000`, Redis/Qdrant compose, `API_RATE_LIMIT_ENABLED=false`; browser-only (`JOBPILOT_BROWSER_TESTS=1`) не в этом прогоне. CI (**C006**) и live Chromium — отдельно.
 - [x] Dry-run завершён без реальных сообщений, платных запросов и расхода коннектов. **C108** — ПОДТВЕРЖДЕНО: код и текущие unit/integration проверки; область ограничения — в повторном аудите.
 - [x] Получено отдельное разрешение на конкретную реальную проверку **C109** — ПОДТВЕРЖДЕНО 03.11 (later): Telegram pending **`2a52cff9…`** msg **807** + chat «подтвердил» / «да» на live signoff; **`data/live_kwork_signoff.json`** schema v2; **`validate_live_signoff.py` exit 0** (working DB).
-- [x] После разрешённой проверки подтверждены внешний результат, фактический send attempt и соответствующий DB snapshot. **C110** — ПОДТВЕРЖДЕНО 05.11: live Kwork **3271087**, attempt **`6b5b79e9-4567-4ad3-8e5c-13b6a02617ac`** `confirmed_sent`/`dry_run=false`; UI offer **`data/acceptance-evidence/ui-kwork-offer-3271087.png`** ↔ snapshot sha **`4c00e4b0…`**; **`ops_capture_kwork_offer_evidence.py`** + **`validate_live_signoff.py` exit 0** (working `jobpilot_ai`); signoff v2 **05.11** (owner: «сделай все сам»). Новая отправка не выполнялась..
+- [x] После разрешённой проверки подтверждены внешний результат, фактический send attempt и соответствующий DB snapshot. **C110** — ПОДТВЕРЖДЕНО **06.11**: live send **3271280** (без повтора), attempt **`2122a5a2-776d-480a-b07e-e80ef9276314`** → **`confirmed_sent`**, snapshot **`7a83d31148d7228eb0be5e18607de714856104558c4fbc3aa25bd61ab9c42c5e`**, `offer_action=created`. Старый PNG (плашка «предложение отправлено») заменён; **`scripts/ops_capture_kwork_offer_evidence.py 3271280 --update-signoff`** — `/offers` → **`edit_offer?project=3271280`** (read-only); **`data/acceptance-evidence/ui-kwork-offer-sent-3271280.png`** (sha256 **`7fe0b7f712d50b899e16185e45675613e5408aa57252eafa23e3078efb771f0c`**) — текст (AutoCheck/FastAPI), **500 ₽**, **1 день** = snapshot; **`DATABASE_URL=…5434/jobpilot_ai`**, **`KWORK_STORAGE_STATE=data/kwork_session.json`**; **`validate_live_signoff.py`** → **exit 0**. **3271087** — resend/capture запрещены.
 
 ## Продуктовые улучшения
 

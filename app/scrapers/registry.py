@@ -3,6 +3,7 @@ import structlog
 from app.config import get_settings
 from app.scrapers.base import BaseScraper
 from app.scrapers.fl_ru import FlRuScraper
+from app.scrapers.weblancer import WeblancerScraper
 from app.scrapers.generic import GenericMarketplaceScraper
 from app.scrapers.kwork import KworkScraper
 from app.scrapers.upwork import UpworkScraper
@@ -14,6 +15,7 @@ SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "kwork": KworkScraper,
     "upwork": UpworkScraper,
     "fl_ru": FlRuScraper,
+    "weblancer": WeblancerScraper,
 }
 
 

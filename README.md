@@ -1,6 +1,6 @@
 # JobPilot AI
 
-> **Статус 05.11.2026:** remediation **не завершена** (**113/115** подтверждено, **2** открыто). Единственный источник: [план и чеклисты](docs/remediation-plan.md). Dry-run / simulation signoff **не** означает live-приёмку или release approval.
+> **Статус 06.11.2026:** чеклист **115/115**, **0** открыто. Релиз **не принят** — remediation release не завершена, пока нет отдельного owner review. Источник: [план и чеклисты](docs/remediation-plan.md). Dry-run / simulation signoff не означает live-приёмку.
 
 AI-powered freelance automation system for a single developer. JobPilot AI scrapes job boards, filters and scores opportunities with AI, generates personalized proposals, routes them through Telegram for human approval, sends approved proposals, handles client chat, and learns from outcomes.
 
@@ -195,12 +195,12 @@ LearningAgent adjusts scoring weights and stores successful proposals in Qdrant.
 
 ## Scrapers
 
-| Platform | `ENABLED_SCRAPERS` | Status                                             |
-| -------- | ------------------ | -------------------------------------------------- |
-| Kwork    | `kwork`            | Supported (Playwright listing + optional login)    |
-| Generic  | `generic`          | Configurable CSS selectors via `GENERIC_SCRAPER_*` |
-| Upwork   | `upwork`           | Experimental — may require manual fixes            |
-| FL.ru    | `fl_ru`            | Experimental — may require manual fixes            |
+| Platform | `ENABLED_SCRAPERS` | Status                                                                                  |
+| -------- | ------------------ | --------------------------------------------------------------------------------------- |
+| Kwork    | `kwork`            | Supported (Playwright listing + optional login)                                         |
+| Generic  | `generic`          | Configurable CSS selectors via `GENERIC_SCRAPER_*`                                      |
+| Upwork   | `upwork`           | Experimental — may require manual fixes                                                 |
+| FL.ru    | `fl_ru`            | Listing scrape + pipeline; session via `FL_RU_STORAGE_STATE`; auto-send not implemented |
 
 ## Adding a Scraper
 

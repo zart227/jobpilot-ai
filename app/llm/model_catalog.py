@@ -258,6 +258,11 @@ def _ollama_record_name(record: dict[str, Any]) -> str:
     return str(record.get("name") or record.get("model") or "").strip()
 
 
+# Cloud auto used to require the free-model list. Pay-as-you-go accounts no longer
+# publish one, so auto stays on these low-priced models instead of the full catalog.
+PAYG_CLOUD_AUTO_MODELS = ("gpt-oss:20b", "gemma4:31b", "nemotron-3-super")
+
+
 def select_ollama_installed_model(
     records: list[dict[str, Any]],
     *,
@@ -307,9 +312,17 @@ def select_ollama_installed_model(
     return chosen
 
 
-async def fetch_ollama_free_entitlement(settings: Settings) -> list[str]:
-    """Read current account entitlement; never follow an authentication redirect."""
-    from app.llm.ollama_free_usage import parse_free_usage_entitlement, parse_settings_account_email
+async def fetch_ollama_free_entitlement(settings: Settings) -> list[str] | None:
+    """Read current account entitlement; never follow an authentication redirect.
+
+    Returns the free-model allowlist, or None when the signed-in settings page
+    no longer publishes one (pay-as-you-go).
+    """
+    from app.llm.ollama_free_usage import (
+        parse_free_usage_entitlement,
+        parse_settings_account_email,
+        settings_omits_free_plan,
+    )
     from app.llm.ollama_usage import _build_cookie_header, _cookies_configured
 
     if not _cookies_configured(settings):
@@ -318,25 +331,39 @@ async def fetch_ollama_free_entitlement(settings: Settings) -> list[str]:
     cache_key = hashlib.sha256((cookie + '\0' + settings.ollama_api_key).encode()).hexdigest()
     cached = _ollama_entitlement_cache.get(cache_key)
     if cached and cached[0] > time.monotonic():
-        return list(cached[1])
+        cached_models = cached[1]
+        return None if cached_models is None else list(cached_models)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(settings.ollama_timeout_seconds), follow_redirects=False) as client:
             response = await client.get('https://ollama.com/settings', headers={'Cookie': cookie, 'Accept': 'text/html'})
             if response.status_code in (301, 302, 303, 307, 308, 401, 403):
                 raise LLMServiceError(LLMErrorKind.AUTH, 'Ollama settings session expired or requires verification', False)
             response.raise_for_status()
-            models, quota = parse_free_usage_entitlement(response.text)
+            if settings_omits_free_plan(response.text):
+                models = None
+                quota = None
+            else:
+                models, quota = parse_free_usage_entitlement(response.text)
             session_email = parse_settings_account_email(response.text)
             actor = await client.post('https://ollama.com/api/me', headers={'Authorization': f'Bearer {settings.ollama_api_key}'}, json={})
             actor.raise_for_status()
             api_email = actor.json().get('Email')
             if not isinstance(api_email, str) or api_email.strip().lower() != session_email:
-                raise ValueError('Ollama session and API key account identities do not match')
+                raise LLMServiceError(
+                    LLMErrorKind.AUTH,
+                    'Ollama free usage entitlement is unavailable or unrecognized',
+                    False,
+                )
+    except LLMServiceError:
+        raise
     except (httpx.HTTPError, ValueError) as exc:
-        raise LLMServiceError(LLMErrorKind.SERVER, 'Ollama free usage entitlement is unavailable or unrecognized', False) from exc
+        raise LLMServiceError(LLMErrorKind.SERVER, 'Ollama free usage entitlement is unavailable or unrecognized', True) from exc
     _ollama_entitlement_cache[cache_key] = (
         time.monotonic() + min(300, max(30, settings.ollama_models_cache_seconds)), models
     )
+    if models is None:
+        logger.warning('Ollama settings has no free-model list; auto limited to cheap cloud models')
+        return None
     logger.info('Ollama free usage entitlement refreshed', model_count=len(models), used_percent=quota)
     return list(models)
 
@@ -355,8 +382,10 @@ async def resolve_ollama_model(
     except ValueError:
         loopback = False
     entitlement = None
+    payg_cloud = False
     if not loopback and settings.ollama_base_url.rstrip('/') == 'https://ollama.com':
         entitlement = await fetch_ollama_free_entitlement(settings)
+        payg_cloud = entitlement is None
     elif not loopback:
         raise LLMServiceError(
             LLMErrorKind.SERVER,
@@ -366,9 +395,19 @@ async def resolve_ollama_model(
     prefer = settings.ollama_auto_prefer
     if task == ModelTask.SCORING:
         prefer = settings.ollama_scoring_auto_prefer or prefer
+    if payg_cloud and not prefer.strip():
+        prefer = ",".join(PAYG_CLOUD_AUTO_MODELS)
     records = await fetch_ollama_models(settings)
-    if entitlement is not None:
+    allowed: set[str] | None = None
+    if payg_cloud:
+        allowed = set(PAYG_CLOUD_AUTO_MODELS)
+        logger.warning(
+            "Ollama pay-as-you-go auto selection",
+            allowed=list(PAYG_CLOUD_AUTO_MODELS),
+        )
+    elif entitlement is not None:
         allowed = set(entitlement)
+    if allowed is not None:
         records = [record for record in records if isinstance(record, dict) and (
             _ollama_record_name(record) in allowed
             or _ollama_record_name(record).removesuffix(':latest') in allowed

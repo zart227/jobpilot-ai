@@ -261,7 +261,7 @@ async def _send_outbox_row(bot, row: NotificationOutbox) -> bool:
     if row.kind == "inbox_alert":
         markup = inbox_reply_keyboard(pending_id)
     elif row.kind == "proposal_approval":
-        markup = approval_keyboard(pending_id)
+        markup = approval_keyboard(pending_id, platform=payload.get("platform"))
     else:
         raise ValueError(f"unknown outbox kind: {row.kind}")
 

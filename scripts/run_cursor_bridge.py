@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
@@ -49,9 +51,48 @@ def _port_listening(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def _port_from_bridge_url(url: str, fallback: int) -> int:
+    try:
+        parsed = urlparse(url)
+        if parsed.port is not None:
+            return int(parsed.port)
+    except Exception:
+        pass
+    return fallback
+
+
+async def _wait_for_tcp(host: str, port: int, *, timeout: float = 30.0) -> None:
+    """Block until something accepts TCP on host:port (bridge bound to its real port)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if _port_listening(host, port):
+            return
+        if loop.time() >= deadline:
+            raise RuntimeError(f"Timeout waiting for bridge TCP {host}:{port}")
+        await asyncio.sleep(0.05)
+
+
 def _bridge_healthy(port: int) -> bool:
     pid = _read_pid()
-    return bool(pid and _pid_running(pid) and _port_listening("127.0.0.1", port))
+    if not (pid and _pid_running(pid)):
+        return False
+    if _port_listening("127.0.0.1", port):
+        return True
+    # Bridge may bind to an ephemeral port; check the last written docker URL.
+    file_values: dict[str, str] = {}
+    if BRIDGE_ENV_FILE.is_file():
+        for line in BRIDGE_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            k, v = stripped.split("=", 1)
+            file_values[k.strip()] = v.strip().strip('"').strip("'")
+    base = file_values.get("CURSOR_BRIDGE_BASE_URL", "")
+    if base.startswith("http://host.docker.internal:"):
+        inner = int(base.rsplit(":", 1)[-1])
+        return _port_listening("127.0.0.1", inner)
+    return False
 
 
 def _print_existing_config(port: int) -> None:
@@ -121,6 +162,10 @@ async def main() -> None:
         print("Bridge started but endpoint is unknown", file=sys.stderr)
         await client.aclose()
         raise SystemExit(1)
+
+    listen_port = _port_from_bridge_url(endpoint.url, args.port)
+    bind_host = args.host if args.host not in ("", "0.0.0.0") else "127.0.0.1"
+    await _wait_for_tcp(bind_host, listen_port)
 
     docker_url = f"http://host.docker.internal:{args.public_port}"
     env_path = write_bridge_env_file(docker_url, endpoint.auth_token, workspace)

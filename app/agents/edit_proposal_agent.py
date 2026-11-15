@@ -33,7 +33,8 @@ Rules (critical):
 KWORK_EXTRA = """
 Kwork offer rules:
 - Sound like an experienced freelancer, not a template.
-- Do not add filler ("готов взяться", "имею большой опыт").
+- Do not add filler ("готов взяться", "имею большой опыт",
+  "интересная задача", "выглядит интересной", "looks interesting").
 - Keep numbered clarifying questions if the user did not ask to remove them."""
 
 

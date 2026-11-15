@@ -35,6 +35,6 @@ Historical finding statuses below are dated and may be stale. Current plan and c
 - Findings: **23**
 - By status: {'partial': 14, 'rework': 5, 'done': 4}
 - Historical checklist snapshot: 51/115 confirmed, 64 open.
-- Current checklist markers (not independent evidence): 98/115 closed, 17 open.
+- Current checklist markers (not independent evidence): 112/115 closed, 3 open.
 - Release not accepted. Live/staging criteria cannot be replaced by simulated evidence.
 - Review evidence is dated; update it when code or accepted behavior changes.

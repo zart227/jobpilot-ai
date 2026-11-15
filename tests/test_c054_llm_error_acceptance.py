@@ -21,6 +21,27 @@ PIPELINE_LLM_MODULES = [
 ]
 
 
+@pytest.mark.asyncio
+async def test_filter_processing_error_survives_compiled_graph(monkeypatch):
+    from app.agents import graph as graph_mod
+
+    async def boom(state):
+        return {
+            "pipeline_processing_error": True,
+            "processing_retryable": True,
+            "processing_stage": "filter",
+            "processing_error_kind": "server",
+            "error": "entitlement",
+            "relevance_reason": "entitlement",
+        }
+
+    monkeypatch.setattr(graph_mod, "filter_node", boom)
+    result = await graph_mod.compile_jobpilot_graph().ainvoke({"job_data": {}})
+    assert result["pipeline_processing_error"] is True
+    assert result["processing_retryable"] is True
+    assert result["relevance_reason"] == "entitlement"
+
+
 def test_pipeline_llm_modules_use_shared_error_mapper():
     missing = []
     for rel in PIPELINE_LLM_MODULES:

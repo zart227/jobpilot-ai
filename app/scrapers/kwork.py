@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -47,6 +48,8 @@ class KworkScraper(BaseScraper):
     async def _scrape_listing_pages(self, page: Any) -> list[NormalizedJob]:
         jobs: list[NormalizedJob] = []
         seen_ids: set[str] = set()
+        page.set_default_timeout(30_000)
+        page.set_default_navigation_timeout(60_000)
         for page_num in range(1, self._max_pages + 1):
             url = self._page_url(page_num)
             try:
@@ -69,7 +72,11 @@ class KworkScraper(BaseScraper):
 
             for i in range(count):
                 card = cards.nth(i)
-                job = await self._extract_kwork_card(card, page)
+                try:
+                    job = await asyncio.wait_for(self._extract_kwork_card(card, page), timeout=90)
+                except TimeoutError:
+                    logger.warning("Kwork card extraction timed out", page=page_num, index=i)
+                    return jobs
                 if job and job.external_id not in seen_ids:
                     seen_ids.add(job.external_id)
                     jobs.append(job)

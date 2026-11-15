@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings, get_settings
-from app.db.models import Interaction, Job, Proposal, SendAttempt, TelegramInboxPending
+from app.db.models import Interaction, Job, Proposal, SendAttempt, TelegramInboxPending, TelegramPending
 from app.db.send_attempt_states import (
     ATTEMPT_CONFIRMED_SENT,
     ATTEMPT_KIND_INBOX_REPLY,
@@ -44,9 +44,57 @@ from app.services.submission_policy import (
     job_has_submitted_proposal,
     validate_submission_action_for_send,
 )
-from app.utils.delivery_errors import is_ambiguous_send_error
+from app.utils.delivery_errors import (
+    humanize_kwork_browser_error,
+    is_ambiguous_send_error,
+    is_playwright_form_fill_error,
+)
 
 logger = structlog.get_logger(__name__)
+
+_RETRYABLE_UNKNOWN_LABELS = frozenset(
+    {
+        "form_fill_error",
+        "navigation_error",
+        "browser_navigation_failed",
+        "exception",
+        "seller_profile",
+        "exchange_lesson",
+    }
+)
+
+
+def unknown_result_is_retryable(attempt: SendAttempt) -> bool:
+    """Misclassified or definitive UI failures should not block the next send attempt."""
+    if attempt.status != ATTEMPT_UNKNOWN_RESULT:
+        return False
+    platform = attempt.platform_response or {}
+    if platform.get("offer_action") in ("created", "updated"):
+        return False
+    if platform.get("ambiguous") is True:
+        label = platform.get("error_label")
+        if label not in _RETRYABLE_UNKNOWN_LABELS:
+            return False
+    label = platform.get("error_label")
+    if label in _RETRYABLE_UNKNOWN_LABELS:
+        return True
+    if humanize_kwork_browser_error(attempt.last_error):
+        return True
+    return is_playwright_form_fill_error(attempt.last_error)
+
+
+async def load_send_attempt_operator_context(
+    attempt_id: uuid.UUID,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Last error + platform debug for blocked resends (e.g. stuck unknown_result)."""
+    async with AsyncSessionLocal() as session:
+        attempt = await session.get(SendAttempt, attempt_id)
+        if not attempt:
+            return None, None
+        debug = dict(attempt.platform_response or {})
+        if attempt.last_error and not debug.get("reason"):
+            debug.setdefault("reason", attempt.last_error)
+        return attempt.last_error, debug
 
 ClaimAction = Literal["proceed", "already_sent", "blocked", "unchanged"]
 
@@ -206,6 +254,9 @@ async def _claim_locked(
     attempt = next((row for row in attempts if row.idempotency_key == idempotency_key), None)
     for row in attempts:
         await _expire_stale_sending_attempt(row, settings)
+        if row.status == ATTEMPT_UNKNOWN_RESULT and unknown_result_is_retryable(row):
+            _set_attempt_status(row, ATTEMPT_KNOWN_FAILED)
+            continue
         if row.status in (ATTEMPT_SENDING, ATTEMPT_UNKNOWN_RESULT, ATTEMPT_NEEDS_ATTENTION):
             await session.commit()
             return ClaimResult(
@@ -487,6 +538,14 @@ async def _apply_confirmed_send(session, attempt: SendAttempt) -> None:
             job = await session.get(Job, attempt.job_id)
             if job:
                 job.status = job_status
+        pending_rows = await session.execute(
+            select(TelegramPending).where(
+                TelegramPending.proposal_id == attempt.proposal_id,
+                TelegramPending.status.in_(("pending", "approved", "edited")),
+            )
+        )
+        for card in pending_rows.scalars():
+            card.status = pending_status
     elif attempt.kind == ATTEMPT_KIND_INBOX_REPLY and attempt.inbox_pending_id:
         pending = await session.get(TelegramInboxPending, attempt.inbox_pending_id)
         await _ensure_inbox_outbound_interaction(session, attempt, pending)
@@ -550,9 +609,15 @@ async def prepare_proposal_send(
             return ClaimResult(action="blocked", reason="proposal_not_approved"), job, proposal
         from app.services.opportunity_policy import kwork_job_assessment_rejection
 
-        policy_error = await kwork_job_assessment_rejection(session, job)
+        policy_error = await kwork_job_assessment_rejection(session, job, ignore_stale=True)
         if policy_error:
             return ClaimResult(action="blocked", reason=policy_error), job, proposal
+        presented_assessment_id = approval.payload.get("assessment_id")
+        current_assessment = ((job.raw_data or {}).get("opportunity_assessment") or {}).get(
+            "assessment_id"
+        )
+        if job.platform == "kwork" and presented_assessment_id != current_assessment:
+            return ClaimResult(action="blocked", reason="assessment_revision_changed"), job, proposal
         metadata = {
             "approval_event_id": str(approval.id),
             "approved_payload": approval.payload,

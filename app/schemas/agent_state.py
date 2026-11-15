@@ -54,4 +54,10 @@ class JobPilotState(TypedDict, total=False):
     reward: int
     learning_notes: str
     error: str
+    filter_source: str
+    pipeline_processing_error: bool
+    processing_retryable: bool
+    processing_stage: str
+    processing_error_kind: str
+    llm_stage_log: list
     messages: Annotated[list, add_messages]

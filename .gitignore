@@ -10,6 +10,11 @@ backups/
 .venv/
 venv/
 data/kwork_session.json
+data/fl_ru_session.json
+data/weblancer_session.json
+data/weblancer_chrome_profile/
+data/browser-imports/*
+!data/browser-imports/.gitkeep
 data/kwork_api_token.json
 data/kwork_inbox_state.json
 data/kwork_connects_pause.json

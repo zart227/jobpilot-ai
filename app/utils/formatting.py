@@ -1,4 +1,5 @@
 import re
+from urllib.parse import urlparse
 
 import structlog
 
@@ -10,12 +11,25 @@ def extract_site_order_id(
     platform: str | None = None,
 ) -> str | None:
     """Return the marketplace order/project id shown on the source site."""
-    if url and (platform == "kwork" or "kwork.ru" in url):
-        match = re.search(r"/projects/(\d+)", url)
-        if match:
-            return match.group(1)
+    if url:
+        if platform in ("kwork", "fl_ru") or "kwork.ru" in url or "fl.ru" in url:
+            match = re.search(r"/projects/(\d+)", url)
+            if match:
+                return match.group(1)
+        if platform == "weblancer" or "weblancer.net" in url:
+            match = re.search(r"-(\d+)/?$", urlparse(url).path)
+            if match:
+                return match.group(1)
 
     if external_id:
+        if platform == "weblancer" or external_id.startswith("weblancer-"):
+            match = re.search(r"(\d+)", external_id)
+            if match:
+                return match.group(1)
+        if platform == "fl_ru" or external_id.startswith("fl_ru-"):
+            match = re.search(r"(\d+)", external_id)
+            if match:
+                return match.group(1)
         if platform == "kwork" or external_id.startswith("kwork-"):
             match = re.search(r"(\d+)", external_id)
             if match:

@@ -162,7 +162,7 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     openai_model: str = Field(default="gpt-4o-mini", alias="OPENAI_MODEL")
     openai_simple_model: str = Field(
-        default="gpt-4.1-nano",
+        default="gpt-4o-mini",
         alias="OPENAI_SIMPLE_MODEL",
         description="Cheap OpenAI model for filter/score/chat and Ollama auto-fallback",
     )
@@ -298,7 +298,7 @@ class Settings(BaseSettings):
     )
 
     review_first_mode: bool = Field(default=True, alias="REVIEW_FIRST_MODE")
-    review_max_hours: float = Field(default=3.0, gt=0, alias="REVIEW_MAX_HOURS")
+    review_max_hours: float = Field(default=8.0, gt=0, alias="REVIEW_MAX_HOURS")
     client_min_rating: float = Field(default=4.8, ge=0, le=5, alias="CLIENT_MIN_RATING")
     client_min_paid_orders: int = Field(default=1, ge=1, alias="CLIENT_MIN_PAID_ORDERS")
 
@@ -308,6 +308,100 @@ class Settings(BaseSettings):
         default="https://example-freelance.com/jobs", alias="GENERIC_SCRAPER_URL"
     )
     generic_scraper_selectors: str = Field(default="{}", alias="GENERIC_SCRAPER_SELECTORS")
+
+    fl_ru_listing_url: str = Field(
+        default="https://www.fl.ru/projects/?kind=1",
+        alias="FL_RU_LISTING_URL",
+        description="FL.ru feed URL when FL_RU_LISTING_URLS is empty",
+    )
+    fl_ru_listing_urls: str = Field(
+        default="",
+        alias="FL_RU_LISTING_URLS",
+        description="Comma-separated FL.ru category/search URLs (orders: ?kind=1)",
+    )
+    fl_ru_max_pages: int = Field(
+        default=3,
+        ge=1,
+        le=30,
+        alias="FL_RU_MAX_PAGES",
+        description="Pages per listing URL (?page=N appended when N>1)",
+    )
+    fl_ru_fetch_details: bool = Field(
+        default=True,
+        alias="FL_RU_FETCH_DETAILS",
+        description="Load project page for full description when listing text is truncated",
+    )
+    fl_ru_simple_orders_only: bool = Field(
+        default=True,
+        alias="FL_RU_SIMPLE_ORDERS_ONLY",
+        description="Scrape heuristics + filter: only small bounded dev tasks (like review-first)",
+    )
+    fl_ru_max_budget_rub: float = Field(
+        default=100_000.0,
+        ge=0,
+        alias="FL_RU_MAX_BUDGET_RUB",
+        description="Skip FL.ru jobs whose budget_max exceeds this (0 = disable)",
+    )
+    fl_ru_free_offers_only: bool = Field(
+        default=True,
+        alias="FL_RU_FREE_OFFERS_ONLY",
+        description="Only scrape FL.ru projects with the «Для всех» badge (free response, no paid pack)",
+    )
+    fl_ru_email: str = Field(default="", alias="FL_RU_EMAIL")
+    fl_ru_password: str = Field(default="", alias="FL_RU_PASSWORD")
+    fl_ru_storage_state: str = Field(
+        default="",
+        alias="FL_RU_STORAGE_STATE",
+        description="Playwright storage state JSON after manual FL.ru login",
+    )
+    fl_ru_scrape_login: bool = Field(
+        default=False,
+        alias="FL_RU_SCRAPE_LOGIN",
+        description="If true and no valid session file, log in with FL_RU_EMAIL/PASSWORD before scrape",
+    )
+
+    weblancer_listing_url: str = Field(
+        default="https://www.weblancer.net/freelance/veb-programmirovanie-31/",
+        alias="WEBLANCER_LISTING_URL",
+    )
+    weblancer_listing_urls: str = Field(
+        default="",
+        alias="WEBLANCER_LISTING_URLS",
+        description="Comma-separated category URLs (overrides WEBLANCER_LISTING_URL)",
+    )
+    weblancer_max_pages: int = Field(default=2, ge=1, alias="WEBLANCER_MAX_PAGES")
+    weblancer_fetch_details: bool = Field(default=True, alias="WEBLANCER_FETCH_DETAILS")
+    weblancer_simple_orders_only: bool = Field(
+        default=True,
+        alias="WEBLANCER_SIMPLE_ORDERS_ONLY",
+    )
+    weblancer_max_budget_rub: float = Field(
+        default=100_000.0,
+        ge=0,
+        alias="WEBLANCER_MAX_BUDGET_RUB",
+    )
+    weblancer_storage_state: str = Field(
+        default="",
+        alias="WEBLANCER_STORAGE_STATE",
+        description="Playwright storage state after manual login (Cloudflare bypass)",
+    )
+    weblancer_email: str = Field(default="", alias="WEBLANCER_EMAIL")
+    weblancer_password: str = Field(default="", alias="WEBLANCER_PASSWORD")
+    weblancer_scrape_login: bool = Field(
+        default=False,
+        alias="WEBLANCER_SCRAPE_LOGIN",
+        description="If true and no valid session file, log in with WEBLANCER_EMAIL/PASSWORD before scrape",
+    )
+    weblancer_scrape_transport: Literal["auto", "http", "playwright", "chrome", "flaresolverr"] = Field(
+        default="auto",
+        alias="WEBLANCER_SCRAPE_TRANSPORT",
+        description="auto tries http → chrome → playwright → flaresolverr",
+    )
+    weblancer_flaresolverr_url: str = Field(
+        default="",
+        alias="WEBLANCER_FLARESOLVERR_URL",
+        description="Base URL e.g. http://127.0.0.1:8191 when using FlareSolverr",
+    )
 
     kwork_email: str = Field(default="", alias="KWORK_EMAIL")
     kwork_password: str = Field(default="", alias="KWORK_PASSWORD")

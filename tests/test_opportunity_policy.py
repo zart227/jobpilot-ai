@@ -74,7 +74,7 @@ def test_kwork_buyer_listing_threshold(projects, hired, accepted):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('hours', 'days', 'complexity', 'price', 'budget', 'accepted'), [
-    (3, 1, 'simple', 500, 1000, True), (3.1, 1, 'simple', 500, 1000, False),
+    (8, 1, 'simple', 500, 1000, True), (8.1, 1, 'simple', 500, 1000, False),
     (2, 1, 'moderate', 500, 1000, False), (2, 1, 'simple', None, 1000, False),
     (2, 1, 'simple', 1500, 1000, False), (None, 1, 'simple', 500, 1000, False),
     (2, None, 'simple', 500, 1000, False), (2, 2, 'simple', 500, 1000, False),
@@ -119,6 +119,98 @@ def test_assessed_price_and_one_day_are_bound_to_approval_snapshot():
     payload = proposal_card_payload(job, proposal)
     assert payload['offer_price'] == 700
     assert payload['duration_days'] == 1
+
+
+def test_review_first_ineligible_reason_uses_configured_hour_cap():
+    from types import SimpleNamespace
+
+    from app.services.opportunity_policy import review_first_ineligible_reason
+
+    assert review_first_ineligible_reason(SimpleNamespace(review_max_hours=8)) == (
+        "Не подтверждены простой объём, цена, срок до 1 дня и трудозатраты до 8 рабочих часов"
+    )
+
+
+def test_kwork_assessment_stale_can_be_ignored_for_unchanged_presentation():
+    job = {
+        "platform": "kwork",
+        "title": "Fix bug",
+        "description": "Fix one bug",
+        "budget_max": 2000.0,
+        "client_projects_posted": 5,
+        "client_hire_percent": 50,
+        "client_stats_source": "kwork_buyer_block_v1",
+        "listing_revision": "list-2",
+    }
+    assessment = {
+        "relevant": True,
+        "assessment_id": "e48e15f8-6d76-4076-9631-78bf927c5719",
+        "source_fingerprint": kwork_opportunity_fingerprint({**job, "listing_revision": "list-1"}),
+        "estimated_hours": 2,
+        "estimated_calendar_days": 1,
+        "scope_clear": True,
+        "complexity": "simple",
+        "minimum_price_rub": 700,
+    }
+    assert kwork_assessment_rejection(job, assessment) == "assessment_stale"
+    assert kwork_assessment_rejection(job, assessment, ignore_stale=True) is None
+
+
+def test_kwork_assessment_accepts_hours_within_review_max():
+    job = {
+        "platform": "kwork",
+        "title": "Fix bug",
+        "description": "Fix one bug",
+        "budget_max": 2000.0,
+        "client_projects_posted": 5,
+        "client_hire_percent": 50,
+        "client_stats_source": "kwork_buyer_block_v1",
+    }
+    assessment = {
+        "relevant": True,
+        "assessment_id": "e48e15f8-6d76-4076-9631-78bf927c5719",
+        "source_fingerprint": kwork_opportunity_fingerprint(job),
+        "estimated_hours": 7,
+        "estimated_calendar_days": 1,
+        "scope_clear": True,
+        "complexity": "simple",
+        "minimum_price_rub": 700,
+    }
+    assert kwork_assessment_rejection(job, assessment) is None
+    assert kwork_assessment_rejection(job, {**assessment, "estimated_hours": 8.5}) == "assessment_ineligible"
+
+
+def test_kwork_deadline_drift_does_not_change_opportunity_fingerprint():
+    job = {
+        "id": "job",
+        "platform": "kwork",
+        "title": "Fix bug",
+        "description": "Fix one bug",
+        "budget_min": 1000.0,
+        "budget_max": 2000.0,
+        "budget_currency": "RUB",
+        "url": "https://kwork.ru/projects/1",
+        "client_id": "buyer-1",
+        "client_projects_posted": 5,
+        "client_hire_percent": 50,
+        "client_stats_source": "kwork_buyer_block_v1",
+        "client_evidence_revision": "rev-1",
+        "listing_revision": "list-1",
+    }
+    assessment = {
+        "relevant": True,
+        "assessment_id": "e48e15f8-6d76-4076-9631-78bf927c5719",
+        "source_fingerprint": kwork_opportunity_fingerprint(job),
+        "estimated_hours": 2,
+        "estimated_calendar_days": 1,
+        "scope_clear": True,
+        "complexity": "simple",
+        "minimum_price_rub": 700,
+    }
+    assert kwork_opportunity_fingerprint(job) == kwork_opportunity_fingerprint(
+        {**job, "deadline": "2026-11-09T12:00:00+00:00"}
+    )
+    assert kwork_assessment_rejection({**job, "deadline": "2026-11-09T12:00:00+00:00"}, assessment) is None
 
 
 def test_kwork_assessment_rejects_legacy_or_changed_job_and_buyer():

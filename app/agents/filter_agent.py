@@ -8,7 +8,13 @@ from app.llm.errors import LLMServiceError
 from app.llm.provider import get_simple_llm_provider
 from app.schemas.agent_state import JobPilotState
 from app.schemas.llm_outputs import parse_filter_output
-from app.services.opportunity_policy import client_rejection, kwork_opportunity_fingerprint
+from app.services.opportunity_policy import (
+    assessment_hours_within_review_cap,
+    client_rejection,
+    kwork_opportunity_fingerprint,
+    review_first_ineligible_reason,
+    review_max_working_hours,
+)
 from app.services.pipeline_llm_ledger import append_stage_log
 from app.utils.formatting import format_budget
 
@@ -20,12 +26,12 @@ Respond ONLY with valid JSON:
 {"relevant": true/false, "reason": "brief explanation"}
 
 Rules:
-- Accept remote web/backend/fullstack/AI automation/bot/parsing/API projects that match developer skills
+- Accept any simple programming task: web, backend, frontend, fullstack, scripts, parsers, APIs, bots, data processing, fixes and small integrations
+- The listed skills are examples, not a closed list. Ordinary programming in another language or framework is still relevant when the task is small and clear
 - For Kwork and RUB budgets: small fixed budgets (from 500 RUB) are OK for MVP tasks; do not reject only because budget looks low in rubles
-- Accept AI agent, Telegram bot, FastAPI, Django, Laravel, React, Vue, parsing/monitoring projects when skills overlap
-- Reject jobs that require excluded skills (see developer profile) as primary stack, e.g. n8n-only automation setup
-- Reject: spam, clearly unrelated domains (design-only, SEO-only, copywriting-only), illegal content, or zero skill overlap
-- When description is short but title clearly matches developer skills, lean toward relevant=true"""
+- Reject jobs that require excluded skills (see developer profile) as the primary stack, e.g. n8n-only, Make.com-only or Zapier-only setup
+- Reject: spam, non-programming work (design-only, SEO-only, copywriting-only, ads, SMM), illegal content
+- When the title is a small programming task even if the description is short, lean toward relevant=true"""
 
 
 class FilterAgent:
@@ -47,8 +53,18 @@ class FilterAgent:
 
     async def run(self, state: JobPilotState) -> dict:
         job = state.get("job_data", {})
-        quick_review = self._settings.review_first_mode or job.get("platform") == "kwork"
-        if quick_review:
+        platform = job.get("platform")
+        fl_ru_simple = platform == "fl_ru" and self._settings.fl_ru_simple_orders_only
+        weblancer_simple = (
+            platform == "weblancer" and self._settings.weblancer_simple_orders_only
+        )
+        quick_review = (
+            self._settings.review_first_mode
+            or platform == "kwork"
+            or fl_ru_simple
+            or weblancer_simple
+        )
+        if quick_review and job.get("platform") == "kwork":
             reason = client_rejection(job, self._settings.client_min_rating, self._settings.client_min_paid_orders)
             if reason:
                 return {"is_relevant": False, "relevance_reason": reason}
@@ -117,11 +133,13 @@ Client: {job.get('client_name', 'Unknown')} (rating: {job.get('client_rating')})
         strategy = ""
         if quick_review:
             strategy = f"""
-Goal: first reviews with scarce connects. Accept ONLY simple clearly bounded
-single deliverables within {min(self._settings.review_max_hours, 3)} working hours and one calendar day.
-Prefer one bug fix, small script, one API integration or small bot change.
-Reject full products, multi-feature bots, vague scope, ongoing work or unknown effort.
-Low payment is acceptable. Never infer small effort from low budget or 'simple'.
+Goal: first reviews with scarce connects. Accept simple, clearly bounded programming
+deliverables in any language or framework within {review_max_working_hours(self._settings)} working hours
+and one calendar day. Do not require the task to use a skill from the profile list.
+Prefer one bug fix, a small script, one API or site change, a parser, or a small bot change.
+Reject full products, multi-feature systems, vague scope, ongoing work, unknown effort,
+and non-programming tasks.
+Low payment is acceptable. Never infer small effort only from a low budget or the word 'simple'.
 Return estimated_hours (number), estimated_calendar_days (number, including dependencies
 and waiting time), scope_clear (boolean), complexity (simple, moderate or complex).
 If calendar duration is uncertain, set estimated_calendar_days to null.
@@ -131,6 +149,7 @@ Kwork orders yet: prefer the lower competitive end (at or below buyer desired bu
 not an inflated quote. Do not invent a clear scope.
 For Kwork use exactly these JSON keys: relevant, reason, estimated_hours,
 estimated_calendar_days, scope_clear, complexity, minimum_price_rub.
+For FL.ru (simple-order mode) use the same keys except minimum_price_rub may be null.
 """
         try:
             response = await self._llm.complete(SYSTEM_PROMPT + strategy, user_prompt, temperature=0.2)
@@ -138,17 +157,21 @@ estimated_calendar_days, scope_clear, complexity, minimum_price_rub.
             relevant = parsed.relevant
             reason = parsed.reason
             needs_kwork_assessment = job.get("platform") == "kwork"
+            needs_simple_assessment = needs_kwork_assessment or fl_ru_simple or weblancer_simple
             if quick_review:
                 hours = parsed.estimated_hours
+                simple_gate = (
+                    parsed.complexity != "simple"
+                    or parsed.estimated_calendar_days is None
+                    or not 0 < parsed.estimated_calendar_days <= 1
+                )
+                if needs_kwork_assessment:
+                    simple_gate = simple_gate or parsed.minimum_price_rub is None
                 if (not parsed.scope_clear or hours is None
-                    or not 0 < hours <= min(self._settings.review_max_hours, 3)
-                    or needs_kwork_assessment and (
-                        parsed.complexity != "simple" or parsed.minimum_price_rub is None
-                        or parsed.estimated_calendar_days is None
-                        or not 0 < parsed.estimated_calendar_days <= 1
-                    )):
+                    or not assessment_hours_within_review_cap(hours, self._settings)
+                    or needs_simple_assessment and simple_gate):
                     relevant = False
-                    reason = "Не подтверждены простой объём, цена, срок до 1 дня и трудозатраты до 3 часов"
+                    reason = review_first_ineligible_reason(self._settings)
                 if needs_kwork_assessment and parsed.minimum_price_rub is not None:
                     budget_cap = job.get("budget_max")
                     if budget_cap is not None and parsed.minimum_price_rub > budget_cap:

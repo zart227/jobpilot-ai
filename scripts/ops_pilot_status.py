@@ -42,7 +42,6 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
     from app.db.models import (
         Job,
         NotificationOutbox,
-        ProposalApprovalSnapshot,
         SendAttempt,
         TelegramPending,
     )
@@ -53,34 +52,17 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
         get_kwork_pause_reason,
         is_kwork_offers_paused,
     )
-    from app.services.opportunity_policy import kwork_job_assessment_rejection
+    from app.services.telegram_review_status import telegram_pending_status_breakdown
 
     async with AsyncSessionLocal() as session:
-        pending_cards = await session.scalar(
-            select(func.count()).select_from(TelegramPending).where(TelegramPending.status == "pending")
+        pending_cards, pending_review_ready, pending_stale_assessment, _other = (
+            await telegram_pending_status_breakdown(session)
         )
         outbox_pending = await session.scalar(
             select(func.count())
             .select_from(NotificationOutbox)
             .where(NotificationOutbox.status == "pending")
         )
-        pending_review_ready = 0
-        pending_stale_assessment = 0
-        pending_rows = (
-            await session.scalars(
-                select(TelegramPending).where(TelegramPending.status == "pending")
-            )
-        ).all()
-        for tp in pending_rows:
-            job = await session.get(Job, tp.job_id)
-            gate = None
-            if job and job.platform == "kwork":
-                gate = await kwork_job_assessment_rejection(session, job) or "pass"
-            snap = await session.get(ProposalApprovalSnapshot, tp.id) is not None
-            if gate == "assessment_stale":
-                pending_stale_assessment += 1
-            if gate == "pass" and snap and tp.message_id is not None:
-                pending_review_ready += 1
         outbox_needs_attention = await session.scalar(
             select(func.count())
             .select_from(NotificationOutbox)
@@ -110,7 +92,7 @@ async def _db_counts(database_url: str) -> dict[str, int | str]:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
     return {
         "alembic": revision or "?",
-        "telegram_pending_cards": int(pending_cards or 0),
+        "telegram_pending_cards": int(pending_cards),
         "telegram_pending_review_ready": pending_review_ready,
         "telegram_pending_assessment_stale": pending_stale_assessment,
         "outbox_pending": int(outbox_pending or 0),

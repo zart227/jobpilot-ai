@@ -13,6 +13,7 @@ from playwright.async_api import async_playwright
 from app.services.kwork_browser import (
     _click_submit_offer_button,
     _fill_offer_form,
+    _fill_offer_title,
     _select_duration,
     _verify_approved_form,
 )
@@ -162,6 +163,38 @@ async def test_hidden_editor_fail_closed(page):
     await page.locator(".trumbowyg-editor").evaluate("element => element.style.display = 'none'")
     with pytest.raises(RuntimeError, match="editor_not_visible"):
         await _verify_approved_form(page, CONTENT, 8500, 7)
+
+
+async def test_hidden_title_trumbowyg_can_be_filled_headless(page):
+    title = "Скрытое название — отклик"
+    await page.evaluate(
+        """() => {
+        const box = document.createElement('div');
+        box.className = 'trumbowyg-box';
+        const extra = document.createElement('div');
+        extra.className = 'trumbowyg-editor is-placeholder-mobile';
+        extra.setAttribute('placeholder', 'Введите название заказа');
+        extra.contentEditable = 'true';
+        extra.style.display = 'none';
+        const hidden = document.createElement('textarea');
+        hidden.name = 'order_title';
+        box.append(extra, hidden);
+        document.querySelector('form').prepend(box);
+    }"""
+    )
+    await _fill_offer_title(page, title)
+    filled = await page.evaluate(
+        """() => {
+        const editor = document.querySelector('.trumbowyg-editor[placeholder*="название"]');
+        const textarea = editor?.closest('.trumbowyg-box')?.querySelector('textarea');
+        return {
+            editor: (editor?.textContent || '').trim(),
+            textarea: (textarea?.value || '').trim(),
+        };
+    }"""
+    )
+    assert filled["editor"] == title
+    assert filled["textarea"] == title
 
 
 async def test_approved_title_and_payment_fields_are_filled(page):

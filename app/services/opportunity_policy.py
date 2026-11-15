@@ -5,16 +5,40 @@ import math
 import re
 import uuid
 
+from app.config import Settings, get_settings
+
 REVIEW_WEIGHTS = {
     "skill_match": 0.25, "budget": 0.05, "complexity": 0.35,
     "client_quality": 0.25, "competition": 0.10,
 }
 
 
+def review_max_working_hours(settings: Settings | None = None) -> float:
+    settings = settings or get_settings()
+    return float(settings.review_max_hours)
+
+
+def review_first_ineligible_reason(settings: Settings | None = None) -> str:
+    cap = review_max_working_hours(settings)
+    label = int(cap) if cap == int(cap) else cap
+    return (
+        f"Не подтверждены простой объём, цена, срок до 1 дня и трудозатраты до {label} рабочих часов"
+    )
+
+
+def assessment_hours_within_review_cap(
+    hours: object,
+    settings: Settings | None = None,
+) -> bool:
+    if type(hours) not in (int, float) or not math.isfinite(hours):
+        return False
+    return 0 < hours <= review_max_working_hours(settings)
+
+
 def kwork_opportunity_fingerprint(job: dict) -> str:
     """Bind an assessment to the job and buyer facts actually supplied to the filter."""
     fields = (
-        "id", "title", "description", "budget_min", "budget_max", "budget_currency", "url", "deadline",
+        "id", "title", "description", "budget_min", "budget_max", "budget_currency", "url",
         "client_id", "client_projects_posted", "client_hire_percent", "client_stats_source",
         "client_evidence_revision", "listing_revision",
     )
@@ -24,7 +48,12 @@ def kwork_opportunity_fingerprint(job: dict) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
-def kwork_assessment_rejection(job: dict, assessment: object) -> str | None:
+def kwork_assessment_rejection(
+    job: dict,
+    assessment: object,
+    *,
+    ignore_stale: bool = False,
+) -> str | None:
     """Reject stale, legacy, incomplete or ineligible Kwork assessments before sending."""
     if job.get("platform") != "kwork":
         return None
@@ -39,10 +68,11 @@ def kwork_assessment_rejection(job: dict, assessment: object) -> str | None:
     except (ValueError, AttributeError):
         return "assessment_required"
     if assessment.get("source_fingerprint") != kwork_opportunity_fingerprint(job):
-        return "assessment_stale"
+        if not ignore_stale:
+            return "assessment_stale"
     hours, days = assessment.get("estimated_hours"), assessment.get("estimated_calendar_days")
     if (
-        type(hours) not in (int, float) or not math.isfinite(hours) or not 0 < hours <= 3
+        not assessment_hours_within_review_cap(hours)
         or type(days) not in (int, float) or not math.isfinite(days) or not 0 < days <= 1
         or assessment.get("scope_clear") is not True or assessment.get("complexity") != "simple"
     ):
@@ -66,7 +96,7 @@ async def kwork_job_facts(session, job) -> dict:
         "description": job.description, "budget_min": float(job.budget_min) if job.budget_min else None,
         "budget_max": float(job.budget_max) if job.budget_max else None,
         "budget_currency": job.budget_currency,
-        "url": job.url, "deadline": job.deadline.isoformat() if job.deadline else None,
+        "url": job.url,
         "skills": job.skills or [],
         "client_id": str(job.client_id) if job.client_id else None,
         "client_name": client.name if client else None,
@@ -79,11 +109,20 @@ async def kwork_job_facts(session, job) -> dict:
     }
 
 
-async def kwork_job_assessment_rejection(session, job) -> str | None:
+async def kwork_job_assessment_rejection(
+    session,
+    job,
+    *,
+    ignore_stale: bool = False,
+) -> str | None:
     if job.platform != "kwork":
         return None
     facts = await kwork_job_facts(session, job)
-    return kwork_assessment_rejection(facts, (job.raw_data or {}).get("opportunity_assessment"))
+    return kwork_assessment_rejection(
+        facts,
+        (job.raw_data or {}).get("opportunity_assessment"),
+        ignore_stale=ignore_stale,
+    )
 
 
 def client_rejection(job: dict, minimum_rating: float, minimum_paid: int) -> str | None:

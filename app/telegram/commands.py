@@ -18,6 +18,7 @@ async def _register_command_menu(bot: Bot, admin_chat_id: int) -> None:
     commands = [
         BotCommand(command="start", description="О боте и работе с откликами"),
         BotCommand(command="status", description="Статус откликов и результатов"),
+        BotCommand(command="stats", description="Очередь, unknown_result, last_error"),
         BotCommand(command="rereview", description="Повторно показать карточку для одобрения"),
         BotCommand(command="dev", description="Включить режим агента разработки"),
         BotCommand(command="dev_status", description="Проверить состояние проекта"),

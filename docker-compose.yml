@@ -35,6 +35,7 @@ services:
             interval: 5s
             timeout: 5s
             retries: 10
+        restart: unless-stopped
 
     redis:
         image: redis:7-alpine
@@ -46,6 +47,7 @@ services:
             interval: 5s
             timeout: 3s
             retries: 10
+        restart: unless-stopped
 
     qdrant:
         image: qdrant/qdrant:v1.13.6
@@ -65,11 +67,13 @@ services:
             timeout: 5s
             retries: 10
             start_period: 10s
+        restart: unless-stopped
 
     api:
         build: .
         container_name: jobpilot-api
         <<: [*app-user, *docker-logging]
+        restart: unless-stopped
         command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
         env_file: .env
         extra_hosts:
@@ -100,12 +104,19 @@ services:
         build: .
         container_name: jobpilot-celery-worker
         <<: [*app-user, *docker-logging]
+        restart: unless-stopped
+        # Host routes (makecloud) reach Kwork/FL.ru. Docker's fwmark bypasses that table.
+        network_mode: host
         command: celery -A app.celery_app worker --loglevel=info --concurrency=2
         env_file: .env
-        extra_hosts:
-            - "host.docker.internal:host-gateway"
         environment:
             <<: *app-env
+            DATABASE_URL: postgresql+asyncpg://jobpilot:${POSTGRES_PASSWORD:-jobpilot_secret}@127.0.0.1:5434/jobpilot_ai
+            REDIS_URL: redis://127.0.0.1:6379/0
+            CELERY_BROKER_URL: redis://127.0.0.1:6379/0
+            CELERY_RESULT_BACKEND: redis://127.0.0.1:6379/1
+            QDRANT_URL: http://127.0.0.1:6333
+            WEBLANCER_FLARESOLVERR_URL: http://127.0.0.1:8191
             JOBPILOT_SKIP_DB_MIGRATE: "1"
         depends_on:
             postgres:
@@ -126,6 +137,7 @@ services:
         build: .
         container_name: jobpilot-celery-beat
         <<: [*app-user, *docker-logging]
+        restart: unless-stopped
         command: celery -A app.celery_app beat --loglevel=info
         env_file: .env
         extra_hosts:
@@ -149,6 +161,7 @@ services:
         build: .
         container_name: jobpilot-telegram
         <<: [*app-user, *docker-logging]
+        restart: unless-stopped
         command: python -m app.telegram.bot
         env_file:
             - .env
@@ -187,6 +200,17 @@ services:
         container_name: jobpilot-cursor-proxy
         network_mode: host
         command: TCP-LISTEN:9247,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:19247
+        restart: unless-stopped
+
+    # Optional Cloudflare bypass for Weblancer: docker compose --profile flaresolverr up -d
+    flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        container_name: jobpilot-flaresolverr
+        profiles: ["flaresolverr"]
+        environment:
+            LOG_LEVEL: info
+        ports:
+            - "127.0.0.1:8191:8191"
         restart: unless-stopped
 
 volumes:

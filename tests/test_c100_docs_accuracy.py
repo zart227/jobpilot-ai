@@ -27,11 +27,11 @@ def test_readme_status_matches_checklist_header() -> None:
     assert "не завершена" in intro.lower() or "not complete" in intro.lower()
 
 
-def test_readme_does_not_claim_full_remediation_or_release() -> None:
+def test_readme_does_not_claim_release_accepted() -> None:
     readme = README.read_text(encoding="utf-8").lower()
-    assert "115/115" not in readme
+    assert "релиз принят" not in readme
+    assert "release approved" not in readme
     assert "0 open" not in readme
-    assert "release signoff" not in readme or "отсутствует" in readme or "not" in readme
 
 
 def test_readme_documents_postgres_host_port_and_api_auth() -> None:

@@ -1,6 +1,6 @@
 """Operational metrics must consume each SQLAlchemy result only once."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from sqlalchemy import create_engine, text
 
@@ -15,8 +15,10 @@ async def test_counts_can_be_reused_in_job_and_funnel_metrics() -> None:
                 2, 1, None, 0, 0, 1, 3, 4, 0, None, 42, 5, 0, None, 0, 3, 0, 0, 0, 7, 9, None, None
             ]
             results = [connection.execute(text("SELECT :value"), {"value": v}) for v in values]
+            preview_result = MagicMock()
+            preview_result.all.return_value = []
             session = AsyncMock()
-            session.execute.side_effect = results
+            session.execute.side_effect = [*results, preview_result]
             metrics = await collect_ops_metrics(session)
         assert metrics["jobs"]["total"] == metrics["funnel"]["unique_jobs"] == 42
         assert metrics["jobs"]["with_confirmed_send"] == 9

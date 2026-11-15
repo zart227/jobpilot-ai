@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from decimal import Decimal
 
 import structlog
 from sqlalchemy import select
@@ -21,6 +22,14 @@ from app.schemas.job import NormalizedJob
 from app.services.send_attempt_service import delivery_blocks_mutation
 
 logger = structlog.get_logger(__name__)
+
+
+def _listing_value_unchanged(current, incoming) -> bool:
+    if current is None or incoming is None:
+        return current is None and incoming is None
+    if isinstance(current, Decimal) or isinstance(incoming, Decimal):
+        return Decimal(current) == Decimal(incoming)
+    return current == incoming
 
 
 def _transition_job_status(job: Job, new_status: str) -> None:
@@ -104,10 +113,11 @@ class JobPipelineService:
                         "skills", "deadline", "url",
                     ):
                         value = getattr(normalized, field)
-                        if getattr(row, field) != value:
+                        if not _listing_value_unchanged(getattr(row, field), value):
                             setattr(row, field, value)
                             updated = True
-                            listing_changed = True
+                            if field != "deadline":
+                                listing_changed = True
                     if text_changed:
                         row.raw_data = {**(row.raw_data or {}), "embedding_pending": True}
                     if listing_changed or not (row.raw_data or {}).get("listing_revision"):
@@ -308,6 +318,10 @@ class JobPipelineService:
                 _transition_job_status(job, JOB_STATUS_FILTERED)
             else:
                 _transition_job_status(job, JOB_STATUS_FILTERED)
+
+            from app.services.telegram_review_status import close_telegram_pending_if_job_not_in_review
+
+            await close_telegram_pending_if_job_not_in_review(session, job)
 
             job.processing_claim_owner = None
             job.processing_claim_token = None

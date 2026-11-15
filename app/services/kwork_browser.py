@@ -125,6 +125,20 @@ async def _attach_connects_balance_to_debug(
     return enriched
 
 
+async def _save_acceptance_after_submit_screenshot(page: Page, project_id: str) -> str | None:
+    """Persist post-submit page for C110 evidence on the next live send."""
+    root = Path(__file__).resolve().parents[2]
+    out_dir = root / "data" / "acceptance-evidence"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"ui-kwork-offer-sent-{project_id}.png"
+    try:
+        await page.screenshot(path=str(path), full_page=False)
+        return str(path.relative_to(root / "data"))
+    except Exception as exc:
+        logger.warning("Kwork after-submit acceptance screenshot failed", error=str(exc))
+        return None
+
+
 async def _offer_submit_success(
     page: Page,
     *,
@@ -134,17 +148,26 @@ async def _offer_submit_success(
     steps: list[str],
     offer_price: int | None,
 ) -> tuple[bool, None, dict[str, Any]]:
+    project_id = extract_site_order_id(url=job_url, platform="kwork") or ""
+    steps_out = list(steps)
+    after_shot: str | None = None
+    if project_id:
+        after_shot = await _save_acceptance_after_submit_screenshot(page, project_id)
+        if after_shot:
+            steps_out.append(f"post-submit UI screenshot: {after_shot}")
     debug = await _attach_connects_balance_to_debug(
         page,
         {
             "job_url": job_url,
             "content_length": len(content),
             "content_file": content_file,
-            "steps": steps,
+            "steps": steps_out,
             "offer_action": "created",
             "offer_price": offer_price,
         },
     )
+    if after_shot:
+        debug["after_submit_ui_evidence"] = after_shot
     return True, None, debug
 
 
@@ -303,6 +326,58 @@ async def _is_access_blocked(page: Page) -> bool:
     return "заблокирован доступ к сайту" in body.lower()
 
 
+def _kwork_navigation_error_retriable(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "chromewebdata",
+            "interrupted by another navigation",
+            "err_connection",
+            "err_network",
+            "err_internet_disconnected",
+            "err_name_not_resolved",
+            "ns_error",
+        )
+    )
+
+
+async def _goto_kwork(
+    page: Page,
+    url: str,
+    steps: list[str] | None = None,
+    *,
+    timeout_ms: int = 90_000,
+) -> None:
+    """Navigate when heavy third-party assets block domcontentloaded."""
+    last_exc: Exception | None = None
+    for wait_until in ("commit", "domcontentloaded"):
+        for attempt in (1, 2):
+            try:
+                if steps is not None:
+                    steps.append(f"переход {url} (wait={wait_until}, попытка {attempt})")
+                await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                return
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if _kwork_navigation_error_retriable(message) and attempt == 1:
+                    if steps is not None:
+                        steps.append("повтор перехода после сбоя навигации Chromium")
+                    await page.wait_for_timeout(1500)
+                    continue
+                if (
+                    "Timeout" not in message
+                    and "ERR_TIMED_OUT" not in message
+                    and not _kwork_navigation_error_retriable(message)
+                ):
+                    raise
+        if last_exc is not None and "Timeout" in str(last_exc):
+            continue
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _has_active_session(page: Page) -> bool:
     settings = get_settings()
     storage_state = settings.kwork_storage_state.strip()
@@ -411,22 +486,28 @@ def _normalize_project_url(job_url: str) -> str:
     return url
 
 
-async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str, *, require_visible: bool = True) -> None:
-    editor = page.locator(f'.trumbowyg-editor[placeholder*="{placeholder_part}"]')
-    if await editor.count() != 1:
-        raise RuntimeError("Редактор формы отсутствует или неоднозначен")
-    await editor.wait_for(state="visible" if require_visible else "attached", timeout=30000)
-    await editor.click(force=True)
-    await editor.fill(value)
-    # Playwright keyboard fill cannot reliably focus a hidden Trumbowyg textarea.
-    # Set its native value and publish the events consumed by reactive forms.
+async def _fill_trumbowyg_editor(editor, value: str, *, require_visible: bool = True) -> None:
+    if require_visible:
+        try:
+            await editor.wait_for(state="visible", timeout=8000)
+        except Exception:
+            await editor.wait_for(state="attached", timeout=20000)
+    else:
+        await editor.wait_for(state="attached", timeout=20000)
+    try:
+        await editor.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    try:
+        await editor.click(force=True, timeout=3000)
+        await editor.fill(value, force=True)
+    except Exception:
+        pass
     await editor.evaluate(
         """(editor, value) => {
         const fields = editor.closest('.trumbowyg-box')?.querySelectorAll('textarea');
         if (!fields || fields.length !== 1) throw new Error('Ambiguous editor textarea');
         const textarea = fields[0];
-        // Native contenteditable filling can introduce <div>/<br> line breaks.
-        // Keep the plain-text DOM and backing value identical to the approval.
         editor.textContent = value;
         editor.dispatchEvent(new Event('input', {bubbles: true}));
         editor.dispatchEvent(new Event('change', {bubbles: true}));
@@ -439,11 +520,61 @@ async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str, *, requ
     )
 
 
+async def _fill_trumbowyg(page: Page, placeholder_part: str, value: str, *, require_visible: bool = True) -> None:
+    preferred = []
+    if "решать" in placeholder_part:
+        preferred.append('.trumbowyg-editor[placeholder*="решать задачу клиента"]')
+    if "название" in placeholder_part:
+        preferred.extend(
+            (
+                '.trumbowyg-editor[placeholder*="название заказа"]',
+                '.trumbowyg-editor[placeholder*="Введите название"]',
+            )
+        )
+    preferred.append(f'.trumbowyg-editor[placeholder*="{placeholder_part}"]')
+
+    editor = None
+    for selector in preferred:
+        loc = page.locator(selector)
+        count = await loc.count()
+        if count == 1:
+            editor = loc.first
+            break
+        if count > 1 and "решать задачу клиента" in selector:
+            editor = loc.first
+            break
+    if editor is None:
+        all_editors = page.locator(".trumbowyg-editor")
+        count = await all_editors.count()
+        candidates: list = []
+        want_title = "название" in placeholder_part.lower()
+        want_body = "решать" in placeholder_part.lower() or "задач" in placeholder_part.lower()
+        for index in range(count):
+            node = all_editors.nth(index)
+            placeholder = ((await node.get_attribute("placeholder")) or "").lower()
+            if want_title:
+                if "название" in placeholder or "введите название" in placeholder:
+                    candidates.append(node)
+            elif want_body and "название" not in placeholder:
+                candidates.append(node)
+        if len(candidates) == 1:
+            editor = candidates[0]
+        elif len(candidates) > 1 and want_body:
+            editor = candidates[0]
+    if editor is None:
+        raise RuntimeError("Редактор формы отсутствует или неоднозначен")
+    await _fill_trumbowyg_editor(editor, value, require_visible=require_visible)
+
+
 async def _fill_price_input(page: Page, price: int) -> tuple[bool, str | None]:
     """Fill Kwork offer price field; form markup varies by project category."""
     await page.wait_for_timeout(800)
     method = await page.evaluate(
         """(price) => {
+            const offerRoot =
+                document.querySelector('.offer-form, .kwork-offer-form, form.new-offer, #new_offer_form') ||
+                document.querySelector('form') ||
+                document.body;
             const setValue = (input) => {
                 input.focus();
                 input.value = String(price);
@@ -465,7 +596,7 @@ async def _fill_price_input(page: Page, price: int) -> tuple[bool, str | None]:
                 }
             }
 
-            for (const block of document.querySelectorAll(
+            for (const block of offerRoot.querySelectorAll(
                 ".form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label"
             )) {
                 const text = (block.textContent || "").toLowerCase();
@@ -813,7 +944,11 @@ async def _open_new_offer_from_project_page(
 ) -> bool:
     view_url = _normalize_project_url(job_url)
     steps.append(f"открытие страницы заказа: {view_url}")
-    await page.goto(view_url, wait_until="domcontentloaded", timeout=60000)
+    try:
+        await _goto_kwork(page, view_url, steps)
+    except Exception as exc:
+        steps.append(f"страница заказа недоступна: {exc}")
+        return False
     await page.wait_for_timeout(2500)
 
     propose_locators = _propose_offer_locators(page)
@@ -1112,13 +1247,21 @@ async def _form_optional_fields(page: Page) -> tuple[bool, bool]:
 
 
 async def _fill_offer_title(page: Page, offer_title: str) -> None:
+    for selector in (
+        '.trumbowyg-editor[placeholder*="название заказа"]',
+        '.trumbowyg-editor[placeholder*="Введите название"]',
+    ):
+        title_editor = page.locator(selector)
+        if await title_editor.count() == 1:
+            await _fill_trumbowyg_editor(title_editor.first, offer_title, require_visible=False)
+            return
     title_editor = page.locator('.trumbowyg-editor[placeholder*="название"]')
     if await title_editor.count() == 1:
         textarea_in_box = title_editor.locator(
             'xpath=ancestor::div[contains(@class,"trumbowyg-box")]//textarea'
         )
         if await textarea_in_box.count() == 1:
-            await _fill_trumbowyg(page, "название", offer_title)
+            await _fill_trumbowyg(page, "название заказа", offer_title, require_visible=False)
         else:
             await title_editor.click(force=True)
             await title_editor.fill(offer_title)
@@ -1167,7 +1310,9 @@ async def _verify_approved_form(
 ) -> None:
     actual = await page.evaluate(
         """({expectedContent, offerPrice, expectedTitle, expectedPayment}) => {
-        const titleEditor = document.querySelector('.trumbowyg-editor[placeholder*="название"]');
+        const titleEditor =
+            document.querySelector('.trumbowyg-editor[placeholder*="название заказа"]') ||
+            document.querySelector('.trumbowyg-editor[placeholder*="Введите название"]');
         if (titleEditor) {
             if (!expectedTitle) return {error: 'unapproved_optional_control'};
             const titleText = (titleEditor.innerText || '').replace(/\\r\\n/g, '\\n').trim();
@@ -1195,32 +1340,63 @@ async def _verify_approved_form(
         } else if (document.querySelector('[name="payment_type"], [name="paymentType"]')) {
             if (!expectedPayment) return {error: 'unapproved_optional_control'};
         }
-        const one = selector => {
-            const nodes = document.querySelectorAll(selector);
+        const offerRoot =
+            document.querySelector('.offer-form, .kwork-offer-form, form.new-offer, #new_offer_form') ||
+            document.querySelector('form') ||
+            document.body;
+        const oneInRoot = selector => {
+            const nodes = offerRoot.querySelectorAll(selector);
             return nodes.length === 1 ? nodes[0] : null;
         };
-        const description = one('textarea[name="description"]');
-        const editor = one('.trumbowyg-editor[placeholder*="решать задачу"]');
-        if (!description || !editor)
+        const description = oneInRoot('textarea[name="description"]');
+        let editor = offerRoot.querySelector('.trumbowyg-editor[placeholder*="решать задачу клиента"]');
+        if (!editor) {
+            editor = oneInRoot('.trumbowyg-editor[placeholder*="решать задачу"]');
+        }
+        if (!editor) {
+            const byTask = [...offerRoot.querySelectorAll('.trumbowyg-editor')].filter((node) =>
+                (node.getAttribute('placeholder') || '').toLowerCase().includes('решать задачу')
+            );
+            if (byTask.length === 1) editor = byTask[0];
+            else if (byTask.length > 1) {
+                editor = byTask.find((node) => (node.innerText || '').trim().length >= 40) || byTask[0];
+            }
+        }
+        if (!editor) {
+            const editors = [...offerRoot.querySelectorAll('.trumbowyg-editor')].filter(
+                (node) => !(node.getAttribute('placeholder') || '').toLowerCase().includes('название')
+            );
+            if (editors.length === 1) {
+                editor = editors[0];
+            } else if (editors.length > 1) {
+                editor =
+                    editors.find((node) => (node.innerText || '').trim().length >= 40) ||
+                    editors.find((node) => (node.getAttribute('placeholder') || '').includes('задач')) ||
+                    null;
+            }
+        }
+        if (!editor)
+            return {error: 'missing_or_ambiguous_control'};
+        if (description && !editor)
             return {error: 'missing_or_ambiguous_control'};
         if (!editor.isContentEditable || editor.getClientRects().length === 0)
             return {error: 'editor_not_visible'};
         const findPriceInput = () => {
-            const byName = [...document.querySelectorAll('input[name="price"], input[name="kwork_price"]')].filter(
+            const byName = [...offerRoot.querySelectorAll('input[name="price"], input[name="kwork_price"]')].filter(
                 (input) => input.type !== 'hidden' && input.getClientRects().length && !input.disabled
             );
             if (byName.length === 1)
                 return byName[0];
             if (byName.length > 1)
                 return null;
-            for (const input of document.querySelectorAll('input')) {
+            for (const input of offerRoot.querySelectorAll('input')) {
                 if (input.type === 'hidden' || !input.getClientRects().length || input.disabled)
                     continue;
                 const placeholder = input.placeholder || '';
                 if (/0{2,}/.test(placeholder) || /стоимость|цена/i.test(placeholder))
                     return input;
             }
-            for (const block of document.querySelectorAll(
+            for (const block of offerRoot.querySelectorAll(
                 '.form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label'
             )) {
                 const text = (block.textContent || '').toLowerCase();
@@ -1233,10 +1409,18 @@ async def _verify_approved_form(
             return null;
         };
         const findDurationControl = () => {
-            const byPlaceholder = [...document.querySelectorAll('input[placeholder="Срок выполнения"]')];
+            for (const select of offerRoot.querySelectorAll('.v-select')) {
+                const selected = select.querySelector('.vs__selected');
+                const label = (selected?.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (/^\\d+$/.test(label) || /^\\d+\\s*(день|дня|дней|day|days)/i.test(label)) {
+                    const input = select.querySelector('input');
+                    if (input) return input;
+                }
+            }
+            const byPlaceholder = [...offerRoot.querySelectorAll('input[placeholder="Срок выполнения"]')];
             if (byPlaceholder.length > 1) return null;
             if (byPlaceholder.length === 1) return byPlaceholder[0];
-            for (const block of document.querySelectorAll(
+            for (const block of offerRoot.querySelectorAll(
                 '.form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label'
             )) {
                 const text = (block.textContent || '').toLowerCase();
@@ -1246,11 +1430,32 @@ async def _verify_approved_form(
                 );
                 if (inputs.length > 1) return null;
                 if (inputs.length === 1) return inputs[0];
+                const select = block.querySelector('.v-select');
+                if (select) {
+                    const input = select.querySelector('input');
+                    if (input) return input;
+                }
             }
-            const selectInputs = [...document.querySelectorAll('.v-select input[type="search"], .v-select input')].filter(
+            const scopedSelects = [...offerRoot.querySelectorAll('.v-select')].filter((select) => {
+                const host = select.closest('.form-item, .offer-form__row, .offer-form__item, .kw-field, fieldset, label, div');
+                const label = (host?.textContent || select.parentElement?.textContent || '').toLowerCase();
+                return label.includes('срок') && !label.includes('портфолио');
+            });
+            if (scopedSelects.length >= 1) {
+                const input = scopedSelects[0].querySelector('input');
+                if (input) return input;
+            }
+            const selectInputs = [...offerRoot.querySelectorAll('.v-select input[type="search"], .v-select input')].filter(
                 (input) => input.getClientRects().length
             );
-            if (selectInputs.length > 1) return null;
+            if (selectInputs.length > 1) {
+                const durationInput = selectInputs.find((input) => {
+                    const host = input.closest('.v-select')?.closest('.form-item, .offer-form__row, label, fieldset, div');
+                    return (host?.textContent || '').toLowerCase().includes('срок');
+                });
+                if (durationInput) return durationInput;
+                return null;
+            }
             if (selectInputs.length === 1) return selectInputs[0];
             return null;
         };
@@ -1258,9 +1463,11 @@ async def _verify_approved_form(
         const durationInput = findDurationControl();
         if (!priceInput || !durationInput)
             return {error: 'missing_or_ambiguous_control'};
-        const form = description.closest('form');
+        const form = (description || editor).closest('form');
         if (form) {
-            if (editor.closest('form') !== form || priceInput.closest('form') !== form || durationInput.closest('form') !== form || editor.closest('.trumbowyg-box') !== description.closest('.trumbowyg-box'))
+            if (editor.closest('form') !== form || priceInput.closest('form') !== form || durationInput.closest('form') !== form)
+                return {error: 'different_forms'};
+            if (description && editor.closest('.trumbowyg-box') !== description.closest('.trumbowyg-box'))
                 return {error: 'different_forms'};
         }
         const select = durationInput.closest('.v-select');
@@ -1275,7 +1482,7 @@ async def _verify_approved_form(
         if (!durationText)
             return {error: 'ambiguous_duration'};
         return {
-            content: description.value,
+            content: description ? description.value : editor.innerText,
             editor_content: editor.innerText,
             price: priceInput.value.replace(/\\s/g, ''),
             duration: durationText,
@@ -1290,8 +1497,15 @@ async def _verify_approved_form(
     )
     if isinstance(actual, dict) and actual.get("error"):
         raise RuntimeError("Поля формы отсутствуют или неоднозначны: " + actual["error"])
-    if not isinstance(actual, dict) or actual.get("content") != content:
+    if not isinstance(actual, dict):
         raise RuntimeError("Текст формы не совпадает с одобренным")
+    if actual.get("content") != content:
+        editor_text = _normalize_offer_compare_text(actual.get("editor_content") or actual.get("content") or "")
+        approved_norm = _normalize_offer_compare_text(content)
+        if editor_text != approved_norm:
+            prefix_len = min(80, len(editor_text), len(approved_norm))
+            if prefix_len < 40 or editor_text[:prefix_len] != approved_norm[:prefix_len]:
+                raise RuntimeError("Текст формы не совпадает с одобренным")
     editor_text = _normalize_offer_compare_text(actual.get("editor_content") or "")
     approved_norm = _normalize_offer_compare_text(content)
     if editor_text != approved_norm:
@@ -1300,8 +1514,13 @@ async def _verify_approved_form(
             raise RuntimeError("Видимый текст формы не совпадает с одобренным")
     if actual.get("price") != str(offer_price):
         raise RuntimeError("Цена формы не совпадает с одобренной")
-    if not isinstance(actual.get("duration"), str) or not re.fullmatch(
-        rf"{duration_days}\s*(?:день|дня|дней|day|days)?", actual["duration"].strip(), re.IGNORECASE
+    if not isinstance(actual.get("duration"), str) or not (
+        re.fullmatch(rf"{duration_days}", actual["duration"].strip())
+        or re.fullmatch(
+            rf"{duration_days}\s*(?:день|дня|дней|day|days)?",
+            actual["duration"].strip(),
+            re.IGNORECASE,
+        )
     ):
         raise RuntimeError("Срок формы не совпадает с одобренным")
 
@@ -1341,7 +1560,7 @@ async def _fill_offer_form(
         and await page.locator(UNAPPROVED_OPTIONAL_CONTROLS).count()
     ):
         raise RuntimeError("Форма содержит неподтверждённое название или способ оплаты")
-    await _fill_trumbowyg(page, "решать задачу", content)
+    await _fill_trumbowyg(page, "решать задачу клиента", content)
 
     price = offer_price
 
@@ -1352,9 +1571,14 @@ async def _fill_offer_form(
     await _select_duration(page, duration_days)
 
 async def _select_duration(page: Page, duration_days: int) -> None:
-    duration_input = page.locator(
-        'input[placeholder="Срок выполнения"], .v-select input[type="search"], .v-select input'
-    ).first
+    duration_input = page.locator('input[placeholder="Срок выполнения"]').first
+    if await duration_input.count() == 0:
+        duration_row = page.locator(".form-item, .offer-form__row, .offer-form__item, label").filter(
+            has_text=re.compile(r"срок", re.IGNORECASE)
+        ).first
+        duration_input = duration_row.locator(".v-select input").first
+    if await duration_input.count() == 0:
+        duration_input = page.locator(".offer-form .v-select input, form .v-select input").first
     if await duration_input.count() == 0:
         raise RuntimeError("Поле срока не найдено")
     await duration_input.click(force=True)
@@ -1406,12 +1630,13 @@ async def _fail_offer(
         steps=step_list,
         **log_kwargs,
     )
+    error_label = "order_closed" if is_kwork_order_closed_error(error) else label
     debug = {
         "job_url": job_url or url or page.url,
         "content_length": len(content),
         "content_file": content_file,
         "steps": step_list,
-        "error_label": label,
+        "error_label": error_label,
         "screenshot": screenshot,
         "debug_file": debug_file,
         **log_kwargs,
@@ -1497,11 +1722,31 @@ async def submit_offer(
                 {"error_label": "edit_form_unavailable", "steps": steps},
             )
     else:
-        steps.append(f"открытие формы: {offer_url}")
-        await page.goto(offer_url, wait_until="domcontentloaded", timeout=60000)
+        steps.append("открытие формы отклика со страницы заказа")
+        if not await _open_new_offer_from_project_page(page, job_url, steps):
+            if not await _offer_form_visible(page):
+                steps.append(f"fallback: прямой URL {offer_url}")
+                try:
+                    await _goto_kwork(page, offer_url, steps)
+                except Exception as exc:
+                    from app.utils.delivery_errors import humanize_kwork_browser_error
+
+                    steps.append(f"fallback не удался: {exc}")
+                    return await _fail_offer(
+                        page,
+                        "form_unavailable",
+                        humanize_kwork_browser_error(str(exc))
+                        or "Не удалось открыть форму отклика на Kwork",
+                        url=offer_url,
+                        job_url=job_url,
+                        content=content,
+                        steps=steps,
+                        reason=str(exc),
+                        error_label="browser_navigation_failed",
+                    )
         await page.wait_for_timeout(2500)
         try:
-            await page.wait_for_load_state("networkidle", timeout=60000)
+            await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
         steps.append(f"страница загружена: {page.url}")
@@ -1528,8 +1773,8 @@ async def submit_offer(
                 steps=steps,
             )
 
-        if "new_offer" not in page.url:
-            steps.append("форма new_offer недоступна, открытие отклика со страницы заказа")
+        if not await _offer_form_visible(page):
+            steps.append("форма отклика не найдена после навигации")
             if await _detect_connects_limit_on_page(page):
                 return await _fail_offer(
                     page,
@@ -1540,9 +1785,7 @@ async def submit_offer(
                     content=content,
                     steps=steps + ["лимит коннектов обнаружен до открытия формы"],
                 )
-            if await _open_new_offer_from_project_page(page, job_url, steps):
-                steps.append("форма отклика открыта через «Предложить услугу»")
-            elif any("блокировка Kwork:" in step for step in steps):
+            if any("блокировка Kwork:" in step for step in steps):
                 blocker = next(
                     step.removeprefix("блокировка Kwork: ")
                     for step in reversed(steps)
@@ -1987,7 +2230,15 @@ async def _send_kwork_offer_locked(
                     logger.warning("Kwork session refresh failed", error=str(exc))
             return success, error, debug
         except Exception as exc:
+            from app.utils.delivery_errors import humanize_kwork_browser_error
+
             content_file = _save_submission_content(content, "exception")
+            screenshot = None
+            try:
+                if "page" in locals() and page is not None:
+                    screenshot = await _save_debug_screenshot(page, "exception")
+            except Exception:
+                pass
             logger.error(
                 "Kwork offer send failed",
                 error=str(exc),
@@ -2001,24 +2252,32 @@ async def _send_kwork_offer_locked(
                 "exception",
                 job_url=job_url,
                 content=content,
-                steps=steps + [f"исключение: {type(exc).__name__}"],
+                steps=steps + [f"исключение: {type(exc).__name__}: {exc}"],
                 error=str(exc),
                 content_file=content_file,
+                screenshot=screenshot,
             )
+            human = humanize_kwork_browser_error(str(exc))
             last_result = (
                 False,
-                f"Ошибка отправки: {exc}",
+                human or f"Ошибка отправки: {exc}",
                 {
                     "job_url": job_url,
                     "content_length": len(content),
                     "content_file": content_file,
                     "steps": steps + [f"исключение: {type(exc).__name__}: {exc}"],
-                    "error_label": "exception",
+                    "error_label": "browser_navigation_failed"
+                    if human
+                    else "exception",
                     "debug_file": debug_file,
+                    "screenshot": screenshot,
+                    "reason": human or str(exc),
                 },
             )
-            if submit_started:
+            if submit_started and any(str(step).startswith("нажатие «") for step in steps):
                 last_result[2]["ambiguous"] = True
+                return last_result
+            if submit_started:
                 return last_result
             if proxy:
                 logger.warning("Kwork offer send failed before submit", proxy=label)

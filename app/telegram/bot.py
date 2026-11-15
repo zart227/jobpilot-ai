@@ -20,7 +20,7 @@ from app.config import get_settings
 from app.logging_setup import configure_application_logging
 
 configure_application_logging()
-from app.db.models import Job, NotificationOutbox, Proposal, TelegramPending
+from app.db.models import Job, NotificationOutbox, Proposal, SendAttempt, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.llm.errors import LLMServiceError, format_llm_error_message
 from app.services.approval_snapshot import (
@@ -37,6 +37,11 @@ from app.services.dev_agent_service import (
 )
 from app.services.edit_preference_service import EditPreferenceService
 from app.services.job_pipeline import JobPipelineService
+from app.services.fl_ru_browser import is_fl_ru_order_closed_error
+from app.services.weblancer_send import (
+    WEBLANCER_ORDER_CLOSED_ERROR,
+    is_weblancer_order_closed_error,
+)
 from app.services.kwork_browser import is_kwork_connects_limit_error, is_kwork_order_closed_error
 from app.services.kwork_pause import (
     blocks_kwork_operator_send,
@@ -61,8 +66,13 @@ from app.telegram.commands import register_command_menu
 from app.telegram.dev_agent_handlers import register_dev_agent_handlers
 from app.telegram.full_review import send_full_review
 from app.telegram.inbox_handlers import register_inbox_handlers
-from app.telegram.keyboards import edit_preview_keyboard
+from app.telegram.keyboards import edit_preview_keyboard, send_retry_keyboard
 from app.telegram.review_handlers import register_review_handlers
+from app.utils.delivery_errors import (
+    SEND_ATTEMPT_BLOCK_REASONS,
+    format_proposal_send_block_message,
+    humanize_kwork_browser_error,
+)
 from app.utils.formatting import (
     KWORK_MAX_OFFER_CHARS,
     extract_site_order_id,
@@ -92,10 +102,14 @@ def _resolve_order_id(
             platform=job.platform,
         )
     debug = send_debug or {}
-    return extract_site_order_id(
-        url=debug.get("job_url"),
-        platform="kwork" if debug.get("job_url") else None,
-    )
+    platform = debug.get("platform")
+    if not platform and debug.get("job_url"):
+        url = str(debug["job_url"])
+        if "fl.ru" in url:
+            platform = "fl_ru"
+        elif "kwork.ru" in url:
+            platform = "kwork"
+    return extract_site_order_id(url=debug.get("job_url"), platform=platform)
 
 
 def _order_id_html_line(job: Job | None) -> str:
@@ -105,38 +119,85 @@ def _order_id_html_line(job: Job | None) -> str:
     return f"<b>№ заказа:</b> {html.escape(order_id)}\n"
 
 
-def format_kwork_success_message(
+def _platform_display_name(platform: str | None) -> str:
+    return {
+        "kwork": "Kwork",
+        "fl_ru": "FL.ru",
+        "weblancer": "Weblancer",
+    }.get(platform or "", platform or "площадку")
+
+
+def _send_progress_answer(platform: str | None) -> str:
+    return f"⏳ Отправляю на {_platform_display_name(platform)}..."
+
+
+def _resolve_send_platform(
+    job: Job | None,
+    send_debug: dict[str, Any] | None = None,
+    send_error: str | None = None,
+) -> str | None:
+    platform = (job.platform if job else None) or (send_debug or {}).get("platform")
+    if platform:
+        return platform
+    url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if url:
+        url_s = str(url)
+        if "fl.ru" in url_s:
+            return "fl_ru"
+        if "weblancer.net" in url_s:
+            return "weblancer"
+        if "kwork.ru" in url_s:
+            return "kwork"
+    err = (send_error or "").lower()
+    if "fl.ru" in err or "fl_ru" in err:
+        return "fl_ru"
+    return None
+
+
+def format_platform_success_message(
+    platform: str | None,
     send_debug: dict[str, Any] | None,
     *,
     edited: bool = False,
     job: Job | None = None,
 ) -> str:
+    label = _platform_display_name(platform or (job.platform if job else None))
     action = (send_debug or {}).get("offer_action")
     if action == "updated" or edited:
-        base = "✅ JobPilot AI: отредактированный отклик обновлён на Kwork."
+        base = f"✅ JobPilot AI: отредактированный отклик обновлён на {label}."
     else:
-        base = "✅ JobPilot AI: отклик отправлен на Kwork."
+        base = f"✅ JobPilot AI: отклик отправлен на {label}."
 
     order_id = _resolve_order_id(job=job, send_debug=send_debug)
     lines = [base]
     if order_id:
         lines.append(f"\n№ заказа: {order_id}")
 
-    remaining = (send_debug or {}).get("connects_remaining")
-    total = (send_debug or {}).get("connects_total")
-    if remaining is None and total is None:
-        summary = get_kwork_connects_status_summary()
-        if summary:
-            lines.append(f"\n{summary}.")
-    else:
-        balance = format_connects_balance_line(
-            int(remaining) if remaining is not None else None,
-            int(total) if total is not None else None,
-        )
-        if balance:
-            lines.append(f"\n{balance}.")
+    if (platform or (job.platform if job else None)) == "kwork":
+        remaining = (send_debug or {}).get("connects_remaining")
+        total = (send_debug or {}).get("connects_total")
+        if remaining is None and total is None:
+            summary = get_kwork_connects_status_summary()
+            if summary:
+                lines.append(f"\n{summary}.")
+        else:
+            balance = format_connects_balance_line(
+                int(remaining) if remaining is not None else None,
+                int(total) if total is not None else None,
+            )
+            if balance:
+                lines.append(f"\n{balance}.")
 
     return "".join(lines)
+
+
+def format_kwork_success_message(
+    send_debug: dict[str, Any] | None,
+    *,
+    edited: bool = False,
+    job: Job | None = None,
+) -> str:
+    return format_platform_success_message("kwork", send_debug, edited=edited, job=job)
 
 
 def _order_id_plain_suffix(order_id: str | None) -> str:
@@ -275,6 +336,80 @@ def format_job_alert(job: Job, proposal: Proposal, score: int | None) -> str:
     )
 
 
+def _send_outcome_is_order_closed(
+    send_error: str | None,
+    send_debug: dict[str, Any] | None,
+) -> bool:
+    if (
+        is_kwork_order_closed_error(send_error)
+        or is_fl_ru_order_closed_error(send_error)
+        or is_weblancer_order_closed_error(send_error)
+    ):
+        return True
+    if not send_debug:
+        return False
+    if send_debug.get("error_label") == "order_closed":
+        return True
+    reason = send_debug.get("reason")
+    return (
+        is_kwork_order_closed_error(reason)
+        or is_fl_ru_order_closed_error(reason)
+        or is_weblancer_order_closed_error(reason)
+    )
+
+
+def format_kwork_order_closed_message(
+    job: Job | None,
+    send_error: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+) -> str:
+    parts = [
+        "🚫 <b>Заказ на Kwork уже закрыт</b> — исполнитель выбран, отклик отправить нельзя.",
+    ]
+    title = (job.title if job else None) or (send_debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+    order_id = _resolve_order_id(job=job, send_debug=send_debug)
+    if order_id:
+        parts.append(f"\n<b>№ заказа:</b> {html.escape(order_id)}")
+    job_url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Kwork</a>')
+    parts.append(
+        "\n\n<b>Что делать:</b> нажмите SKIP на карточке отклика. "
+        "Повторная отправка не сработает — это не ошибка сессии и не сеть."
+    )
+    if send_error and not is_kwork_order_closed_error(send_error):
+        parts.append(f"\n\n<b>Детали:</b> {html.escape(send_error)}")
+    return "".join(parts)
+
+
+def format_fl_ru_order_closed_message(
+    job: Job | None,
+    send_error: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+) -> str:
+    parts = [
+        "🚫 <b>Заказ на FL.ru уже закрыт</b> — отклики не принимаются.",
+    ]
+    title = (job.title if job else None) or (send_debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+    order_id = _resolve_order_id(job=job, send_debug=send_debug)
+    if order_id:
+        parts.append(f"\n<b>№ заказа:</b> {html.escape(order_id)}")
+    job_url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на FL.ru</a>')
+    parts.append(
+        "\n\n<b>Что делать:</b> нажмите SKIP на карточке. "
+        "Повторная отправка не сработает — заказ уже неактивен на бирже."
+    )
+    if send_error and not is_fl_ru_order_closed_error(send_error):
+        parts.append(f"\n\n<b>Детали:</b> {html.escape(send_error)}")
+    return "".join(parts)
+
+
 def format_kwork_skipped_message(
     job: Job | None,
     reason: str | None = None,
@@ -373,6 +508,28 @@ def format_kwork_connects_limit_message(
     return "".join(parts)
 
 
+async def _latest_proposal_send_context(
+    session,
+    proposal_id: uuid.UUID,
+) -> tuple[str | None, dict[str, Any] | None]:
+    attempt = await session.scalar(
+        select(SendAttempt)
+        .where(SendAttempt.proposal_id == proposal_id)
+        .order_by(SendAttempt.created_at.desc())
+        .limit(1)
+    )
+    if not attempt:
+        return None, None
+    debug = dict(attempt.platform_response or {})
+    if attempt.last_error:
+        debug.setdefault("reason", attempt.last_error)
+    return attempt.last_error, debug
+
+
+def _pending_allows_send_retry(pending: TelegramPending) -> bool:
+    return pending.status in ("approved", "edited")
+
+
 def format_send_outcome_message(
     job: Job | None,
     *,
@@ -381,15 +538,149 @@ def format_send_outcome_message(
     send_debug: dict[str, Any] | None = None,
     edited: bool = False,
 ) -> str:
+    platform = _resolve_send_platform(job, send_debug, send_error)
     if success:
-        return format_kwork_success_message(send_debug, edited=edited, job=job)
-    if is_kwork_order_closed_error(send_error):
-        return format_kwork_skipped_message(job, send_error, send_debug)
+        return format_platform_success_message(platform, send_debug, edited=edited, job=job)
+    if _send_outcome_is_order_closed(send_error, send_debug):
+        if platform == "fl_ru":
+            return format_fl_ru_order_closed_message(job, send_error, send_debug)
+        if platform == "weblancer":
+            return format_weblancer_order_closed_message(job, send_error, send_debug)
+        return format_kwork_order_closed_message(job, send_error, send_debug)
+    if platform == "fl_ru":
+        return format_fl_ru_failure_message(job, send_error, send_debug)
+    if platform == "weblancer":
+        return format_weblancer_failure_message(job, send_error, send_debug)
     if is_kwork_connects_limit_error(send_error):
         return format_kwork_connects_limit_message(job, send_error, send_debug)
     if is_kwork_paused() and job and job.platform == "kwork":
         return format_kwork_paused_message(job)
     return format_kwork_failure_message(job, send_error, send_debug)
+
+
+def format_weblancer_order_closed_message(
+    job: Job | None,
+    send_error: str | None = None,
+    send_debug: dict[str, Any] | None = None,
+) -> str:
+    parts = [
+        "🚫 <b>Заказ на Weblancer уже закрыт</b> — заявку подать нельзя.",
+    ]
+    title = (job.title if job else None) or (send_debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+    order_id_line = _order_id_html_line(job).rstrip("\n")
+    if order_id_line:
+        parts.append(f"\n{order_id_line}")
+    job_url = (job.url if job else None) or (send_debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Weblancer</a>')
+    parts.append(
+        "\n\n<b>Что делать:</b> нажмите SKIP на карточке. "
+        "Повторная отправка не сработает."
+    )
+    err = send_error or WEBLANCER_ORDER_CLOSED_ERROR
+    if err and not is_weblancer_order_closed_error(err):
+        parts.append(f"\n\n<b>Детали:</b> {html.escape(err)}")
+    return "".join(parts)
+
+
+def format_weblancer_failure_message(
+    job: Job | None,
+    send_error: str | None,
+    debug: dict[str, Any] | None,
+) -> str:
+    label = _platform_display_name("weblancer")
+    parts = [f"❌ JobPilot AI: не удалось отправить отклик на {label}."]
+
+    title = (job.title if job else None) or (debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+
+    order_id_line = _order_id_html_line(job).rstrip("\n")
+    if order_id_line:
+        parts.append(f"\n{order_id_line}")
+
+    job_url = (job.url if job else None) or (debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на {html.escape(label)}</a>')
+
+    if send_error:
+        parts.append(f"\n\n<b>Причина:</b> {html.escape(send_error)}")
+
+    error_label = (debug or {}).get("error_label")
+    if error_label in ("login_failed", "cloudflare_blocked"):
+        parts.append(
+            "\n\n<b>Что делать:</b>\n"
+            "1. bash scripts/setup_weblancer_session.sh — войдите в аккаунт фрилансера, не гостя\n"
+            "2. Docker: docker compose --profile flaresolverr up -d flaresolverr\n"
+            "3. Проверка: python scripts/export_weblancer_session.py"
+        )
+    elif error_label == "weblancer_tariff_required":
+        parts.append(
+            "\n\n<b>Что делать:</b> в личном кабинете Weblancer оформите тариф / оплатите комиссию, "
+            "затем повторите отправку."
+        )
+    elif error_label == "platform_sender_missing":
+        parts.append(
+            "\n\n<b>Что делать:</b> обновите бот (docker compose up -d --build telegram-bot)."
+        )
+    else:
+        parts.append(
+            "\n\n<b>Что делать:</b>\n"
+            "1. Откройте заказ по ссылке и отправьте заявку вручную\n"
+            "2. Логи: docker compose logs telegram-bot celery-worker --tail=80"
+        )
+
+    text = "".join(parts)
+    return text[:4093] + "..." if len(text) > 4096 else text
+
+
+def format_fl_ru_failure_message(
+    job: Job | None,
+    send_error: str | None,
+    debug: dict[str, Any] | None,
+) -> str:
+    label = _platform_display_name("fl_ru")
+    parts = [f"❌ JobPilot AI: не удалось отправить отклик на {label}."]
+
+    title = (job.title if job else None) or (debug or {}).get("job_title")
+    if title:
+        parts.append(f"\n\n<b>Задание:</b> {html.escape(title)}")
+
+    order_id_line = _order_id_html_line(job).rstrip("\n")
+    if not order_id_line and debug and debug.get("job_url"):
+        order_id = extract_site_order_id(url=debug["job_url"], platform="fl_ru")
+        if order_id:
+            order_id_line = f"<b>№ заказа:</b> {html.escape(order_id)}"
+    if order_id_line:
+        parts.append(f"\n{order_id_line}")
+
+    job_url = (job.url if job else None) or (debug or {}).get("job_url")
+    if job_url:
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на FL.ru</a>')
+
+    if send_error:
+        parts.append(f"\n\n<b>Причина:</b> {html.escape(send_error)}")
+
+    error_label = (debug or {}).get("error_label")
+    if error_label == "fl_ru_paid_offers_required":
+        parts.append(
+            "\n\n<b>Что делать:</b>\n"
+            "1. Купить пакет откликов: https://www.fl.ru/payed/\n"
+            "2. Или брать только заказы с пометкой «для всех» (бесплатный отклик)\n"
+            "3. Текст отклика можно вставить вручную по ссылке выше"
+        )
+    else:
+        parts.append(
+            "\n\n<b>Что делать:</b>\n"
+            "1. Проверьте сессию — python scripts/export_fl_ru_session.py\n"
+            "2. Откройте заказ и отправьте отклик вручную при необходимости\n"
+            "3. Логи: docker compose logs telegram-bot --tail=50"
+        )
+
+    text = "".join(parts)
+    return text[:4093] + "..." if len(text) > 4096 else text
 
 
 def format_kwork_failure_message(
@@ -405,7 +696,12 @@ def format_kwork_failure_message(
 
     order_id_line = _order_id_html_line(job).rstrip("\n")
     if not order_id_line and debug and debug.get("job_url"):
-        order_id = extract_site_order_id(url=debug["job_url"], platform="kwork")
+        platform = (job.platform if job else None) or debug.get("platform")
+        if not platform and "fl.ru" in str(debug["job_url"]):
+            platform = "fl_ru"
+        elif not platform:
+            platform = "kwork"
+        order_id = extract_site_order_id(url=debug["job_url"], platform=platform)
         if order_id:
             order_id_line = f"<b>№ заказа:</b> {html.escape(order_id)}"
     if order_id_line:
@@ -413,10 +709,32 @@ def format_kwork_failure_message(
 
     job_url = (job.url if job else None) or (debug or {}).get("job_url")
     if job_url:
-        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на Kwork</a>')
+        link_label = _platform_display_name((job.platform if job else None) or "kwork")
+        parts.append(f'\n<a href="{html.escape(job_url)}">Открыть на {html.escape(link_label)}</a>')
 
     if send_error:
-        parts.append(f"\n\n<b>Причина:</b> {html.escape(send_error)}")
+        display_error = send_error
+        if send_error in SEND_ATTEMPT_BLOCK_REASONS:
+            display_error = format_proposal_send_block_message(
+                send_error,
+                last_error=(debug or {}).get("reason"),
+                debug=debug,
+            )
+        summary = humanize_kwork_browser_error(display_error)
+        if summary and summary != display_error:
+            parts.append(f"\n\n<b>Причина:</b> {html.escape(summary)}")
+            if display_error != summary:
+                parts.append(
+                    f"\n<b>Технически:</b> <code>{html.escape(display_error[:900])}</code>"
+                )
+        else:
+            parts.append(f"\n\n<b>Причина:</b> {html.escape(display_error)}")
+
+    if (debug or {}).get("send_attempt_status") == "unknown_result":
+        parts.append(
+            "\n\n⚠️ <b>Неопределённый результат отправки</b> (статус unknown_result в БД). "
+            "Перед повтором сверьте отклик на Kwork. Если отклика нет — нажмите «Повторить»."
+        )
 
     if debug:
         content_length = debug.get("content_length")
@@ -490,6 +808,7 @@ async def queue_proposal_review(session, job: Job, proposal: Proposal, target_ch
         kind="proposal_approval", idempotency_key=key, chat_id=target_chat,
         payload={
             "pending_id": str(pending.id), "job_id": str(job.id), "proposal_id": str(proposal.id),
+            "platform": job.platform,
             "alert_text": text, "review_format": "full_text_v1",
             "review_content": snapshot.payload["content"],
             "review_heading": (
@@ -577,17 +896,126 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
 
     @dp.message(Command("status"))
     async def cmd_status(message: Message) -> None:
+        from app.services.telegram_review_status import telegram_pending_status_breakdown
+
         async with AsyncSessionLocal() as session:
-            pending_count = await session.execute(
-                select(TelegramPending).where(TelegramPending.status == "pending")
+            total, review_ready, assessment_stale, other = await telegram_pending_status_breakdown(
+                session
             )
-            count = len(pending_count.scalars().all())
         rewards = RewardSystem()
-        total = await rewards.get_total_rewards()
+        total_rewards = await rewards.get_total_rewards()
         await message.answer(
-            f"<b>JobPilot AI Status</b>\n\nPending approvals: {count}\nTotal rewards: {total}",
+            (
+                "<b>JobPilot AI Status</b>\n\n"
+                f"Pending Telegram cards: {total}\n"
+                f"  — Review-ready (can APPROVE/send): {review_ready}\n"
+                f"  — Blocked (assessment stale): {assessment_stale}\n"
+                f"  — Other / stale queue: {other}\n"
+                f"\nTotal rewards: {total_rewards}"
+            ),
             parse_mode=ParseMode.HTML,
         )
+
+    @dp.message(Command("stats"))
+    async def cmd_stats(message: Message) -> None:
+        from app.services.ops_metrics import collect_ops_metrics
+        from app.services.ops_stats_format import format_ops_stats_telegram
+
+        async with AsyncSessionLocal() as session:
+            ops = await collect_ops_metrics(session)
+        await message.answer(
+            format_ops_stats_telegram(ops),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @dp.callback_query(F.data.startswith("resend:"))
+    async def handle_resend(callback: CallbackQuery) -> None:
+        pending_id = callback.data.split(":", 1)[1]
+        async with AsyncSessionLocal() as session:
+            pending = await session.get(TelegramPending, uuid.UUID(pending_id))
+            if not pending:
+                await callback.answer("Request expired", show_alert=True)
+                return
+            if not pending_matches_callback(pending, callback):
+                await callback.answer("Карточка устарела", show_alert=True)
+                return
+            if not _pending_allows_send_retry(pending):
+                job = await session.get(Job, pending.job_id)
+                send_error, send_debug = await _latest_proposal_send_context(
+                    session, pending.proposal_id
+                )
+                if pending.status == "skipped" and _send_outcome_is_order_closed(
+                    send_error, send_debug
+                ):
+                    try:
+                        await callback.message.edit_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    await callback.answer(
+                        "Заказ на Kwork уже закрыт — повтор не имеет смысла",
+                        show_alert=True,
+                    )
+                    await callback.message.answer(
+                        format_kwork_order_closed_message(job, send_error, send_debug),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    return
+                if pending.status == "skipped":
+                    await callback.answer(
+                        "Карточка уже пропущена (SKIP). Повторная отправка недоступна",
+                        show_alert=True,
+                    )
+                elif pending.status == "pending":
+                    await callback.answer("Сначала одобрите карточку", show_alert=True)
+                else:
+                    await callback.answer(
+                        f"Карточка в статусе «{pending.status}» — нажмите SKIP или запросите новую",
+                        show_alert=True,
+                    )
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+            job_id = str(pending.job_id)
+            proposal_id = str(pending.proposal_id)
+            approval_status = pending.status if pending.status == "edited" else "approved"
+            job = await session.get(Job, pending.job_id)
+            send_platform = job.platform if job else None
+
+        try:
+            await callback.answer(_send_progress_answer(send_platform))
+        except Exception:
+            pass
+
+        success, send_error, send_debug = await _resume_pipeline(
+            job_id, proposal_id, approval_status
+        )
+        async with AsyncSessionLocal() as session:
+            job = await session.get(Job, uuid.UUID(job_id))
+        await callback.message.answer(
+            format_send_outcome_message(
+                job,
+                success=success,
+                send_error=send_error,
+                send_debug=send_debug,
+            ),
+            parse_mode="HTML" if not success else None,
+            disable_web_page_preview=not success,
+        )
+        try:
+            if success or _send_outcome_is_order_closed(send_error, send_debug):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            else:
+                async with AsyncSessionLocal() as session:
+                    pending_row = await session.get(TelegramPending, uuid.UUID(pending_id))
+                if pending_row and _pending_allows_send_retry(pending_row):
+                    await callback.message.edit_reply_markup(
+                        reply_markup=send_retry_keyboard(pending_id)
+                    )
+        except Exception:
+            logger.warning("Failed to update retry keyboard", pending_id=pending_id)
 
     @dp.callback_query(F.data.startswith("approve:"))
     async def handle_approve(callback: CallbackQuery) -> None:
@@ -652,6 +1080,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             job_id=job_id,
             proposal_id=proposal_id,
             pending_id=pending_id,
+            platform=job.platform if job else None,
             original_content=original_content,
             original_version=proposal.version,
             review_parameters=review_parameters,
@@ -745,7 +1174,9 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             f"Цена: {review_parameters['offer_price']} {review_parameters['currency']}; "
             f"срок: {review_parameters['duration_days']} дней.\n{review_parameters['url'] or ''}\n"
             f"Правка: {instruction[:1000]}",
-            markup=edit_preview_keyboard(pending_id),
+            markup=edit_preview_keyboard(
+                pending_id, platform=data.get("platform") or job.get("platform")
+            ),
         )
         await state.update_data(**edit_preview_binding(preview_message, after))
 
@@ -871,7 +1302,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
                 return
 
         try:
-            await callback.answer("⏳ Отправляю на Kwork...")
+            await callback.answer(_send_progress_answer(platform))
         except Exception:
             pass
 
@@ -1002,7 +1433,7 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             return
 
         try:
-            await callback.answer("⏳ Отправляю на Kwork...")
+            await callback.answer(_send_progress_answer(job.platform if job else None))
         except Exception:
             pass
 
@@ -1019,6 +1450,21 @@ def create_dispatcher(dev_agent: DevAgentService | None = None) -> Dispatcher:
             parse_mode="HTML" if not success else None,
             disable_web_page_preview=not success,
         )
+        if not success and action in ("approved", "edited"):
+            async with AsyncSessionLocal() as session:
+                pending_row = await session.get(TelegramPending, uuid.UUID(pending_id))
+            if _send_outcome_is_order_closed(send_error, send_debug):
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            elif pending_row and _pending_allows_send_retry(pending_row):
+                try:
+                    await callback.message.edit_reply_markup(
+                        reply_markup=send_retry_keyboard(pending_id)
+                    )
+                except Exception:
+                    logger.warning("Failed to restore send retry keyboard", pending_id=pending_id)
 
     async def _resume_pipeline(
         job_id: str,

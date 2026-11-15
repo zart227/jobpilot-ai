@@ -1,12 +1,17 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def edit_preview_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+def platform_send_label(platform: str | None) -> str:
+    names = {"kwork": "Kwork", "fl_ru": "FL.ru", "weblancer": "Weblancer"}
+    return f"✅ Отправить на {names.get(platform or '', platform or 'площадку')}"
+
+
+def edit_preview_keyboard(pending_id: str, *, platform: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Отправить на Kwork",
+                    text=platform_send_label(platform),
                     callback_data=f"edit_send:{pending_id}",
                 ),
             ],
@@ -24,7 +29,24 @@ def edit_preview_keyboard(pending_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def approval_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+def send_retry_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Повторить отправку",
+                    callback_data=f"resend:{pending_id}",
+                ),
+                InlineKeyboardButton(
+                    text="⏭ SKIP",
+                    callback_data=f"skip:{pending_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def approval_keyboard(pending_id: str, *, platform: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -72,12 +94,12 @@ def inbox_reply_keyboard(pending_id: str) -> InlineKeyboardMarkup:
     )
 
 
-def inbox_edit_preview_keyboard(pending_id: str) -> InlineKeyboardMarkup:
+def inbox_edit_preview_keyboard(pending_id: str, *, platform: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✅ Отправить на Kwork",
+                    text=platform_send_label(platform),
                     callback_data=f"inbox_edit_send:{pending_id}",
                 ),
             ],

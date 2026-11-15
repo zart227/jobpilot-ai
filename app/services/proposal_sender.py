@@ -8,6 +8,8 @@ from app.config import get_settings
 from app.db.models import Job, Proposal, TelegramPending
 from app.db.session import AsyncSessionLocal
 from app.db.workflow_states import proposal_is_submitted
+from app.services.fl_ru_browser import is_fl_ru_order_closed_error, send_fl_ru_offer
+from app.services.weblancer_send import is_weblancer_order_closed_error, send_weblancer_offer
 from app.services.kwork_browser import (
     is_kwork_connects_limit_error,
     is_kwork_order_closed_error,
@@ -19,7 +21,16 @@ from app.services.kwork_pause import (
     load_pause_state,
     record_connects_limit_detected,
 )
-from app.services.send_attempt_service import finalize_send_attempt, prepare_proposal_send
+from app.services.send_attempt_service import (
+    finalize_send_attempt,
+    load_send_attempt_operator_context,
+    prepare_proposal_send,
+)
+from app.utils.delivery_errors import (
+    SEND_ATTEMPT_BLOCK_REASONS,
+    format_ambiguous_delivery_outcome,
+    format_proposal_send_block_message,
+)
 from app.utils.formatting import extract_site_order_id
 
 logger = structlog.get_logger(__name__)
@@ -76,7 +87,19 @@ class ProposalSender:
                 job_id, proposal_id
             ):
                 return True, None, {"offer_action": "unchanged"}
-            return False, reason, {"error_label": reason}
+            debug: dict[str, Any] = {"error_label": reason}
+            last_error: str | None = None
+            if claim.attempt_id and reason in SEND_ATTEMPT_BLOCK_REASONS:
+                last_error, attempt_debug = await load_send_attempt_operator_context(
+                    claim.attempt_id
+                )
+                if attempt_debug:
+                    debug = {**attempt_debug, **debug}
+            message = format_proposal_send_block_message(
+                reason, last_error=last_error, debug=debug
+            )
+            debug.setdefault("block_reason", reason)
+            return False, message, debug
 
         if not job or not proposal or not claim.attempt_id or not claim.claim_token:
             return False, "Не удалось захватить отправку", None
@@ -106,8 +129,11 @@ class ProposalSender:
             await self._handle_send_failure(job_id, proposal_id, error, debug)
         else:
             logger.warning("Proposal delivery outcome requires reconciliation", job_id=job_id)
+            error = format_ambiguous_delivery_outcome(error, debug)
 
         if debug is not None:
+            if debug.get("ambiguous"):
+                debug["send_attempt_status"] = "unknown_result"
             debug["job_title"] = job.title
             debug["job_id"] = job_id
             debug["proposal_id"] = proposal_id
@@ -131,7 +157,11 @@ class ProposalSender:
             if not job or not proposal:
                 return
 
-            if is_kwork_order_closed_error(error):
+            if (
+                is_kwork_order_closed_error(error)
+                or is_fl_ru_order_closed_error(error)
+                or is_weblancer_order_closed_error(error)
+            ):
                 proposal.status = "skipped"
                 job.status = "skipped"
                 pending_rows = await session.execute(
@@ -213,14 +243,37 @@ class ProposalSender:
             debug = dict(debug or {})
             debug["dry_run"] = False
             if success:
-                # Current browser signals do not bind an external receipt to this payload.
+                if debug.get("offer_action") == "created":
+                    return True, None, debug
                 debug["ambiguous"] = True
                 debug["error_label"] = "payload_receipt_unverified"
                 return False, "Отправка не подтверждена по точному содержимому", debug
             return success, error, debug
 
+        if job.platform == "fl_ru" and job.url:
+            success, error, debug = await send_fl_ru_offer(job.url, content)
+            debug = dict(debug or {})
+            debug["dry_run"] = False
+            debug["platform"] = "fl_ru"
+            if success:
+                return True, None, debug
+            return False, error, debug
+
+        if job.platform == "weblancer" and job.url:
+            success, error, debug = await send_weblancer_offer(job.url, content)
+            debug = dict(debug or {})
+            debug["dry_run"] = False
+            debug["platform"] = "weblancer"
+            if success:
+                return True, None, debug
+            return False, error, debug
+
         logger.warning(
             "JobPilot AI has no sender for platform, skipping real delivery",
             platform=job.platform,
         )
-        return False, f"Отправка на платформу {job.platform} не настроена", None
+        return (
+            False,
+            f"Автоотправка на {job.platform} пока не поддерживается",
+            {"platform": job.platform, "error_label": "platform_sender_missing"},
+        )

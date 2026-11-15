@@ -81,21 +81,25 @@ async def proposal_card_is_current(session, pending_id, job, proposal) -> bool:
         return False
     from app.services.opportunity_policy import kwork_job_assessment_rejection
 
-    if await kwork_job_assessment_rejection(session, job):
-        return False
-    if job.platform == "kwork" and not kwork_text_price_matches(
-        proposal.content, proposal_card_payload(job, proposal)["offer_price"]
-    ):
-        return False
     snapshot = await session.get(ProposalApprovalSnapshot, pending_id)
     action = (
         SUBMISSION_EDIT_EXISTING
         if await job_has_live_submitted_proposal(session, job.id)
         else SUBMISSION_NEW_OFFER
     )
-    return snapshot is not None and snapshot.payload == proposal_card_payload(
-        job, proposal, submission_action=action
-    )
+    presented = proposal_card_payload(job, proposal, submission_action=action)
+    if job.platform == "kwork" and not kwork_text_price_matches(
+        proposal.content, presented["offer_price"]
+    ):
+        return False
+    presentation_unchanged = snapshot is not None and snapshot.payload == presented
+    if await kwork_job_assessment_rejection(session, job, ignore_stale=presentation_unchanged):
+        return False
+    if job.platform == "kwork" and presentation_unchanged:
+        assessment = (job.raw_data or {}).get("opportunity_assessment") or {}
+        if snapshot.payload.get("assessment_id") != assessment.get("assessment_id"):
+            return False
+    return presentation_unchanged
 
 
 async def record_proposal_approval(
